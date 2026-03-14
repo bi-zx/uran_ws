@@ -1,0 +1,12 @@
+uran_core:
+  state_broadcast_interval_ms: 1000    # 对内广播周期（ms）
+  state_report_interval_ms: 10000      # 对外定期上报周期（ms）
+  state_report_protocol: "mqtt"        # 首选上行协议，空串跟随主通路
+  state_report_on_change: true         # 关键字段变更时立即触发上报
+  state_report_change_fields:
+    - "online_status"
+    - "error_code"
+    - "control_mode"
+    - "current_controller"
+    - "battery_level"
+  db_path: "/tmp/uran_core_state.db"   # 持久化 SQLite 路径
