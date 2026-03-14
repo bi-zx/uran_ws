@@ -100,8 +100,9 @@ class UranCoreNode(Node):
 
         # ── 定时器 ────────────────────────────────────────────────────────
         self._start_ts = time.time()
+        self._last_report_ts = 0.0          # T1.6: 支持动态修改上报周期
         self.create_timer(self._broadcast_ms / 1000.0, self._timer_broadcast)
-        self.create_timer(self._report_ms / 1000.0, self._timer_report)
+        self.create_timer(1.0, self._timer_report_check)  # T1.6: 每秒检查是否到上报周期
         self.create_timer(self._hb_ms / 1000.0, self._timer_heartbeat)
         self.create_timer(1.0, self._timer_uptime)
         self.create_timer(0.05, self._timer_mqtt_queue)  # 处理 MQTT 消息队列
@@ -323,7 +324,15 @@ class UranCoreNode(Node):
 
     # ================================================================== 状态写入订阅
     def _cb_state_write(self, msg: StateField):
-        self._state.set(msg.field_name, json.loads(msg.value_json), persistent=msg.persistent)
+        try:
+            value = json.loads(msg.value_json)
+        except json.JSONDecodeError:
+            value = msg.value_json
+        self._state.set(msg.field_name, value, persistent=msg.persistent)
+        # T1.6: urgent StateField 触发即时上报
+        if msg.urgent:
+            self.get_logger().debug(f'urgent StateField {msg.field_name} → immediate report')
+            self._do_state_report(trigger='change')
 
     # ================================================================== 状态变更回调
     def _on_state_change(self, field_name: str, new_value: Any):
@@ -340,8 +349,12 @@ class UranCoreNode(Node):
         msg.fields_json = self._state.get_snapshot_json()
         self._pub_broadcast.publish(msg)
 
-    def _timer_report(self):
-        self._do_state_report(trigger='periodic')
+    def _timer_report_check(self):
+        """T1.6: 每秒检查，支持动态修改上报周期。"""
+        now = time.time()
+        if now - self._last_report_ts >= self._report_ms / 1000.0:
+            self._last_report_ts = now
+            self._do_state_report(trigger='periodic')
 
     def _timer_heartbeat(self):
         """发送心跳包并发布 HeartbeatStatus。"""
@@ -442,6 +455,7 @@ class UranCoreNode(Node):
     def _srv_report_configure(self, req: ConfigureStateReport.Request, res: ConfigureStateReport.Response):
         if req.interval_ms > 0:
             self._report_ms = req.interval_ms
+            self._last_report_ts = 0.0  # 立即触发一次，让新周期从现在开始计算
         if req.protocol:
             self._core_cfg['state_report_protocol'] = req.protocol
         self._report_on_change = req.report_on_change
