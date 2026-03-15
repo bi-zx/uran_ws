@@ -30,7 +30,7 @@ class UranMoveNode(Node):
         self._controller = 'cloud'
 
         # 最近一次心跳状态（T2.5 失控保护用，T2.2 阶段仅存储）
-        self._last_heartbeat: HeartbeatStatus | None = None
+        self._last_heartbeat = None  # type: HeartbeatStatus
 
         # 插件相关
         self._plugin = None
@@ -88,7 +88,11 @@ class UranMoveNode(Node):
         node_cfg = cfg.get('uran_move', {})
         self._default_plugin_id = node_cfg.get('active_plugin', '')
         for p in node_cfg.get('plugins', []):
-            self._plugins_cfg[p['id']] = {'module': p['module'], 'class': p['class']}
+            self._plugins_cfg[p['id']] = {
+                'module': p['module'],
+                'class': p['class'],
+                'params': p.get('params', {}),
+            }
 
     def _load_plugin(self, plugin_id: str) -> bool:
         if plugin_id not in self._plugins_cfg:
@@ -99,7 +103,7 @@ class UranMoveNode(Node):
             mod = importlib.import_module(spec['module'])
             cls = getattr(mod, spec['class'])
             plugin = cls()
-            ok = plugin.init(self)
+            ok = plugin.init(self, spec.get('params', {}))
             if not ok:
                 self.get_logger().error(f'Plugin {plugin_id} init() returned False')
                 return False

@@ -5,11 +5,12 @@ class MovePluginBase(ABC):
     """运控插件基类，所有设备适配插件必须继承此类。"""
 
     @abstractmethod
-    def init(self, node) -> bool:
+    def init(self, node, params: dict) -> bool:
         """初始化插件，创建 ROS publisher/subscriber/client。
 
         Args:
             node: rclpy.node.Node 实例（主节点）
+            params: plugins.yaml 中该插件的 params 字典
         Returns:
             True 表示初始化成功
         """

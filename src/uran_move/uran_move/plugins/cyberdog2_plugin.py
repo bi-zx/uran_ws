@@ -24,8 +24,8 @@ _MOTION_ESTOP = 0
 # MotionServoCmd.cmd_type
 _SERVO_START = 0
 
-# cmd_source
-_SOURCE_APP = 0
+# cmd_source（-1 = 最高调试优先级，绕过 motion_manager 优先级队列）
+_SOURCE_APP = -1
 
 # switch_status 正常值
 _SWITCH_STATUS_NORMAL = 0
@@ -33,12 +33,15 @@ _SWITCH_STATUS_NORMAL = 0
 
 class CyberDog2Plugin(MovePluginBase):
 
-    def init(self, node) -> bool:
+    def init(self, node, params: dict) -> bool:
         self._node = node
         self._result_timeout = 3.0
         self._cmd_timeout_s = 0.5
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
+
+        # cyberdog_ws 节点的 ROS namespace（如 /mi_desktop_48_b0_2d_5f_b6_d0）
+        ns = params.get('namespace', '').rstrip('/')
 
         try:
             from protocol.msg import MotionServoCmd, MotionStatus
@@ -51,23 +54,23 @@ class CyberDog2Plugin(MovePluginBase):
         self._MotionResultCmd = MotionResultCmd
 
         # 发布 servo 指令
-        self._servo_pub = node.create_publisher(MotionServoCmd, 'motion_servo_cmd', 10)
+        self._servo_pub = node.create_publisher(MotionServoCmd, ns + '/motion_servo_cmd', 10)
 
         # 订阅 motion_status
         self._status_sub = node.create_subscription(
             MotionStatus,
-            'motion_status',
+            ns + '/motion_status',
             self._cb_motion_status,
             10,
         )
 
         # Result 服务 client
-        self._result_client = node.create_client(MotionResultCmd, 'motion_result_cmd')
+        self._result_client = node.create_client(MotionResultCmd, ns + '/motion_result_cmd')
 
         # 保活定时器（20Hz）
         self._keepalive_timer = node.create_timer(0.05, self._cb_keepalive)
 
-        node.get_logger().info('CyberDog2Plugin initialized')
+        node.get_logger().info(f'CyberDog2Plugin initialized, namespace="{ns}"')
         return True
 
     def device_type(self) -> str:

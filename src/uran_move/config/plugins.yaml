@@ -4,6 +4,11 @@ uran_move:
     - id: "cyberdog2"
       module: "uran_move.plugins.cyberdog2_plugin"
       class: "CyberDog2Plugin"
+      params:
+        # cyberdog_ws 节点的 ROS namespace（由 manual.py 根据 MAC 地址生成）
+        # 执行 `ros2 service list | grep motion_result_cmd` 查看完整路径
+        # 留空则使用相对名（无 namespace）
+        namespace: "/mi_desktop_48_b0_2d_5f_b6_d0"
   failsafe:
     enabled: true
     failsafe_timeout_s: 5.0
