@@ -802,7 +802,7 @@ public:
 
   // 查询插件内部当前状态（JSON 字符串）
   // 对于有状态机的平台（如 px4_mavros），返回当前飞行状态；
-  // 对于无状态机的平台（如 ros_twist），返回空对象 "{}"
+  // 对于无状态机的平台（如 cyberdog2），返回空对象 "{}"
   virtual std::string internal_state_json() const { return "{}"; }
 };
 
@@ -811,14 +811,14 @@ public:
 
 #### 5.4.2 官方预设插件列表
 
-| 插件标识      | 适配设备类型       | 说明                                           |
-| ------------- | ------------------ | ---------------------------------------------- |
-| `unitree_go2` | 宇树 Go2 机器狗    | 适配宇树 SDK 控制接口                          |
-| `unitree_b2`  | 宇树 B2 机器狗     | 适配宇树 SDK 控制接口                          |
-| `dji_m300`    | 大疆 M300 无人机   | 适配大疆 Onboard SDK（OSDK）                   |
-| `dji_m30`     | 大疆 M30 无人机    | 适配大疆 MSDK/OSDK                             |
-| `px4_mavros`  | PX4 无人机（通用） | 基于 MAVROS topic/service 适配，内置飞行状态机 |
-| `ros_twist`   | 通用 ROS 差速底盘  | 发布 `geometry_msgs/Twist` 到 `/cmd_vel`       |
+| 插件标识      | 适配设备类型       | 说明                                                         |
+| ------------- | ------------------ | ------------------------------------------------------------ |
+| `cyberdog2`   | 小米 CyberDog2     | 适配 CyberDog2 ROS 运控接口（servo topic + result service）  |
+| `dji_m300`    | 大疆 M300 无人机   | 适配大疆 Onboard SDK（OSDK）                                 |
+| `dji_m30`     | 大疆 M30 无人机    | 适配大疆 MSDK/OSDK                                           |
+| `px4_mavros`  | PX4 无人机（通用） | 基于 MAVROS topic/service 适配，内置飞行状态机               |
+
+> **暂未适配**：`unitree_go2`/`unitree_b2`（宇树机器狗）、`ros_twist`（通用 ROS 差速底盘）。后续按需补充。
 
 #### 5.4.2.1 各平台适配行为说明
 
@@ -826,20 +826,22 @@ public:
 
 **字段适配与坐标系转换矩阵**
 
-| 统一指令字段              | `px4_mavros`（无人机）                                                                                | `unitree_go2/b2`（机器狗）     | `ros_twist`（差速底盘）  |
-| ------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------ |
-| `linear_vel_x`            | ✅ 插件转换：ENU体系 x→ MAVROS body_vel x（同向）                                                      | ✅ 直接映射（SDK 同为体坐标系） | ✅ 映射到 Twist.linear.x  |
-| `linear_vel_y`            | ✅ 插件转换：ENU体系 y→ MAVROS body_vel y（同向）                                                      | ✅ 直接映射（侧步）             | ❌ 忽略                   |
-| `linear_vel_z`            | ✅ 插件转换：ENU体系 z（上正）→ MAVROS body_vel z（上正，与NED相反，插件内部取反后发给MAVROS NED接口） | ❌ 忽略                         | ❌ 忽略                   |
-| `angular_vel_z`           | ✅ 插件转换：ENU体系逆时针正→ MAVROS yaw_rate（同向，MAVROS 本地系同为逆时针正）                       | ✅ 直接映射                     | ✅ 映射到 Twist.angular.z |
-| `target_roll/pitch`       | ❌ 忽略（由飞控自主姿态环控制）                                                                        | ✅ 直接映射到 SDK 姿态接口      | ❌ 忽略                   |
-| `target_yaw`              | ✅ ENU世界系绝对偏航角，插件转换为 MAVROS 对应坐标系角度                                               | ✅ 直接映射                     | ❌ 忽略                   |
-| `action="takeoff"`        | ✅ 触发内部飞行状态机                                                                                  | ❌ 不支持（记录警告）           | ❌ 不支持                 |
-| `action="land"`           | ✅ 触发降落状态机                                                                                      | ❌ 不支持                       | ❌ 不支持                 |
-| `action="return_home"`    | ✅ 切换 RTL 模式                                                                                       | ❌ 不支持                       | ❌ 不支持                 |
-| `action="stop"`           | ✅ 悬停（切换 HOLD 模式）                                                                              | ✅ 原地停止                     | ✅ 发布零速度             |
-| `action="emergency_stop"` | ✅ 立即 disarm（危险）                                                                                 | ✅ 急停并锁定关节               | ✅ 发布零速度并报警       |
-| `extra_json`              | 可传入飞行模式名等扩展参数                                                                            | 可传入步态（gait）等扩展参数   | 一般忽略                 |
+| 统一指令字段              | `px4_mavros`（无人机）                                                                                | `cyberdog2`（小米机器狗）                                    |
+| ------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `linear_vel_x`            | ✅ 插件转换：ENU体系 x→ MAVROS body_vel x（同向）                                                      | ✅ 直接映射到 `vel_des[0]`（SDK 同为体坐标系前向）            |
+| `linear_vel_y`            | ✅ 插件转换：ENU体系 y→ MAVROS body_vel y（同向）                                                      | ✅ 直接映射到 `vel_des[1]`（侧步，左正）                      |
+| `linear_vel_z`            | ✅ 插件转换：ENU体系 z（上正）→ MAVROS body_vel z（上正，与NED相反，插件内部取反后发给MAVROS NED接口） | ❌ 忽略（机器狗不支持垂直速度控制）                           |
+| `angular_vel_z`           | ✅ 插件转换：ENU体系逆时针正→ MAVROS yaw_rate（同向，MAVROS 本地系同为逆时针正）                       | ✅ 直接映射到 `vel_des[2]`（偏航角速度，逆时针正）            |
+| `target_roll/pitch`       | ❌ 忽略（由飞控自主姿态环控制）                                                                        | ✅ 映射到 `rpy_des[0/1]`（姿态控制，仅在 WALK_STAND 模式有效）|
+| `target_yaw`              | ✅ ENU世界系绝对偏航角，插件转换为 MAVROS 对应坐标系角度                                               | ❌ 忽略（servo 模式无绝对偏航控制，通过 angular_vel_z 转向）  |
+| `action="takeoff"`        | ✅ 触发内部飞行状态机                                                                                  | ❌ 不支持（记录警告）                                         |
+| `action="land"`           | ✅ 触发降落状态机                                                                                      | ❌ 不支持（记录警告）                                         |
+| `action="return_home"`    | ✅ 切换 RTL 模式                                                                                       | ❌ 不支持（记录警告）                                         |
+| `action="stop"`           | ✅ 悬停（切换 HOLD 模式）                                                                              | ✅ 发布零速度 servo 指令（保持当前步态）                      |
+| `action="emergency_stop"` | ✅ 立即 disarm（危险）                                                                                 | ✅ 调用 `motion_result_cmd` 服务，`motion_id=ESTOP(0)`        |
+| `action="stand"`          | ❌ 不支持                                                                                              | ✅ 调用 `motion_result_cmd` 服务，`motion_id=RECOVERYSTAND(111)` |
+| `action="sit"`            | ❌ 不支持                                                                                              | ✅ 调用 `motion_result_cmd` 服务，`motion_id=GETDOWN(101)`    |
+| `extra_json`              | 可传入飞行模式名等扩展参数                                                                            | 可传入 `motion_id`（覆盖默认步态）、`step_height` 等扩展参数 |
 
 > ❌ 表示该平台忽略该字段，不报错；插件有责任记录 DEBUG 日志说明忽略原因。
 >
@@ -922,24 +924,71 @@ px4_mavros:
 
 ---
 
-**`unitree_go2/b2` 插件——步态与动作映射**
+**`cyberdog2` 插件——双模式运控接口**
 
-宇树机器狗无飞行状态机概念，但需要处理步态切换与特殊动作：
+CyberDog2 提供两类 ROS 接口，插件根据指令类型自动选择：
 
-| `action` 值        | SDK 调用                         | 说明         |
-| ------------------ | -------------------------------- | ------------ |
-| `"stop"`           | 速度置零，保持当前步态           | 原地停止     |
-| `"emergency_stop"` | 锁定所有关节，阻尼模式           | 紧急制动     |
-| `"stand"`          | `RobotControl::StandUp()`        | 站立         |
-| `"sit"`            | `RobotControl::StandDown()`      | 趴下/坐下    |
-| `"dance"` 等       | 通过 `extra_json.motion_id` 传递 | 特殊预设动作 |
+- **Servo 模式（连续速度控制）**：向 `motion_servo_cmd` topic 发布 `protocol::msg::MotionServoCmd`，适用于持续行走控制。
+- **Result 模式（一次性动作）**：调用 `motion_result_cmd` service（`protocol::srv::MotionResultCmd`），适用于站立、趴下、急停等离散动作，调用阻塞直至动作完成或超时。
 
-步态（`gait`）通过 `extra_json` 传递，插件解析后调用对应 SDK 接口：
+**速度控制（Servo 模式）字段映射**
+
+| `MotionServoCmd` 字段 | 来源                                | 说明                                      |
+| --------------------- | ----------------------------------- | ----------------------------------------- |
+| `motion_id`           | 固定 `WALK_USERTROT = 303`          | 自适应步频行走模式                        |
+| `cmd_type`            | 固定 `SERVO_START = 0`              | 每帧均以 SERVO_START 发送（SDK 要求）     |
+| `vel_des[0]`          | `linear_vel_x`                      | 前进速度（m/s），前正后负                 |
+| `vel_des[1]`          | `linear_vel_y`                      | 侧移速度（m/s），左正右负                 |
+| `vel_des[2]`          | `angular_vel_z`                     | 偏航角速度（rad/s），逆时针正             |
+| `rpy_des[0]`          | `target_roll`（仅 WALK_STAND 有效） | 横滚角（rad）                             |
+| `rpy_des[1]`          | `target_pitch`（仅 WALK_STAND 有效）| 俯仰角（rad）                             |
+| `step_height`         | `extra_json.step_height`（可选）    | 步高 [前腿, 后腿]（m），默认 [0.05, 0.05]|
+
+> **坐标系说明**：CyberDog2 SDK `vel_des` 采用体坐标系（前/左/逆时针正），与 REP-103 完全一致，无需坐标转换，直接赋值。
+
+**`action` 映射**
+
+| `action` 值        | 控制方式     | SDK 调用                                                     | 说明                         |
+| ------------------ | ------------ | ------------------------------------------------------------ | ---------------------------- |
+| `"stop"`           | Servo 模式   | 发布零速度 `vel_des=[0,0,0]`，`motion_id=WALK_USERTROT`      | 原地停止，保持站立步态       |
+| `"emergency_stop"` | Result 模式  | `motion_result_cmd`，`motion_id=ESTOP(0)`                    | 急停，进入阻尼模式           |
+| `"stand"`          | Result 模式  | `motion_result_cmd`，`motion_id=RECOVERYSTAND(111)`          | 从任意姿态恢复站立           |
+| `"sit"`            | Result 模式  | `motion_result_cmd`，`motion_id=GETDOWN(101)`                | 高阻尼趴下                   |
+| `extra_json` 中 `motion_id` | Result 模式 | `motion_result_cmd`，使用指定 `motion_id`           | 执行任意预设动作（如翻滚等） |
+
+**`extra_json` 扩展参数**
 
 ```json
 {
-  "gait": "trot"    // "trot" | "crawl" | "bound" | "stand"
+  "motion_id": 124,          // 可选：覆盖默认步态，直接调用 motion_result_cmd（优先级高于 action）
+  "step_height": [0.08, 0.08] // 可选：步高（m），仅 servo 模式有效
 }
+```
+
+**状态反馈**
+
+插件订阅 `motion_status` topic（`protocol::msg::MotionStatus`），将 `switch_status` 映射为插件内部状态并写入状态空间：
+
+| `switch_status` 值 | 含义           | 插件处理                                   |
+| ------------------ | -------------- | ------------------------------------------ |
+| `NORMAL(0)`        | 正常运行       | 正常接受指令                               |
+| `TRANSITIONING(1)` | 动作切换中     | 暂缓下一条 result 指令，等待切换完成       |
+| `ESTOP(2)`         | 急停状态       | 拒绝速度指令，上报 `E_ESTOP` 事件          |
+| `EDAMP(3)`         | 阻尼模式       | 拒绝速度指令，需先发 `action="stand"` 恢复 |
+| `LOW_BAT(7)`       | 低电量         | 写入状态空间 `battery_low=true`            |
+| 其他错误状态       | 硬件/过热/过流 | 上报对应错误码，拒绝运控指令               |
+
+**配置项（`config/plugins.yaml` 中 `cyberdog2` 段）**
+
+```yaml
+cyberdog2:
+  servo_topic: "motion_servo_cmd"       # Servo 控制 topic 名
+  result_service: "motion_result_cmd"   # Result 控制 service 名
+  status_topic: "motion_status"         # 状态反馈 topic 名
+  default_step_height: [0.05, 0.05]     # 默认步高（m）
+  result_cmd_timeout_s: 10.0            # motion_result_cmd 服务调用超时时间
+  servo_publish_hz: 20                  # servo 指令发布频率（Hz），用于保活
+  cmd_timeout_s: 0.5                    # 超过此时间未收到新指令则发布零速度
 ```
 
 ---
@@ -950,12 +999,10 @@ px4_mavros:
 
 ```yaml
 uran_move:
-  active_plugin: "unitree_go2"   # 当前激活的转换插件
+  active_plugin: "cyberdog2"    # 当前激活的转换插件
   plugins:
-    - id: "unitree_go2"
-      lib: "liburan_move_unitree_go2.so"
-    - id: "ros_twist"
-      lib: "liburan_move_ros_twist.so"
+    - id: "cyberdog2"
+      lib: "liburan_move_cyberdog2.so"
     - id: "custom_myplugin"
       lib: "/path/to/libcustom_myplugin.so"  # 用户自定义插件路径
 ```
@@ -1003,7 +1050,7 @@ string current_plugin
   "error_code": 0,
   "error_msg": "",
   "current_control_mode": "manual",
-  "plugin_id": "unitree_go2",
+  "plugin_id": "cyberdog2",
   "plugin_internal_state": {}
 }
 ```

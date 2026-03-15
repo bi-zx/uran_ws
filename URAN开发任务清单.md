@@ -181,30 +181,35 @@
   - angular_vel_z clamp
   - 截断时上报 move_clamp_event
 
-### T2.3 ros_twist 插件（通用差速底盘）
+### T2.3 cyberdog2 插件（小米 CyberDog2）
 
-> 设计文档参考：§5.4.2 ros_twist 行
+> 设计文档参考：§5.4.2 cyberdog2 行，§5.4.2.1 适配行为
 
-- 实现 `ros_twist` 插件：将 UnifiedMoveCmd 映射为 `geometry_msgs/Twist` 发布到 `/cmd_vel`
-- linear_vel_x → Twist.linear.x，angular_vel_z → Twist.angular.z
-- 忽略 linear_vel_y/z、target_roll/pitch/yaw
-- action="stop" / "emergency_stop" → 发布零速度
+- 实现 `cyberdog2` 插件，适配 CyberDog2 ROS 运控接口
+- **Servo 模式（连续速度控制）**：
+  - 发布 `protocol::msg::MotionServoCmd` 到 `motion_servo_cmd` topic
+  - `motion_id=WALK_USERTROT(303)`，`cmd_type=SERVO_START(0)`
+  - 字段映射：`linear_vel_x/y` → `vel_des[0/1]`，`angular_vel_z` → `vel_des[2]`
+  - `target_roll/pitch` → `rpy_des[0/1]`（仅 WALK_STAND 模式有效）
+  - 内部保活定时器（20Hz）：超过 `cmd_timeout_s`（默认 0.5s）未收到新指令则发布零速度
+- **Result 模式（一次性动作）**：
+  - 调用 `motion_result_cmd` service（`protocol::srv::MotionResultCmd`）
+  - `action="stand"` → `RECOVERYSTAND(111)`
+  - `action="sit"` → `GETDOWN(101)`
+  - `action="emergency_stop"` → `ESTOP(0)`
+  - `extra_json.motion_id` → 直接调用对应 motion_id（优先级最高）
+- 订阅 `motion_status` topic，监听 `switch_status`，写入状态空间并上报异常
+- `action="stop"` → 发布零速度 servo 指令
+- 读取 `extra_json.step_height` 覆盖默认步高
 
 **实机测试（T2.3）**：
-- 用 MQTT 工具发送 move_cmd 下行消息
-- 用 `ros2 topic echo /cmd_vel` 验证 Twist 输出
+- 用 MQTT 工具发送 move_cmd 下行消息（含速度字段）
+- 验证 `motion_servo_cmd` topic 收到正确的 MotionServoCmd
+- 发送 `action="stand"/"sit"/"emergency_stop"`，验证 `motion_result_cmd` 服务被正确调用
 - 验证限速截断、模式冲突拒绝、执行结果上报
+- 验证 `motion_status` 异常状态（如 ESTOP）触发上报
 
-### T2.4 unitree_go2 插件（宇树机器狗）
-
-> 设计文档参考：§5.4.2 unitree_go2 行，§5.4.2.1 适配行为
-
-- 实现 `unitree_go2` 插件，适配宇树 SDK
-- 速度直接映射（SDK 同为体坐标系）
-- 步态切换（extra_json 中 gait 字段）
-- action 映射：stop → 零速度，emergency_stop → 锁定关节，stand/sit 等
-
-### T2.5 px4_mavros 插件（PX4 无人机）
+### T2.4 px4_mavros 插件（PX4 无人机）
 
 > 设计文档参考：§5.4.2 px4_mavros 行，§5.4.2.1 飞行状态机
 
@@ -214,7 +219,7 @@
 - OFFBOARD 保活定时器（20Hz）
 - 超时自动悬停（默认 3s）
 
-### T2.6 失控保护
+### T2.5 失控保护
 
 > 设计文档参考：§5.7
 
@@ -225,12 +230,12 @@
 - 写入状态空间 failsafe_active、failsafe_action_executed
 - 上报 failsafe_event
 
-### T2.7 运行时插件切换
+### T2.6 运行时插件切换
 
 - 实现 Service `/uran/move/switch_plugin`（`SwitchMovePlugin`）
 
 **实机测试（T2 整体）**：
-- 模拟云端发送 move_cmd，验证 ros_twist 插件输出 /cmd_vel
+- 模拟云端发送 move_cmd，验证 cyberdog2 插件输出 motion_servo_cmd
 - 切换插件，验证 SwitchMovePlugin Service
 - 模拟全部链路中断，验证失控保护触发与恢复
 - 验证执行结果通过 uplink 上报到 MQTT Broker
