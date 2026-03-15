@@ -1,0 +1,11 @@
+uran_move:
+  active_plugin: "cyberdog2"
+  plugins:
+    - id: "cyberdog2"
+      module: "uran_move.plugins.cyberdog2_plugin"
+      class: "CyberDog2Plugin"
+  failsafe:
+    enabled: true
+    failsafe_timeout_s: 5.0
+    failsafe_action: "stop"
+    failsafe_recover_delay_s: 2.0

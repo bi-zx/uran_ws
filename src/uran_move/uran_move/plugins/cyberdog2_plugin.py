@@ -1,0 +1,218 @@
+"""cyberdog2_plugin.py — 小米 CyberDog2 运控适配插件（T2.3）
+
+依赖：
+  - protocol.msg.MotionServoCmd
+  - protocol.msg.MotionStatus
+  - protocol.srv.MotionResultCmd
+"""
+
+import json
+import threading
+import time
+
+import rclpy
+import rclpy.executors
+
+from uran_move.plugin_base import MovePluginBase
+
+# CyberDog2 motion_id 常量
+_MOTION_WALK_USERTROT = 303
+_MOTION_RECOVERYSTAND = 111
+_MOTION_GETDOWN = 101
+_MOTION_ESTOP = 0
+
+# MotionServoCmd.cmd_type
+_SERVO_START = 0
+
+# cmd_source
+_SOURCE_APP = 0
+
+# switch_status 正常值
+_SWITCH_STATUS_NORMAL = 0
+
+
+class CyberDog2Plugin(MovePluginBase):
+
+    def init(self, node) -> bool:
+        self._node = node
+        self._result_timeout = 3.0
+        self._cmd_timeout_s = 0.5
+        self._last_execute_ts = 0.0
+        self._switch_status = _SWITCH_STATUS_NORMAL
+
+        try:
+            from protocol.msg import MotionServoCmd, MotionStatus
+            from protocol.srv import MotionResultCmd
+        except ImportError as e:
+            node.get_logger().error(f'CyberDog2Plugin: protocol package not found: {e}')
+            return False
+
+        self._MotionServoCmd = MotionServoCmd
+        self._MotionResultCmd = MotionResultCmd
+
+        # 发布 servo 指令
+        self._servo_pub = node.create_publisher(MotionServoCmd, 'motion_servo_cmd', 10)
+
+        # 订阅 motion_status
+        self._status_sub = node.create_subscription(
+            MotionStatus,
+            'motion_status',
+            self._cb_motion_status,
+            10,
+        )
+
+        # Result 服务 client
+        self._result_client = node.create_client(MotionResultCmd, 'motion_result_cmd')
+
+        # 保活定时器（20Hz）
+        self._keepalive_timer = node.create_timer(0.05, self._cb_keepalive)
+
+        node.get_logger().info('CyberDog2Plugin initialized')
+        return True
+
+    def device_type(self) -> str:
+        return 'cyberdog2'
+
+    def version(self) -> str:
+        return '1.0.0'
+
+    def internal_state_json(self) -> str:
+        return json.dumps({'switch_status': self._switch_status})
+
+    # ------------------------------------------------------------------ #
+    #  执行                                                                #
+    # ------------------------------------------------------------------ #
+
+    def execute(self, cmd) -> tuple:
+        self._last_execute_ts = time.monotonic()
+
+        # 检查 motion_status
+        if self._switch_status != _SWITCH_STATUS_NORMAL:
+            return False, json.dumps({'reason': 'motion not normal', 'switch_status': self._switch_status})
+
+        # 解析 extra_json
+        extra = {}
+        if cmd.extra_json:
+            try:
+                extra = json.loads(cmd.extra_json)
+            except Exception:
+                pass
+
+        # 若 extra 含 motion_id → Result 模式
+        if 'motion_id' in extra:
+            return self._call_result_cmd(int(extra['motion_id']))
+
+        action = cmd.action
+        if action == 'emergency_stop':
+            return self._call_result_cmd(_MOTION_ESTOP)
+        elif action == 'stand':
+            return self._call_result_cmd(_MOTION_RECOVERYSTAND)
+        elif action == 'sit':
+            return self._call_result_cmd(_MOTION_GETDOWN)
+        elif action == 'stop':
+            self._publish_servo(0.0, 0.0, 0.0)
+            return True, ''
+        else:
+            # 速度指令
+            self._publish_servo(
+                cmd.linear_vel_x,
+                cmd.linear_vel_y,
+                cmd.angular_vel_z,
+                roll=cmd.target_roll,
+                pitch=cmd.target_pitch,
+            )
+            return True, ''
+
+    def on_failsafe(self):
+        self._publish_servo(0.0, 0.0, 0.0)
+
+    def destroy(self):
+        if hasattr(self, '_keepalive_timer'):
+            self._keepalive_timer.cancel()
+
+    # ------------------------------------------------------------------ #
+    #  内部方法                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _publish_servo(self, vx: float, vy: float, wz: float,
+                       roll: float = 0.0, pitch: float = 0.0,
+                       step_height: list = None):
+        if step_height is None:
+            step_height = [0.05, 0.05]
+        msg = self._MotionServoCmd()
+        msg.motion_id = _MOTION_WALK_USERTROT
+        msg.cmd_type = _SERVO_START
+        msg.cmd_source = _SOURCE_APP
+        msg.vel_des = [float(vx), float(vy), float(wz)]
+        msg.rpy_des = [float(roll), float(pitch), 0.0]
+        msg.step_height = step_height
+        # 其余数组字段保持默认零值
+        self._servo_pub.publish(msg)
+
+    def _call_result_cmd(self, motion_id: int) -> tuple:
+        if not self._result_client.service_is_ready():
+            return False, 'motion_result_cmd service not ready'
+
+        req = self._MotionResultCmd.Request()
+        req.motion_id = motion_id
+        req.cmd_source = _SOURCE_APP
+        req.vel_des = [0.0, 0.0, 0.0]
+        req.rpy_des = [0.0, 0.0, 0.0]
+        req.pos_des = [0.0, 0.0, 0.0]
+        req.acc_des = [0.0] * 6
+        req.ctrl_point = [0.0, 0.0, 0.0]
+        req.foot_pose = [0.0] * 6
+        req.step_height = [0.0, 0.0]
+        req.duration = 0
+
+        future = self._result_client.call_async(req)
+
+        # 在独立线程中等待，不阻塞主 executor
+        result_holder = [None]
+        done_event = threading.Event()
+
+        def _wait():
+            executor = rclpy.executors.SingleThreadedExecutor()
+            executor.add_node(self._node)
+            try:
+                executor.spin_until_future_complete(future, timeout_sec=self._result_timeout)
+            finally:
+                executor.remove_node(self._node)
+            result_holder[0] = future.result() if future.done() else None
+            done_event.set()
+
+        t = threading.Thread(target=_wait, daemon=True)
+        t.start()
+        done_event.wait(timeout=self._result_timeout + 0.5)
+
+        resp = result_holder[0]
+        if resp is None:
+            return False, 'timeout'
+        return bool(resp.result), f'code={resp.code}'
+
+    def _cb_motion_status(self, msg):
+        prev = self._switch_status
+        self._switch_status = msg.switch_status
+        if self._switch_status != _SWITCH_STATUS_NORMAL and prev == _SWITCH_STATUS_NORMAL:
+            self._node.get_logger().warn(
+                f'CyberDog2: motion switch_status abnormal: {self._switch_status}'
+            )
+            # 写入状态空间
+            self._node._write_state(
+                'cyberdog2_switch_status',
+                self._switch_status,
+                urgent=True,
+            )
+            # 上报事件
+            self._node._publish_uplink(
+                data_type='cyberdog2_motion_abnormal',
+                payload={'switch_status': self._switch_status},
+                urgent=True,
+            )
+
+    def _cb_keepalive(self):
+        """保活：若距上次 execute 超过 cmd_timeout_s，发布零速 servo 指令。"""
+        if self._last_execute_ts > 0.0:
+            elapsed = time.monotonic() - self._last_execute_ts
+            if elapsed > self._cmd_timeout_s:
+                self._publish_servo(0.0, 0.0, 0.0)
