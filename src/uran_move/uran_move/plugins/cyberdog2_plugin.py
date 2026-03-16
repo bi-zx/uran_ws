@@ -25,8 +25,14 @@ _SERVO_START = 0
 # cmd_source（-1 = 最高调试优先级，绕过 motion_manager 优先级队列）
 _SOURCE_APP = -1
 
-# switch_status 正常值
-_SWITCH_STATUS_NORMAL = 0
+# switch_status 含义（来自 MotionStatus.msg）
+_SWITCH_STATUS_NAMES = {
+    0: 'NORMAL', 1: 'TRANSITIONING', 2: 'ESTOP', 3: 'EDAMP',
+    4: 'LIFTED', 5: 'BAN_TRANS', 6: 'OVER_HEAT', 7: 'LOW_BAT',
+    8: 'ORI_ERR', 9: 'FOOTPOS_ERR', 10: 'STAND_STUCK',
+    11: 'MOTOR_OVER_HEAT', 12: 'MOTOR_OVER_CURR', 13: 'MOTOR_ERR',
+    14: 'CHARGING',
+}
 
 
 class CyberDog2Plugin(MovePluginBase):
@@ -87,7 +93,8 @@ class CyberDog2Plugin(MovePluginBase):
     def execute(self, cmd) -> tuple:
         # 检查 motion_status
         if self._switch_status != _SWITCH_STATUS_NORMAL:
-            return False, json.dumps({'reason': 'motion not normal', 'switch_status': self._switch_status})
+            name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
+            return False, json.dumps({'reason': 'motion not normal', 'switch_status': name})
 
         # 解析 extra_json
         extra = {}
@@ -186,8 +193,9 @@ class CyberDog2Plugin(MovePluginBase):
         prev = self._switch_status
         self._switch_status = msg.switch_status
         if self._switch_status != _SWITCH_STATUS_NORMAL and prev == _SWITCH_STATUS_NORMAL:
+            name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
             self._node.get_logger().warn(
-                f'CyberDog2: motion switch_status abnormal: {self._switch_status}'
+                f'CyberDog2: motion switch_status -> {name} ({self._switch_status})'
             )
             # 写入状态空间
             self._node._write_state(
