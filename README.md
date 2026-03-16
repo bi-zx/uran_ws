@@ -10,6 +10,9 @@ URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一
 - [快速开始](#快速开始)
 - [软件包结构](#软件包结构)
 - [uran_core 使用说明](#uran_core-使用说明)
+  - [MQTT 控制说明](#mqtt-控制说明)
+  - [配置文件](#配置文件)
+  - [ROS 接口](#ros-接口)
 - [消息与服务定义](#消息与服务定义)
 - [实机测试（CyberDog2）](#实机测试cyberdog2)
 - [相关文档](#相关文档)
@@ -97,6 +100,268 @@ uran_ws/
 ---
 
 ## uran_core 使用说明
+
+### MQTT 控制说明
+
+#### 网络拓扑
+
+```
+[主机 / 云端]                        [机器狗]
+mosquitto broker ◄──── WiFi ────► uran_core_node
+mosquitto_pub/sub                       │
+                                   uran_move_node
+                                        │
+                                  motion_manager
+```
+
+机器狗上的 `uran_core_node` 作为 MQTT 客户端连接到主机（或云端）的 Broker，所有控制指令通过 MQTT 下行，执行结果通过 MQTT 上行。
+
+#### 前置准备
+
+**主机上安装并启动 Broker：**
+
+```bash
+sudo apt install mosquitto mosquitto-clients
+mosquitto -p 1883 -v   # -v 显示所有收发消息，便于调试
+```
+
+**机器狗上修改 Broker 地址（改为主机 IP）：**
+
+```bash
+# 查看主机 IP
+ip addr show | grep "inet " | grep -v 127.0.0.1
+
+# 编辑配置（改完需重新编译或直接改 install 目录下的副本）
+nano /SDCARD/uran_ws/src/uran_core/config/network.yaml
+# 将 broker_host: "localhost" 改为 broker_host: "192.168.x.x"
+
+# 若直接改 install 目录下的副本则无需重新编译：
+nano /SDCARD/uran_ws/install/share/uran_core/config/network.yaml
+```
+
+**主机上开启上行监听（另开终端，全程保持）：**
+
+```bash
+mosquitto_sub -h localhost -t '/oivs/default/device_001/up' -v
+```
+
+节点启动后 5 秒内应收到第一条 `msg_type=register`，随后每 5 秒收到 `msg_type=heartbeat`。
+
+---
+
+#### 消息格式
+
+所有下行消息均为 JSON，必须包含以下公共字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `msg_type` | string | 消息类型，见下表 |
+| `msg_version` | string | 固定 `"1.0"` |
+| `device_id` | string | 与 `network.yaml` 中一致，默认 `"device_001"` |
+| `timestamp_ms` | int | Unix 毫秒时间戳，调试时填 `0` |
+
+下行 Topic：`/oivs/default/device_001/down`
+上行 Topic：`/oivs/default/device_001/up`
+
+---
+
+#### 下行指令参考
+
+**1. 控制模式切换（control_switch）**
+
+切换 manual / auto 模式，影响 uran_move 的指令来源过滤。
+
+```bash
+# 切换为 manual 模式（接受 cloud/field 来源，拒绝 auto）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "control_switch",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "switch": {
+    "control_mode": "manual",
+    "controller": "cloud",
+    "primary_uplink_protocol": "mqtt",
+    "media": {"action": "stop", "protocol": ""}
+  }
+}'
+
+# 切换为 auto 模式（接受 auto 来源，拒绝 cloud/field）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "control_switch",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "switch": {
+    "control_mode": "auto",
+    "controller": "cloud",
+    "primary_uplink_protocol": "mqtt",
+    "media": {"action": "stop", "protocol": ""}
+  }
+}'
+```
+
+切换后上行会收到 `msg_type=state_snapshot`，其中 `control_mode` 字段反映新状态。
+
+---
+
+**2. 运控指令（move_cmd）**
+
+`controller` 字段须与当前 `control_mode` 匹配：
+- `manual` 模式 → `controller` 填 `"cloud"` 或 `"field"`
+- `auto` 模式 → `controller` 填 `"auto"`
+
+```bash
+# 站立
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "controller": "cloud",
+  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
+  "action": "stand",
+  "extra_json": ""
+}'
+
+# 坐下
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "controller": "cloud",
+  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
+  "action": "sit",
+  "extra_json": ""
+}'
+
+# 向前走 0.3 m/s（单次发送，保活定时器 0.5s 后自动停止）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "controller": "cloud",
+  "linear_vel_x": 0.3, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
+  "action": "",
+  "extra_json": ""
+}'
+
+# 原地左转（angular_vel_z 正值为左转）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "controller": "cloud",
+  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
+  "angular_vel_z": 0.5, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
+  "action": "",
+  "extra_json": ""
+}'
+
+# 急停
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "controller": "cloud",
+  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
+  "action": "emergency_stop",
+  "extra_json": ""
+}'
+```
+
+> 速度指令需持续发送才能持续行走。可用 shell 循环模拟：
+> ```bash
+> while true; do
+>   mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m \
+>     '{"msg_type":"move_cmd","msg_version":"1.0","device_id":"device_001","timestamp_ms":0,"controller":"cloud","linear_vel_x":0.3,"linear_vel_y":0.0,"linear_vel_z":0.0,"angular_vel_z":0.0,"target_roll":0.0,"target_pitch":0.0,"target_yaw":0.0,"action":"","extra_json":""}'
+>   sleep 0.2
+> done
+> # Ctrl+C 停止后，保活定时器 0.5s 内自动发零速
+> ```
+
+---
+
+**3. 状态查询（state_query）**
+
+```bash
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "state_query",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "field_names": ["control_mode", "battery_level", "cyberdog2_switch_status"]
+}'
+# 上行收到 msg_type=state_query_response，fields_json 包含查询结果
+```
+
+---
+
+**4. 参数更新（param_update）**
+
+动态修改速度限制，无需重启节点：
+
+```bash
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "param_update",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "params": {
+    "linear_vel_limit": 0.5,
+    "angular_vel_limit": 0.8
+  }
+}'
+```
+
+---
+
+#### 上行消息说明
+
+| msg_type | 触发时机 | 关键字段 |
+|----------|---------|---------|
+| `register` | 节点启动时 | `device_id`, `template_id` |
+| `heartbeat` | 每 5 秒 | `online`, `battery_level`, `control_mode`, `current_controller` |
+| `state_snapshot` | 周期上报 / 关键字段变更 / 模式切换后 | `fields_json`（全量状态） |
+| `uplink_data` | 每次运控指令执行后 | `data_type=move_result`, `success`, `error_code`, `error_msg` |
+| `uplink_data` | 指令被限速截断时 | `data_type=move_clamp_event`, `original_v_norm`, `linear_limit` |
+| `uplink_data` | 指令被模式过滤拒绝时 | `data_type=move_reject_event`, `reason`, `controller` |
+| `uplink_data` | motion_status 异常时 | `data_type=cyberdog2_motion_abnormal`, `switch_status` |
+| `state_query_response` | 收到 state_query 后 | `fields_json` |
+
+---
+
+#### 常见问题
+
+**Q: 机器狗收不到 MQTT 指令**
+
+检查 Broker 地址配置和网络连通性：
+```bash
+# 在机器狗上 ping 主机
+ping 192.168.x.x
+
+# 确认 uran_core 已连接（日志应有 MQTT connected）
+# 或查询网络状态
+ros2 service call /uran/core/network/status uran_srvs/srv/GetNetworkStatus '{}'
+```
+
+**Q: 发送 move_cmd 后上行收到 move_reject_event**
+
+`controller` 与当前 `control_mode` 不匹配。先发 `control_switch` 切换到正确模式，或将 `controller` 改为 `"cloud"` / `"field"`（manual 模式下有效）。
+
+**Q: 上行收到 move_result 但 success=false，error_msg 含 CHARGING**
+
+机器狗正在充电，motion_manager 拒绝运动指令。拔掉充电线后重试。
+
+---
 
 ### 配置文件
 
@@ -409,32 +674,10 @@ ros2 topic pub --once /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd 
 
 #### 5.5 通过 MQTT 下发运控指令
 
-先启动本地 MQTT Broker（若云端不可用时用于调试）：
+参见 [MQTT 控制说明](#mqtt-控制说明) 中的完整指令参考。主机 IP 需填入机器狗的 `network.yaml`，Broker 在主机上启动：
 
 ```bash
-sudo apt install mosquitto mosquitto-clients
-mosquitto -p 1883
-```
-
-发送运控指令：
-
-```bash
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.2,
-  "angular_vel_z": 0.0,
-  "action": ""
-}'
-```
-
-监听执行结果上报：
-
-```bash
-mosquitto_sub -h localhost -t '/oivs/default/device_001/up'
+mosquitto -p 1883 -v
 ```
 
 #### 5.6 切换运控插件（运行时）
