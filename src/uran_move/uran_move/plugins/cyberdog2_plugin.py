@@ -26,6 +26,7 @@ _SERVO_START = 0
 _SOURCE_APP = -1
 
 # switch_status 含义（来自 MotionStatus.msg）
+_SWITCH_STATUS_NORMAL = 0
 _SWITCH_STATUS_NAMES = {
     0: 'NORMAL', 1: 'TRANSITIONING', 2: 'ESTOP', 3: 'EDAMP',
     4: 'LIFTED', 5: 'BAN_TRANS', 6: 'OVER_HEAT', 7: 'LOW_BAT',
