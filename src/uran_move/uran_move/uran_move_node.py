@@ -13,6 +13,7 @@ import math
 import time
 
 import rclpy
+import rclpy.executors
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
 
@@ -304,8 +305,11 @@ class UranMoveNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = UranMoveNode()
+    # MultiThreadedExecutor 允许 _call_result_cmd 在回调中阻塞等待服务响应
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

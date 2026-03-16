@@ -7,11 +7,9 @@
 """
 
 import json
-import threading
 import time
 
 import rclpy
-import rclpy.executors
 
 from uran_move.plugin_base import MovePluginBase
 
@@ -87,8 +85,6 @@ class CyberDog2Plugin(MovePluginBase):
     # ------------------------------------------------------------------ #
 
     def execute(self, cmd) -> tuple:
-        self._last_execute_ts = time.monotonic()
-
         # 检查 motion_status
         if self._switch_status != _SWITCH_STATUS_NORMAL:
             return False, json.dumps({'reason': 'motion not normal', 'switch_status': self._switch_status})
@@ -101,22 +97,28 @@ class CyberDog2Plugin(MovePluginBase):
             except Exception:
                 pass
 
-        # 若 extra 含 motion_id → Result 模式
+        # 若 extra 含 motion_id → Result 模式（动作指令，禁用保活）
         if 'motion_id' in extra:
+            self._last_execute_ts = 0.0
             return self._call_result_cmd(int(extra['motion_id']))
 
         action = cmd.action
         if action == 'emergency_stop':
+            self._last_execute_ts = 0.0
             return self._call_result_cmd(_MOTION_ESTOP)
         elif action == 'stand':
+            self._last_execute_ts = 0.0
             return self._call_result_cmd(_MOTION_RECOVERYSTAND)
         elif action == 'sit':
+            self._last_execute_ts = 0.0
             return self._call_result_cmd(_MOTION_GETDOWN)
         elif action == 'stop':
+            self._last_execute_ts = 0.0
             self._publish_servo(0.0, 0.0, 0.0)
             return True, ''
         else:
-            # 速度指令
+            # 速度指令 — 启用保活
+            self._last_execute_ts = time.monotonic()
             self._publish_servo(
                 cmd.linear_vel_x,
                 cmd.linear_vel_y,
@@ -170,27 +172,14 @@ class CyberDog2Plugin(MovePluginBase):
 
         future = self._result_client.call_async(req)
 
-        # 在独立线程中等待，不阻塞主 executor
-        result_holder = [None]
-        done_event = threading.Event()
+        # 轮询等待（主 executor 已在 spin，会处理服务响应回调）
+        deadline = time.monotonic() + self._result_timeout
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
 
-        def _wait():
-            executor = rclpy.executors.SingleThreadedExecutor()
-            executor.add_node(self._node)
-            try:
-                executor.spin_until_future_complete(future, timeout_sec=self._result_timeout)
-            finally:
-                executor.remove_node(self._node)
-            result_holder[0] = future.result() if future.done() else None
-            done_event.set()
-
-        t = threading.Thread(target=_wait, daemon=True)
-        t.start()
-        done_event.wait(timeout=self._result_timeout + 0.5)
-
-        resp = result_holder[0]
-        if resp is None:
+        if not future.done():
             return False, 'timeout'
+        resp = future.result()
         return bool(resp.result), f'code={resp.code}'
 
     def _cb_motion_status(self, msg):
