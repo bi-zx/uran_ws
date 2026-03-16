@@ -137,7 +137,13 @@ class CyberDog2Plugin(MovePluginBase):
             return True, ''
 
     def on_failsafe(self):
+        """失控保护：停止运动，禁用保活。"""
+        self._last_execute_ts = 0.0
         self._publish_servo(0.0, 0.0, 0.0)
+        self._node.get_logger().warn('CyberDog2: failsafe triggered, sending zero-velocity')
+
+    def on_failsafe_recovered(self):
+        self._node.get_logger().info('CyberDog2: failsafe recovered')
 
     def destroy(self):
         if hasattr(self, '_keepalive_timer'):

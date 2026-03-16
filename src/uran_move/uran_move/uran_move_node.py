@@ -1,10 +1,11 @@
-"""uran_move_node.py — URAN-move 主节点（T2.1 + T2.2）
+"""uran_move_node.py — URAN-move 主节点（T2.1 + T2.2 + T2.5 + T2.6）
 
 职责：
   - 动态加载运控插件（T2.1）
   - 接收统一运控指令，执行预检限速 + 模式过滤（T2.2）
   - 执行结果上报到 uran_core uplink（T2.2）
-  - 提供 /uran/move/switch_plugin 服务（T2.1）
+  - 失控保护：链路中断超阈值触发保护动作，恢复后延迟退出（T2.5）
+  - 提供 /uran/move/switch_plugin 服务，支持运行时热切换插件（T2.6）
 """
 
 import importlib
@@ -30,8 +31,14 @@ class UranMoveNode(Node):
         self._control_mode = 'manual'
         self._controller = 'cloud'
 
-        # 最近一次心跳状态（T2.5 失控保护用，T2.2 阶段仅存储）
+        # 最近一次心跳状态（T2.5 失控保护）
         self._last_heartbeat = None  # type: HeartbeatStatus
+
+        # 失控保护状态
+        self._failsafe_active = False
+        self._failsafe_cfg = {}          # 从 plugins.yaml 加载
+        self._link_lost_since = None     # 链路首次中断时间（monotonic）
+        self._link_recovered_since = None  # 链路首次恢复时间（monotonic）
 
         # 插件相关
         self._plugin = None
@@ -41,6 +48,9 @@ class UranMoveNode(Node):
         # 加载配置并初始化插件
         self._load_config()
         self._load_plugin(self._default_plugin_id)
+
+        # ---------- 失控保护定时器（1Hz 检查）----------
+        self.create_timer(1.0, self._cb_failsafe_check)
 
         # ---------- 订阅 ----------
         self.create_subscription(
@@ -94,6 +104,12 @@ class UranMoveNode(Node):
                 'class': p['class'],
                 'params': p.get('params', {}),
             }
+        self._failsafe_cfg = node_cfg.get('failsafe', {
+            'enabled': True,
+            'failsafe_timeout_s': 5.0,
+            'failsafe_action': 'stop',
+            'failsafe_recover_delay_s': 2.0,
+        })
 
     def _load_plugin(self, plugin_id: str) -> bool:
         if plugin_id not in self._plugins_cfg:
@@ -137,10 +153,140 @@ class UranMoveNode(Node):
 
     def _cb_heartbeat(self, msg: HeartbeatStatus):
         self._last_heartbeat = msg
+        now = time.monotonic()
+        link_ok = msg.success
+
+        if not link_ok:
+            # 链路中断：记录首次中断时间，清除恢复计时
+            if self._link_lost_since is None:
+                self._link_lost_since = now
+            self._link_recovered_since = None
+        else:
+            # 链路恢复：记录首次恢复时间，清除中断计时
+            if self._link_recovered_since is None and self._link_lost_since is not None:
+                self._link_recovered_since = now
+            self._link_lost_since = None
+
+    # ------------------------------------------------------------------ #
+    #  失控保护（T2.5）                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _cb_failsafe_check(self):
+        """1Hz 定时检查：链路中断超阈值触发保护，恢复后延迟退出。"""
+        if not self._failsafe_cfg.get('enabled', True):
+            return
+
+        timeout_s = float(self._failsafe_cfg.get('failsafe_timeout_s', 5.0))
+        recover_delay_s = float(self._failsafe_cfg.get('failsafe_recover_delay_s', 2.0))
+        now = time.monotonic()
+
+        if not self._failsafe_active:
+            # 检查是否需要触发
+            if (self._link_lost_since is not None and
+                    now - self._link_lost_since >= timeout_s):
+                self._trigger_failsafe(duration_s=now - self._link_lost_since)
+        else:
+            # 已在保护模式，检查是否可以恢复
+            if (self._link_recovered_since is not None and
+                    now - self._link_recovered_since >= recover_delay_s):
+                self._recover_failsafe()
+
+    def _trigger_failsafe(self, duration_s: float):
+        """触发失控保护。"""
+        self._failsafe_active = True
+        action = self._failsafe_cfg.get('failsafe_action', 'stop')
+
+        self.get_logger().warn(
+            f'[FAILSAFE] Triggered! Link lost for {duration_s:.1f}s, action={action}'
+        )
+
+        # 执行保护动作
+        if self._plugin is not None:
+            try:
+                if action == 'custom':
+                    self._plugin.on_failsafe()
+                else:
+                    # stop / return_home / land / hold_position 均通过 execute 下发
+                    from uran_msgs.msg import UnifiedMoveCmd
+                    cmd = UnifiedMoveCmd()
+                    cmd.timestamp_ns = self.get_clock().now().nanoseconds
+                    cmd.controller = 'failsafe'
+                    if action == 'stop':
+                        cmd.action = 'stop'
+                    elif action == 'return_home':
+                        cmd.action = 'return_home'
+                    elif action == 'land':
+                        cmd.action = 'land'
+                    elif action == 'hold_position':
+                        cmd.action = 'stop'  # 通用平台用 stop 近似
+                    else:
+                        cmd.action = 'stop'
+                    self._plugin.execute(cmd)
+                    # 无论哪种动作，都额外调用 on_failsafe 钩子
+                    self._plugin.on_failsafe()
+            except Exception as e:
+                self.get_logger().error(f'[FAILSAFE] Plugin action failed: {e}')
+
+        # 写入状态空间
+        self._write_state('failsafe_active', True, urgent=True)
+        self._write_state('failsafe_action_executed', action)
+
+        # 上报事件
+        self._publish_uplink(
+            data_type='failsafe_event',
+            payload={
+                'event': 'triggered',
+                'failsafe_action': action,
+                'duration_s': round(duration_s, 2),
+                'timestamp_ns': self.get_clock().now().nanoseconds,
+            },
+            urgent=True,
+        )
+
+    def _recover_failsafe(self):
+        """退出失控保护模式。"""
+        self._failsafe_active = False
+        self._link_recovered_since = None
+
+        self.get_logger().info('[FAILSAFE] Recovered, resuming normal operation')
+
+        if self._plugin is not None:
+            try:
+                self._plugin.on_failsafe_recovered()
+            except Exception as e:
+                self.get_logger().error(f'[FAILSAFE] on_failsafe_recovered error: {e}')
+
+        self._write_state('failsafe_active', False, urgent=True)
+
+        self._publish_uplink(
+            data_type='failsafe_event',
+            payload={
+                'event': 'recovered',
+                'failsafe_action': self._failsafe_cfg.get('failsafe_action', 'stop'),
+                'timestamp_ns': self.get_clock().now().nanoseconds,
+            },
+            urgent=True,
+        )
 
     def _cb_move_cmd(self, cmd: UnifiedMoveCmd):
         if self._plugin is None:
             self.get_logger().warn('No active plugin, dropping move_cmd')
+            return
+
+        # 失控保护拦截（保护期间拒绝一切指令，urgent 也无效）
+        if self._failsafe_active:
+            self.get_logger().warn(
+                f'[FAILSAFE] Active, dropping move_cmd from controller={cmd.controller}'
+            )
+            self._publish_uplink(
+                data_type='move_reject_event',
+                payload={
+                    'reason': 'failsafe active',
+                    'controller': cmd.controller,
+                    'control_mode': self._control_mode,
+                },
+                urgent=False,
+            )
             return
 
         # 模式过滤
@@ -285,10 +431,23 @@ class UranMoveNode(Node):
     # ------------------------------------------------------------------ #
 
     def _srv_switch_plugin(self, request: SwitchMovePlugin.Request, response: SwitchMovePlugin.Response):
+        prev_plugin = self._active_plugin_id
         ok = self._load_plugin(request.plugin_id)
         response.success = ok
         response.message = 'ok' if ok else f'failed to load plugin: {request.plugin_id}'
         response.current_plugin = self._active_plugin_id
+
+        if ok:
+            self._write_state('active_move_plugin', self._active_plugin_id)
+            self._publish_uplink(
+                data_type='plugin_switch_event',
+                payload={
+                    'prev_plugin': prev_plugin,
+                    'new_plugin': self._active_plugin_id,
+                    'timestamp_ns': self.get_clock().now().nanoseconds,
+                },
+                urgent=False,
+            )
         return response
 
     # ------------------------------------------------------------------ #
