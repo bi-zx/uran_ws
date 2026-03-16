@@ -172,8 +172,10 @@ class UranMoveNode(Node):
             req = GetStateField.Request()
             req.field_names = ['linear_vel_limit', 'angular_vel_limit']
             future = self._state_get_cli.call_async(req)
-            # 同步等待（短超时，避免阻塞主 executor）
-            rclpy.spin_until_future_complete(self, future, timeout_sec=0.1)
+            # 轮询等待（不能用 spin_until_future_complete，node 已在 MultiThreadedExecutor 中）
+            deadline = time.time() + 0.1
+            while not future.done() and time.time() < deadline:
+                time.sleep(0.005)
             if future.done() and future.result() and future.result().success:
                 try:
                     fields = json.loads(future.result().fields_json)
