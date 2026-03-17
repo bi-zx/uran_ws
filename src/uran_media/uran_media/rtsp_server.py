@@ -65,7 +65,8 @@ class RTSPServer:
             pipeline_str = (
                 f'( appsrc name=src_{channel_id} is-live=true block=true format=time '
                 f'caps=video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1 ! '
-                f'videoconvert ! x264enc tune=zerolatency ! rtph264pay name=pay0 pt=96 )'
+                f'videoconvert ! video/x-raw,format=I420 ! '
+                f'x264enc tune=zerolatency speed-preset=ultrafast ! rtph264pay name=pay0 pt=96 )'
             )
             factory.set_launch(pipeline_str)
             factory.set_shared(True)
