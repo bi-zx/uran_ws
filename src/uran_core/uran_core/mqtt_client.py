@@ -36,7 +36,9 @@ class MqttClient:
 
         self._device_id = device_id
         self._template_id = net_cfg.get('template_id', 'template_001')
-        self._token = net_cfg.get('auth', {}).get('token', '')
+        auth_cfg = net_cfg.get('auth', {})
+        self._mqtt_username = auth_cfg.get('username', '') or self._device_id
+        self._token = auth_cfg.get('token', '')
         self._broker_host = mqtt_cfg.get('broker_host', 'localhost')
         self._broker_port = int(mqtt_cfg.get('broker_port', 1883))
         self._keepalive = int(mqtt_cfg.get('keepalive', 60))
@@ -53,7 +55,7 @@ class MqttClient:
             return False
         self._client = mqtt.Client(client_id=self._device_id)
         if self._token:
-            self._client.username_pw_set(self._device_id, self._token)
+            self._client.username_pw_set(self._mqtt_username, self._token)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
