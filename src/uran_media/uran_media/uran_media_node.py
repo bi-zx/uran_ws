@@ -44,6 +44,7 @@ class UranMediaNode(Node):
 
         self._cfg: dict = {}
         self._sources: Dict[str, dict] = {}
+        self._cyberdog_ns: str = ''  # e.g. "/mi_desktop_48_b0_2d_5f_b6_d0"
 
         # WebRTC：桥接通道（camera_service）
         self._bridge_channels: Set[str] = set()
@@ -76,9 +77,10 @@ class UranMediaNode(Node):
             10,
         )
         # image_transmission 信令出口（CyberDog2 WebRTC 应答）
+        ns = self._cyberdog_ns
         self.create_subscription(
             String,
-            'img_trans_signal_out',
+            f'{ns}/img_trans_signal_out' if ns else 'img_trans_signal_out',
             self._cb_img_trans_out,
             10,
         )
@@ -87,7 +89,12 @@ class UranMediaNode(Node):
         self._uplink_pub = self.create_publisher(UplinkPayload, '/uran/core/uplink/data', 10)
         self._state_pub = self.create_publisher(StateField, '/uran/core/state/write', 10)
         # image_transmission 信令入口
-        self._img_trans_pub = self.create_publisher(String, 'img_trans_signal_in', 10)
+        _sig_in = f'{ns}/img_trans_signal_in' if ns else 'img_trans_signal_in'
+        self._img_trans_pub = self.create_publisher(String, _sig_in, 10)
+        self.get_logger().info(
+            f'img_trans topics: in={_sig_in}, '
+            f'out={ns + "/img_trans_signal_out" if ns else "img_trans_signal_out"}'
+        )
 
         self.get_logger().info('uran_media_node started')
 
@@ -101,6 +108,7 @@ class UranMediaNode(Node):
 
         cfg_raw = _load_yaml(os.path.join(share, 'config', 'media.yaml'))
         self._cfg = cfg_raw.get('uran_media', {})
+        self._cyberdog_ns = self._cfg.get('cyberdog_ns', '').rstrip('/')
 
         for src in self._cfg.get('video_sources', []):
             cid = src.get('channel_id')
@@ -108,7 +116,8 @@ class UranMediaNode(Node):
                 self._sources[cid] = src
 
         self.get_logger().info(
-            f'Loaded {len(self._sources)} video sources: {list(self._sources.keys())}'
+            f'Loaded {len(self._sources)} video sources: {list(self._sources.keys())}, '
+            f'cyberdog_ns="{self._cyberdog_ns}"'
         )
 
     # ================================================================== asyncio 线程（aiortc）
@@ -192,9 +201,13 @@ class UranMediaNode(Node):
 
     def _start_webrtc_bridge(self, channel_id: str, src: dict):
         """CyberDog2 桥接模式：激活摄像头，注册通道，等待云端发来 SDP offer。"""
+        svc_name = src.get('camera_service_name', 'camera_service')
+        if self._cyberdog_ns and not svc_name.startswith('/'):
+            svc_name = f'{self._cyberdog_ns}/{svc_name}'
+
         adapter = CyberDog2CameraAdapter(
             node=self,
-            service_name=src.get('camera_service_name', 'camera_service'),
+            service_name=svc_name,
             width=src.get('width', 1280),
             height=src.get('height', 960),
             fps=src.get('fps', 10),
@@ -327,9 +340,12 @@ class UranMediaNode(Node):
         src = self._sources[channel_id]
 
         if src.get('source_type') == 'camera_service' and channel_id not in self._cyberdog_adapters:
+            svc_name = src.get('camera_service_name', 'camera_service')
+            if self._cyberdog_ns and not svc_name.startswith('/'):
+                svc_name = f'{self._cyberdog_ns}/{svc_name}'
             adapter = CyberDog2CameraAdapter(
                 node=self,
-                service_name=src.get('camera_service_name', 'camera_service'),
+                service_name=svc_name,
                 width=src.get('width', 1280),
                 height=src.get('height', 960),
                 fps=src.get('fps', 10),

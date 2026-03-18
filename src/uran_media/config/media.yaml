@@ -11,8 +11,8 @@ uran_media:
     # CyberDog2 主 RGB 摄像头（通过 camera_service 激活）
     - channel_id: "cyberdog_main"
       source_type: "camera_service"
-      camera_service_name: "camera_service"
-      ros_topic: "image"                # camera_service 激活后发布的 topic
+      camera_service_name: "camera_service"  # 节点会自动加 cyberdog_ns 前缀
+      ros_topic: "image"
       msg_type: "sensor_msgs/Image"
       width: 1280
       height: 960
@@ -25,6 +25,10 @@ uran_media:
       msg_type: "sensor_msgs/PointCloud2"
       encoding: "rgb8"
       fps: 15
+
+  # CyberDog2 命名空间前缀（ros2 node list 输出中 /mi_desktop_xxx/ 部分）
+  # 留空则使用裸 topic 名（非 CyberDog2 环境）
+  cyberdog_ns: "/mi_desktop_48_b0_2d_5f_b6_d0"
 
   default_protocol: "webrtc"
   webrtc:
