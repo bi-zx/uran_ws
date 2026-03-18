@@ -13,6 +13,12 @@ URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一
   - [MQTT 控制说明](#mqtt-控制说明)
   - [配置文件](#配置文件)
   - [ROS 接口](#ros-接口)
+- [uran_media 使用说明](#uran_media-使用说明)
+  - [摄像头配置](#摄像头配置)
+  - [WebRTC 信令流程](#webrtc-信令流程)
+  - [RTSP 推流](#rtsp-推流)
+  - [本地录制](#本地录制)
+  - [ROS 接口（media）](#ros-接口media)
 - [消息与服务定义](#消息与服务定义)
 - [实机测试（CyberDog2）](#实机测试cyberdog2)
 - [相关文档](#相关文档)
@@ -88,7 +94,7 @@ uran_ws/
 │   ├── uran_srvs/          # 自定义服务定义（10 条）
 │   ├── uran_core/          # 核心包 ← 已实现
 │   ├── uran_move/          # 运控包 ← 已实现（T2.1–T2.3）
-│   ├── uran_media/         # 流媒体包（待开发）
+│   ├── uran_media/         # 流媒体包 ← 已实现（T4）
 │   ├── uran_sensor/        # 传感器包（待开发）
 │   ├── uran_frpcpoint/     # 端口转发服务（待开发）
 │   └── uran_autotask/      # 自动化巡检服务（待开发）
@@ -457,6 +463,283 @@ uran_core:
 
 ---
 
+## uran_media 使用说明
+
+`uran_media` 负责 WebRTC / RTSP 流媒体通道管理，并对 CyberDog2 多摄像头做专项适配。
+
+### 依赖安装
+
+```bash
+conda activate uran
+# WebRTC（可选，不安装则以 stub 模式运行）
+pip install aiortc av aioice
+
+# RTSP 推流依赖 GStreamer（Ubuntu 系统包）
+sudo apt install python3-gi gir1.2-gst-rtsp-server-1.0 \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-x264 gstreamer1.0-rtsp
+
+# 图像处理
+pip install opencv-python-headless numpy
+```
+
+> aiortc / GStreamer 均为可选依赖。未安装时节点以 stub 模式启动，不影响其他功能包运行。
+
+### 编译与启动
+
+```bash
+# 编译
+python -m colcon build --packages-select uran_media
+
+# 启动（需先 source）
+source ~/uran_ws/install/setup.bash
+ros2 launch uran_media uran_media.launch.py
+```
+
+CyberDog2 实机上需先 source cyberdog_ws，使 `protocol` 包可见：
+
+```bash
+source ~/cyberdog_ws/install/setup.bash
+source ~/uran_ws/install/setup.bash
+ros2 run uran_media uran_media_node
+```
+
+---
+
+### 摄像头配置
+
+视频源在 `config/media.yaml` 中定义，`source_type` 控制接入方式：
+
+| source_type | 说明 | 适用摄像头 |
+|-------------|------|-----------|
+| `ros_topic` | 直接订阅 ROS topic | RealSense、其他已发布 topic 的摄像头 |
+| `camera_service` | 通过 CyberDog2 `CameraService` 激活后订阅 topic | CyberDog2 主 RGB 摄像头 |
+
+**修改配置（无需重新编译）：**
+
+```bash
+nano ~/uran_ws/install/share/uran_media/config/media.yaml
+```
+
+**添加自定义摄像头：**
+
+```yaml
+uran_media:
+  video_sources:
+    - channel_id: "my_cam"
+      source_type: "ros_topic"
+      ros_topic: "/my_camera/image_raw"
+      msg_type: "sensor_msgs/Image"
+      fps: 30
+```
+
+**CyberDog2 内置摄像头对应关系：**
+
+| 摄像头 | channel_id | source_type | topic |
+|--------|-----------|-------------|-------|
+| 主 RGB 摄像头（前置高清） | `cyberdog_main` | `camera_service` | `image` |
+| RealSense 深度摄像头 | `cyberdog_depth` | `ros_topic` | `/camera/depth/color/points` |
+
+验证 CyberDog2 摄像头服务是否可用：
+
+```bash
+ros2 service call /camera_service protocol/srv/CameraService "{command: 4}"
+# command=4 为 GET_STATE，result=0 表示正常
+```
+
+---
+
+### WebRTC 信令流程
+
+CyberDog2 上已有 `image_transmission` 节点负责完整的 WebRTC 推流，uran_media 只做**信令中继**，无需 aiortc。
+
+**CyberDog2 桥接模式**（`source_type: camera_service`）：
+
+```
+云端                    uran_media_node              image_transmission
+ │                            │                              │
+ │─ media_ctrl(start,webrtc)─►│                              │
+ │                     activate camera_service               │
+ │                     注册桥接通道，等待 offer               │
+ │                            │                              │
+ │─ media_ctrl(signal_json=   │                              │
+ │    {"type":"offer","sdp":…})►│                             │
+ │                     格式转换                               │
+ │                            │─ img_trans_signal_in ───────►│
+ │                            │   {"uid":"cyberdog_main",    │
+ │                            │    "offer_sdp":{…}}          │
+ │                            │                       协商 ICE
+ │                            │◄─ img_trans_signal_out ──────│
+ │                            │   {"uid":…,"answer_sdp":{…}} │
+ │◄─ uplink(media_signal,     │                              │
+ │    {"type":"answer",…}) ───│                              │
+ │                            │                    [WebRTC 推流至 app]
+ │─ media_ctrl(stop) ────────►│                              │
+ │                            │─ img_trans_signal_in ───────►│
+ │                            │   {"uid":…,"is_closed":true} │
+```
+
+**通用模式**（`source_type: ros_topic`）：uran_media 使用 aiortc 自行生成 SDP Offer，流程与原设计相同（aiortc 不可用时 stub）。
+
+---
+
+**通过 MQTT 发起 WebRTC 流（CyberDog2 主摄像头）：**
+
+```bash
+# 1. 启动 WebRTC 通道（激活摄像头，注册桥接）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "start",
+  "protocol": "webrtc",
+  "channel_id": "cyberdog_main",
+  "signal_json": ""
+}'
+
+# 2. 发送 SDP Offer（由 WebRTC 客户端生成后转发）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "",
+  "protocol": "",
+  "channel_id": "cyberdog_main",
+  "signal_json": "{\"type\":\"offer\",\"sdp\":\"...\"}"
+}'
+# 上行收到 data_type=media_signal，payload 含 SDP Answer（来自 image_transmission）
+
+# 3. 发送 ICE Candidate（可多次）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "",
+  "protocol": "",
+  "channel_id": "cyberdog_main",
+  "signal_json": "{\"type\":\"candidate\",\"sdpMid\":\"0\",\"sdpMLineIndex\":0,\"candidate\":\"...\"}"
+}'
+
+# 4. 停止通道
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "stop",
+  "protocol": "",
+  "channel_id": "cyberdog_main",
+  "signal_json": ""
+}'
+```
+
+**通过 ROS topic 直接测试（绕过 MQTT）：**
+
+```bash
+# 启动桥接通道
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "webrtc", channel_id: "cyberdog_main", signal_json: ""}'
+
+# 监听 image_transmission 信令出口（验证桥接是否工作）
+ros2 topic echo /img_trans_signal_out
+
+# 监听上行（验证 answer 是否转发给云端）
+ros2 topic echo /uran/core/uplink/data
+
+# 监听通道状态
+ros2 topic echo /uran/core/state/write
+# 应看到 field_name=media_active_protocol, value_json="webrtc"
+```
+
+---
+
+### RTSP 推流
+
+```bash
+# 启动 RTSP 通道
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "start",
+  "protocol": "rtsp",
+  "channel_id": "front_cam",
+  "signal_json": ""
+}'
+# 上行收到 data_type=media_rtsp_url，payload 含 rtsp://localhost:8554/front_cam
+
+# 用 VLC 或 ffplay 拉流验证
+ffplay rtsp://机器狗IP:8554/front_cam
+```
+
+---
+
+### 本地录制
+
+```bash
+# 开始录制
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "record_start",
+  "protocol": "",
+  "channel_id": "front_cam",
+  "signal_json": ""
+}'
+
+# 停止录制（触发上行 data_type=media_upload 通知）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "media_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "action": "record_stop",
+  "protocol": "",
+  "channel_id": "front_cam",
+  "signal_json": ""
+}'
+
+# 录制文件保存在（默认路径）
+ls /tmp/uran_media_record/
+```
+
+录制路径和分片时长在 `media.yaml` 的 `local_record` 段配置。
+
+---
+
+### ROS 接口（media）
+
+**订阅的 Topic：**
+
+| Topic | 消息类型 | 说明 |
+|-------|---------|------|
+| `/uran/core/downlink/media_ctrl` | `MediaCtrlCmd` | 通道控制（start/stop/switch/record/signal） |
+| `/uran/core/switch/media` | `MediaSwitchCmd` | 全局流媒体切换 |
+| 各视频源 topic（动态） | `sensor_msgs/Image` 等 | 按 media.yaml 配置动态订阅 |
+
+**发布的 Topic：**
+
+| Topic | 消息类型 | 说明 |
+|-------|---------|------|
+| `/uran/core/uplink/data` | `UplinkPayload` | SDP Offer/ICE、RTSP URL、录制完成通知 |
+| `/uran/core/state/write` | `StateField` | `media_active_protocol`、`media_channel_count` |
+
+**上行 data_type 说明：**
+
+| data_type | 触发时机 | payload 关键字段 |
+|-----------|---------|----------------|
+| `media_signal` | WebRTC SDP Offer 生成 / ICE candidate | `channel_id`, `signal`（含 type/sdp 或 candidate） |
+| `media_rtsp_url` | RTSP 通道启动 | `channel_id`, `url` |
+| `media_upload` | 录制停止 | `channel_id`, `status="ready"` |
+
+---
+
 ## 消息与服务定义
 
 ### uran_msgs
@@ -519,15 +802,26 @@ ros2 interface show uran_srvs/srv/GetStateField
 
 ```
 [云端 / MQTT] ──► uran_core_node ──► /uran/core/downlink/move_cmd
-                                              │
-                                     uran_move_node（cyberdog2 插件）
-                                              │
-                              ┌───────────────┴───────────────┐
-                              ▼                               ▼
-                    motion_servo_cmd               motion_result_cmd
-                    （速度 Servo 指令）              （站立/坐下等动作）
-                              │                               │
-                         motion_manager（cyberdog_ws 原生节点）
+                        │                         │
+                        │                uran_move_node（cyberdog2 插件）
+                        │                         │
+                        │         ┌───────────────┴───────────────┐
+                        │         ▼                               ▼
+                        │ motion_servo_cmd               motion_result_cmd
+                        │ （速度 Servo 指令）              （站立/坐下等动作）
+                        │         │                               │
+                        │    motion_manager（cyberdog_ws 原生节点）
+                        │
+                        └──► /uran/core/downlink/media_ctrl
+                                          │
+                               uran_media_node
+                                          │
+                          ┌───────────────┴───────────────┐
+                          ▼                               ▼
+                   camera_service                   ros_topic 订阅
+                 （主 RGB 摄像头激活）           （RealSense 等直接订阅）
+                          │                               │
+                    WebRTC / RTSP 推流 ◄──────────────────┘
 ```
 
 uran_move_node 通过 `protocol` 包的 ROS 接口与 cyberdog_ws 的 `motion_manager` 通信，**不需要修改任何 cyberdog_ws 代码**。
@@ -580,7 +874,7 @@ python -m colcon build
 
 ### 步骤三：启动 URAN 节点
 
-需要开两个终端（或使用 tmux）。
+需要开三个终端（或使用 tmux）。
 
 **终端 1 — uran_core：**
 
@@ -601,6 +895,16 @@ source ~/uran_ws/install/setup.bash
 ros2 run uran_move uran_move_node
 ```
 
+**终端 3 — uran_media：**
+
+```bash
+eval "$(conda shell.bash hook)" && conda activate uran
+source /opt/ros/humble/setup.bash
+source ~/cyberdog_ws/install/setup.bash   # 使 protocol/srv/CameraService 可见
+source ~/uran_ws/install/setup.bash
+ros2 run uran_media uran_media_node
+```
+
 > `cyberdog_ws/install/setup.bash` 必须在 `uran_ws/install/setup.bash` **之前** source，否则 `protocol` 包找不到。
 
 启动成功后，uran_move 日志应显示：
@@ -611,11 +915,19 @@ ros2 run uran_move uran_move_node
 [INFO] [uran_move_node]: uran_move_node ready, active_plugin=cyberdog2
 ```
 
-也可以用 launch 文件一次启动两个节点：
+uran_media 日志应显示：
+
+```
+[INFO] [uran_media_node]: Loaded 3 video sources: ['front_cam', 'cyberdog_main', 'cyberdog_depth']
+[INFO] [uran_media_node]: uran_media_node started
+```
+
+也可以用 launch 文件启动：
 
 ```bash
 ros2 launch uran_core uran_core.launch.py &
-ros2 launch uran_move uran_move.launch.py
+ros2 launch uran_move uran_move.launch.py &
+ros2 launch uran_media uran_media.launch.py
 ```
 
 ---
@@ -689,6 +1001,81 @@ ros2 service call /uran/move/switch_plugin uran_srvs/srv/SwitchMovePlugin \
 
 ---
 
+### 步骤五（续）：流媒体验证
+
+#### 5.7 验证 camera_service 可用
+
+```bash
+# 查询摄像头当前状态（command=4 为 GET_STATE）
+ros2 service call /camera_service protocol/srv/CameraService "{command: 4}"
+# result=0 表示正常
+```
+
+#### 5.8 启动 WebRTC 通道（主摄像头，桥接模式）
+
+uran_media 不使用 aiortc，而是将信令中继给 `image_transmission` 节点处理。
+
+```bash
+# 1. 启动桥接通道（激活 camera_service，注册信令中继）
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "webrtc", channel_id: "cyberdog_main", signal_json: ""}'
+
+# 2. 发送 SDP Offer（由 WebRTC 客户端生成）
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "", protocol: "", channel_id: "cyberdog_main",
+    signal_json: "{\"type\":\"offer\",\"sdp\":\"v=0...\"}"}'
+
+# 3. 监听 image_transmission 信令出口（验证 offer 已转发）
+ros2 topic echo /img_trans_signal_out
+# 应收到 {"uid":"cyberdog_main","answer_sdp":{...}}
+
+# 4. 监听上行（验证 answer 已转发给云端）
+ros2 topic echo /uran/core/uplink/data
+
+# 验证状态写入
+ros2 topic echo /uran/core/state/write
+# 应看到 field_name=media_active_protocol, value_json="webrtc"
+#        field_name=media_channel_count, value_json=1
+```
+
+#### 5.9 启动 RTSP 通道（前置摄像头）
+
+```bash
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "rtsp", channel_id: "front_cam", signal_json: ""}'
+
+# 监听 RTSP URL 上报
+ros2 topic echo /uran/core/uplink/data
+# 应看到 data_type=media_rtsp_url，url=rtsp://localhost:8554/front_cam
+
+# 在主机上拉流验证（将机器狗 IP 替换为实际 IP）
+ffplay rtsp://192.168.x.x:8554/front_cam
+```
+
+#### 5.10 本地录制验证
+
+```bash
+# 开始录制
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "record_start", protocol: "", channel_id: "front_cam", signal_json: ""}'
+
+# 等待 10 秒后停止
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "record_stop", protocol: "", channel_id: "front_cam", signal_json: ""}'
+
+# 检查录制文件
+ls /tmp/uran_media_record/
+```
+
+#### 5.11 停止所有通道
+
+```bash
+ros2 topic pub --once /uran/core/switch/media uran_msgs/msg/MediaSwitchCmd \
+  '{action: "stop_all", protocol: "", timestamp_ns: 0}'
+```
+
+---
+
 ### 步骤六：模式切换验证
 
 uran_move 会过滤与当前控制模式不匹配的指令来源：
@@ -710,7 +1097,31 @@ ros2 topic echo /uran/core/uplink/data
 
 ### 常见问题
 
-**Q: uran_move 启动时报 `protocol package not found`**
+**Q: uran_media 启动时报 `protocol package not found`（camera_service 不可用）**
+
+正常现象，节点会自动降级：跳过 `camera_service` 激活，直接订阅 ros_topic。若需要激活主摄像头，确保先 source cyberdog_ws：
+
+```bash
+source ~/cyberdog_ws/install/setup.bash
+source ~/uran_ws/install/setup.bash
+ros2 run uran_media uran_media_node
+```
+
+**Q: WebRTC 启动后收不到 SDP Offer**
+
+1. 确认 aiortc 已安装：`pip show aiortc`
+2. 检查 uran_media 日志是否有 `aiortc not available`（stub 模式不生成真实 Offer）
+3. 确认 channel_id 在 `media.yaml` 中存在
+
+**Q: RTSP 拉流失败**
+
+1. 确认 GStreamer 已安装：`gst-launch-1.0 --version`
+2. 检查端口是否被占用：`ss -tlnp | grep 8554`
+3. 确认防火墙放行 8554 端口：`sudo ufw allow 8554`
+
+**Q: 录制文件为空或无法播放**
+
+确认 opencv-python 已安装：`pip show opencv-python-headless`。录制依赖 cv2.VideoWriter，需要 XVID 编解码器支持。
 
 `protocol` 包来自 cyberdog_ws，需要先 source cyberdog_ws 的 install：
 

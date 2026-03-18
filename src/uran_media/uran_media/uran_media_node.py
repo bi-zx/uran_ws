@@ -1,11 +1,11 @@
 """uran_media_node.py — URAN-media 主节点（T4.1 + T4.2 + T4.3 + T4.4）
 
-职责：
-  - 动态订阅视频源 topic（T4.1）
-  - WebRTC 通道管理，SDP 信令上报（T4.2）
-  - RTSP Server 通道管理（T4.3）
-  - 本地录制（T4.4）
-  - CyberDog2 camera_service 适配
+WebRTC 实现策略：
+  - source_type=camera_service（CyberDog2 主摄像头）：
+      信令中继模式 —— 将云端 SDP/ICE 转发给 image_transmission 节点，
+      由 image_transmission 完成实际 WebRTC 推流，无需 aiortc。
+  - source_type=ros_topic（通用摄像头）：
+      aiortc 模式（若 aiortc 不可用则 stub）。
 """
 
 import asyncio
@@ -14,11 +14,12 @@ import os
 import queue
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Set
 
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
+from std_msgs.msg import String
 import yaml
 
 from uran_msgs.msg import MediaCtrlCmd, MediaSwitchCmd, UplinkPayload, StateField
@@ -26,6 +27,7 @@ from uran_msgs.msg import MediaCtrlCmd, MediaSwitchCmd, UplinkPayload, StateFiel
 from .webrtc_channel import WebRTCChannel
 from .rtsp_server import RTSPServer
 from .cyberdog2_camera import CyberDog2CameraAdapter
+from . import cyberdog2_webrtc_bridge as bridge
 
 
 def _load_yaml(path: str) -> dict:
@@ -41,17 +43,22 @@ class UranMediaNode(Node):
         super().__init__('uran_media_node')
 
         self._cfg: dict = {}
-        self._sources: Dict[str, dict] = {}       # channel_id -> source config
+        self._sources: Dict[str, dict] = {}
+
+        # WebRTC：桥接通道（camera_service）
+        self._bridge_channels: Set[str] = set()
+
+        # WebRTC：aiortc 通道（ros_topic，aiortc 可用时）
         self._webrtc_channels: Dict[str, WebRTCChannel] = {}
+
         self._rtsp_server = RTSPServer()
         self._cyberdog_adapters: Dict[str, CyberDog2CameraAdapter] = {}
-        self._image_subs: Dict[str, object] = {}  # channel_id -> subscription
-        self._recorders: Dict[str, object] = {}   # channel_id -> cv2.VideoWriter
+        self._image_subs: Dict[str, object] = {}
+        self._recorders: Dict[str, object] = {}
 
-        # asyncio 事件循环（独立线程，供 aiortc 使用）
+        # asyncio 事件循环（供 aiortc 使用）
         self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._loop_thread.start()
+        threading.Thread(target=self._run_loop, daemon=True).start()
 
         self._load_config()
 
@@ -68,10 +75,19 @@ class UranMediaNode(Node):
             self._cb_media_switch,
             10,
         )
+        # image_transmission 信令出口（CyberDog2 WebRTC 应答）
+        self.create_subscription(
+            String,
+            'img_trans_signal_out',
+            self._cb_img_trans_out,
+            10,
+        )
 
         # ---------- 发布 ----------
         self._uplink_pub = self.create_publisher(UplinkPayload, '/uran/core/uplink/data', 10)
         self._state_pub = self.create_publisher(StateField, '/uran/core/state/write', 10)
+        # image_transmission 信令入口
+        self._img_trans_pub = self.create_publisher(String, 'img_trans_signal_in', 10)
 
         self.get_logger().info('uran_media_node started')
 
@@ -95,13 +111,12 @@ class UranMediaNode(Node):
             f'Loaded {len(self._sources)} video sources: {list(self._sources.keys())}'
         )
 
-    # ================================================================== asyncio 线程
+    # ================================================================== asyncio 线程（aiortc）
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
     def _run_coro(self, coro):
-        """在 asyncio 线程中调度协程，返回 Future。"""
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     # ================================================================== 下行回调
@@ -150,42 +165,58 @@ class UranMediaNode(Node):
         if action == 'stop_all':
             self._stop_all_channels()
         elif action == 'start':
-            # 对所有已知 source 启动指定协议
             for cid in self._sources:
                 if protocol == 'webrtc':
                     self._start_webrtc(cid)
                 elif protocol == 'rtsp':
                     self._start_rtsp(cid)
 
-    # ================================================================== WebRTC（T4.2）
+    # ================================================================== WebRTC 启动
     def _start_webrtc(self, channel_id: str):
         if channel_id not in self._sources:
             self.get_logger().warning(f'Unknown channel_id: {channel_id}')
             return
 
-        if channel_id in self._webrtc_channels:
+        if channel_id in self._bridge_channels or channel_id in self._webrtc_channels:
             self.get_logger().info(f'WebRTC channel already active: {channel_id}')
             return
 
         src = self._sources[channel_id]
 
-        # CyberDog2 camera_service 激活
+        # CyberDog2 camera_service → 信令桥接模式
         if src.get('source_type') == 'camera_service':
-            adapter = CyberDog2CameraAdapter(
-                node=self,
-                service_name=src.get('camera_service_name', 'camera_service'),
-                width=src.get('width', 1280),
-                height=src.get('height', 960),
-                fps=src.get('fps', 10),
-            )
-            ok = adapter.activate()
-            if not ok:
-                self.get_logger().error(
-                    f'Failed to activate CyberDog2 camera for channel {channel_id}'
-                )
-                return
-            self._cyberdog_adapters[channel_id] = adapter
+            self._start_webrtc_bridge(channel_id, src)
+        else:
+            # 通用 ros_topic → aiortc 模式
+            self._start_webrtc_aiortc(channel_id, src)
 
+    def _start_webrtc_bridge(self, channel_id: str, src: dict):
+        """CyberDog2 桥接模式：激活摄像头，注册通道，等待云端发来 SDP offer。"""
+        adapter = CyberDog2CameraAdapter(
+            node=self,
+            service_name=src.get('camera_service_name', 'camera_service'),
+            width=src.get('width', 1280),
+            height=src.get('height', 960),
+            fps=src.get('fps', 10),
+        )
+        ok = adapter.activate()
+        if not ok:
+            self.get_logger().error(
+                f'Failed to activate CyberDog2 camera for channel {channel_id}'
+            )
+            return
+
+        self._cyberdog_adapters[channel_id] = adapter
+        self._bridge_channels.add(channel_id)
+        self._update_state()
+
+        self.get_logger().info(
+            f'[bridge] WebRTC channel ready: {channel_id}. '
+            'Waiting for SDP offer from cloud via signal_json.'
+        )
+
+    def _start_webrtc_aiortc(self, channel_id: str, src: dict):
+        """通用 aiortc 模式：生成 SDP Offer 并上报。"""
         stun = self._cfg.get('webrtc', {}).get('stun_server', 'stun:stun.l.google.com:19302')
         channel = WebRTCChannel(
             channel_id=channel_id,
@@ -194,13 +225,9 @@ class UranMediaNode(Node):
         )
         self._webrtc_channels[channel_id] = channel
 
-        # 异步生成 SDP Offer
         future = self._run_coro(channel.start())
-        future.add_done_callback(
-            lambda f: self._on_offer_ready(channel_id, f)
-        )
+        future.add_done_callback(lambda f: self._on_offer_ready(channel_id, f))
 
-        # 订阅视频 topic
         self._subscribe_topic(channel_id, src)
         self._update_state()
 
@@ -209,44 +236,87 @@ class UranMediaNode(Node):
             offer_json = future.result()
             self._publish_uplink(
                 data_type='media_signal',
-                payload={
-                    'channel_id': channel_id,
-                    'signal': json.loads(offer_json),
-                },
-                urgent=False,
+                payload={'channel_id': channel_id, 'signal': json.loads(offer_json)},
             )
             self.get_logger().info(f'SDP Offer published for channel: {channel_id}')
         except Exception as e:
             self.get_logger().error(f'Failed to generate SDP offer for {channel_id}: {e}')
 
     def _on_webrtc_signal(self, channel_id: str, signal: dict):
-        """WebRTC ICE candidate 回调 → 上报到 uplink。"""
+        """aiortc ICE candidate 回调 → 上报到 uplink。"""
         self._publish_uplink(
             data_type='media_signal',
             payload={'channel_id': channel_id, 'signal': signal},
-            urgent=False,
         )
 
+    # ================================================================== 信令处理
     def _handle_signal(self, channel_id: str, signal_json: str):
-        """处理来自云端的 SDP Answer 或 ICE Candidate。"""
+        """处理来自云端的 SDP offer/answer 或 ICE Candidate。"""
         try:
-            data = json.loads(signal_json)
+            signal = json.loads(signal_json)
         except json.JSONDecodeError:
             self.get_logger().warning(f'Invalid signal_json for {channel_id}')
             return
 
-        sig_type = data.get('type', '')
+        # 桥接模式：转发给 image_transmission
+        if channel_id in self._bridge_channels:
+            raw = bridge.to_img_trans(channel_id, signal)
+            if raw:
+                msg = String()
+                msg.data = raw
+                self._img_trans_pub.publish(msg)
+                self.get_logger().debug(
+                    f'[bridge] Forwarded signal type={signal.get("type")} for {channel_id}'
+                )
+            return
+
+        # aiortc 模式
         channel = self._webrtc_channels.get(channel_id)
         if channel is None:
             self.get_logger().warning(f'No active WebRTC channel for {channel_id}')
             return
 
+        sig_type = signal.get('type', '')
         if sig_type == 'answer':
             self._run_coro(channel.set_answer(signal_json))
         elif sig_type == 'candidate':
             self._run_coro(channel.add_ice_candidate(signal_json))
         else:
             self.get_logger().warning(f'Unknown signal type: {sig_type}')
+
+    # ================================================================== image_transmission 应答回调
+    def _cb_img_trans_out(self, msg: String):
+        """接收 image_transmission 的信令应答，转发给云端。"""
+        uid, signal = bridge.from_img_trans(msg.data)
+        if uid is None or signal is None:
+            return
+
+        # uid 即 channel_id
+        if uid not in self._bridge_channels:
+            return
+
+        sig_type = signal.get('type', '')
+
+        if sig_type in ('answer', 'candidate', 'offer'):
+            self._publish_uplink(
+                data_type='media_signal',
+                payload={'channel_id': uid, 'signal': signal},
+            )
+            self.get_logger().debug(
+                f'[bridge] Forwarded {sig_type} from image_transmission for {uid}'
+            )
+        elif sig_type == 'closed':
+            self.get_logger().info(f'[bridge] image_transmission closed channel: {uid}')
+            self._bridge_channels.discard(uid)
+            self._update_state()
+        elif sig_type == 'error':
+            self.get_logger().error(
+                f'[bridge] image_transmission error for {uid}: {signal.get("error")}'
+            )
+            self._publish_uplink(
+                data_type='media_signal',
+                payload={'channel_id': uid, 'signal': signal},
+            )
 
     # ================================================================== RTSP（T4.3）
     def _start_rtsp(self, channel_id: str):
@@ -256,7 +326,6 @@ class UranMediaNode(Node):
 
         src = self._sources[channel_id]
 
-        # CyberDog2 camera_service 激活
         if src.get('source_type') == 'camera_service' and channel_id not in self._cyberdog_adapters:
             adapter = CyberDog2CameraAdapter(
                 node=self,
@@ -278,7 +347,6 @@ class UranMediaNode(Node):
         self._publish_uplink(
             data_type='media_rtsp_url',
             payload={'channel_id': channel_id, 'url': url},
-            urgent=False,
         )
 
         self._subscribe_topic(channel_id, src)
@@ -287,22 +355,24 @@ class UranMediaNode(Node):
 
     # ================================================================== 停止
     def _stop_channel(self, channel_id: str):
-        # 停止 WebRTC
+        # 桥接模式：发送 is_closed 给 image_transmission
+        if channel_id in self._bridge_channels:
+            msg = String()
+            msg.data = bridge.make_stop(channel_id)
+            self._img_trans_pub.publish(msg)
+            self._bridge_channels.discard(channel_id)
+
+        # aiortc 模式
         if channel_id in self._webrtc_channels:
             self._run_coro(self._webrtc_channels[channel_id].stop())
             del self._webrtc_channels[channel_id]
 
-        # 停止 RTSP
         self._rtsp_server.stop(channel_id)
-
-        # 停止录制
         self._stop_record(channel_id)
 
-        # 取消订阅
         if channel_id in self._image_subs:
             self.destroy_subscription(self._image_subs.pop(channel_id))
 
-        # 停用 CyberDog2 摄像头
         if channel_id in self._cyberdog_adapters:
             self._cyberdog_adapters[channel_id].deactivate()
             del self._cyberdog_adapters[channel_id]
@@ -311,14 +381,14 @@ class UranMediaNode(Node):
         self.get_logger().info(f'Channel stopped: {channel_id}')
 
     def _stop_all_channels(self):
-        for cid in list(self._webrtc_channels.keys()):
+        for cid in list(self._bridge_channels) + list(self._webrtc_channels.keys()):
             self._stop_channel(cid)
         self._rtsp_server.stop_all()
 
     # ================================================================== 视频 topic 订阅
     def _subscribe_topic(self, channel_id: str, src: dict):
         if channel_id in self._image_subs:
-            return  # 已订阅
+            return
 
         topic = src.get('ros_topic', '')
         msg_type_str = src.get('msg_type', 'sensor_msgs/Image')
@@ -345,7 +415,7 @@ class UranMediaNode(Node):
                 )
             else:
                 self.get_logger().warning(
-                    f'Unsupported msg_type {msg_type_str} for channel {channel_id}, skipping subscription'
+                    f'Unsupported msg_type {msg_type_str} for {channel_id}, skipping'
                 )
                 return
 
@@ -356,19 +426,14 @@ class UranMediaNode(Node):
 
     # ================================================================== 图像回调
     def _cb_image(self, channel_id: str, msg):
-        """sensor_msgs/Image → numpy → push to WebRTC/RTSP/recorder。"""
         try:
             import numpy as np
-            frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
-                msg.height, msg.width, -1
-            )
+            frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
         except Exception:
             return
-
-        self._dispatch_frame(channel_id, frame, msg)
+        self._dispatch_frame(channel_id, frame)
 
     def _cb_compressed_image(self, channel_id: str, msg):
-        """sensor_msgs/CompressedImage → numpy → push to WebRTC/RTSP/recorder。"""
         try:
             import numpy as np
             import cv2
@@ -378,18 +443,15 @@ class UranMediaNode(Node):
                 return
         except Exception:
             return
+        self._dispatch_frame(channel_id, frame)
 
-        self._dispatch_frame(channel_id, frame, msg)
-
-    def _dispatch_frame(self, channel_id: str, frame, msg):
-        # WebRTC
+    def _dispatch_frame(self, channel_id: str, frame):
+        # aiortc 通道（桥接模式不需要帧，image_transmission 自己读摄像头）
         if channel_id in self._webrtc_channels:
             self._webrtc_channels[channel_id].push_frame(frame)
 
-        # RTSP
         self._rtsp_server.push_frame(channel_id, frame)
 
-        # 录制
         if channel_id in self._recorders:
             try:
                 self._recorders[channel_id].write(frame)
@@ -433,26 +495,21 @@ class UranMediaNode(Node):
         try:
             writer.release()
             self.get_logger().info(f'Recording stopped: {channel_id}')
-            # 触发上传通知
             self._publish_uplink(
                 data_type='media_upload',
                 payload={'channel_id': channel_id, 'status': 'ready'},
-                urgent=False,
             )
         except Exception as e:
             self.get_logger().error(f'Error stopping recorder for {channel_id}: {e}')
 
     # ================================================================== 状态写入
     def _update_state(self):
-        active_webrtc = len(self._webrtc_channels)
-        active_rtsp = len([
-            cid for cid in self._sources
-            if cid not in self._webrtc_channels
-            and self._rtsp_server._channels.get(cid) is not None
-        ])
-        total = active_webrtc + active_rtsp
+        active_bridge = len(self._bridge_channels)
+        active_aiortc = len(self._webrtc_channels)
+        active_rtsp = len(self._rtsp_server._channels)
+        total = active_bridge + active_aiortc + active_rtsp
 
-        if active_webrtc > 0:
+        if active_bridge + active_aiortc > 0:
             protocol = 'webrtc'
         elif active_rtsp > 0:
             protocol = 'rtsp'
@@ -462,7 +519,7 @@ class UranMediaNode(Node):
         self._write_state('media_active_protocol', protocol)
         self._write_state('media_channel_count', total)
 
-    # ================================================================== 上报 / 状态写入 helpers
+    # ================================================================== helpers
     def _publish_uplink(self, data_type: str, payload: dict, urgent: bool = False):
         msg = UplinkPayload()
         msg.source_pkg = 'uran_media'
