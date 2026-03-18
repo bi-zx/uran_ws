@@ -78,12 +78,13 @@ class RTSPServer:
 
             factory = GstRtspServer.RTSPMediaFactory()
             pipeline_str = (
-                f'( appsrc name=src is-live=true block=true format=time '
+                f'( appsrc name=src is-live=true block=false do-timestamp=true format=time '
                 f'caps=video/x-raw,format=BGR,width={width},height={height},'
                 f'framerate={fps}/1 ! '
                 f'videoconvert ! video/x-raw,format=I420 ! '
-                f'x264enc tune=zerolatency speed-preset=ultrafast ! '
-                f'rtph264pay name=pay0 pt=96 )'
+                f'x264enc tune=zerolatency speed-preset=ultrafast '
+                f'key-int-max={fps} ! '
+                f'rtph264pay name=pay0 pt=96 config-interval=1 )'
             )
             factory.set_launch(pipeline_str)
             factory.set_shared(True)
