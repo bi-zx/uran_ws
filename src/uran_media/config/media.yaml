@@ -26,6 +26,29 @@ uran_media:
       encoding: "rgb8"
       fps: 15
 
+    # CyberDog2 双目/RGB 相机（通过 stereo_camera lifecycle 节点）
+    # 启动后发布 image_left / image_right / image_rgb 三个 topic
+    - channel_id: "stereo_left"
+      source_type: "lifecycle_node"
+      lifecycle_node_name: "stereo_camera"   # 节点会自动加 cyberdog_ns 前缀
+      ros_topic: "image_left"
+      msg_type: "sensor_msgs/Image"
+      fps: 30
+
+    - channel_id: "stereo_right"
+      source_type: "lifecycle_node"
+      lifecycle_node_name: "stereo_camera"
+      ros_topic: "image_right"
+      msg_type: "sensor_msgs/Image"
+      fps: 30
+
+    - channel_id: "stereo_rgb"
+      source_type: "lifecycle_node"
+      lifecycle_node_name: "stereo_camera"
+      ros_topic: "image_rgb"
+      msg_type: "sensor_msgs/Image"
+      fps: 30
+
   # CyberDog2 命名空间前缀（ros2 node list 输出中 /mi_desktop_xxx/ 部分）
   # 留空则使用裸 topic 名（非 CyberDog2 环境）
   cyberdog_ns: "/mi_desktop_48_b0_2d_5f_b6_d0"
