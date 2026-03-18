@@ -24,12 +24,12 @@ except Exception:
 
 
 class _ChannelState:
-    def __init__(self, port: int, url: str):
+    def __init__(self, port: int, url: str, fps: int):
         self.port = port
         self.url = url
         self.appsrc = None
         self.pts = 0
-        self.fps = 30
+        self.fps = fps
 
 
 class RTSPServer:
@@ -58,15 +58,12 @@ class RTSPServer:
             return self._channels[channel_id].url
 
         try:
-            state = _ChannelState(port, url)
-            state.fps = fps
-
             server = GstRtspServer.RTSPServer()
             server.set_service(str(port))
 
             factory = GstRtspServer.RTSPMediaFactory()
             pipeline_str = (
-                f'( appsrc name=src_{channel_id} is-live=true block=false format=time '
+                f'( appsrc name=src_{channel_id} is-live=true block=true format=time '
                 f'caps=video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1 ! '
                 f'videoconvert ! video/x-raw,format=I420 ! '
                 f'x264enc tune=zerolatency speed-preset=ultrafast ! rtph264pay name=pay0 pt=96 )'
@@ -74,15 +71,16 @@ class RTSPServer:
             factory.set_launch(pipeline_str)
             factory.set_shared(True)
 
-            # 客户端连接时通过 media-configure 信号拿到 appsrc 引用
-            def on_media_configure(fac, media, st=state, cid=channel_id):
+            state = _ChannelState(port, url, fps)
+            self._channels[channel_id] = state
+
+            # 客户端首次连接时触发，此时才能拿到 appsrc 元素引用
+            def on_media_configure(factory, media, cid=channel_id):
                 pipeline = media.get_element()
-                src = pipeline.get_by_name(f'src_{cid}')
-                if src:
-                    st.appsrc = src
-                    logger.info(f'[RTSP] appsrc acquired for {cid}')
-                else:
-                    logger.warning(f'[RTSP] appsrc not found in pipeline for {cid}')
+                appsrc = pipeline.get_by_name(f'src_{cid}')
+                if appsrc:
+                    self._channels[cid].appsrc = appsrc
+                    logger.info(f'[RTSP] appsrc ready for channel: {cid}')
 
             factory.connect('media-configure', on_media_configure)
 
@@ -90,7 +88,6 @@ class RTSPServer:
             mounts.add_factory(f'/{channel_id}', factory)
             server.attach(None)
 
-            self._channels[channel_id] = state
             self._servers[channel_id] = server
 
             # GLib 主循环（独立线程）
