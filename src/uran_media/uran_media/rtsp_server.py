@@ -1,166 +1,226 @@
-"""rtsp_server.py — RTSP Server 封装
+"""rtsp_server.py — RTSP Server 封装（子进程模式）
 
-使用 GStreamer appsrc + GstRtspServer 推送帧。
-每个 server 实例使用独立 GLib MainContext 避免与 ROS 冲突。
-若 GStreamer 不可用，降级为 stub 模式。
+在独立子进程中运行 GstRtspServer，彻底隔离 GLib 与 ROS 线程冲突。
+ROS 主进程通过 stdin pipe 传递帧数据给子进程。
 """
 
 import logging
+import os
+import struct
+import subprocess
+import sys
 import threading
-import time
 from typing import Dict
 
 logger = logging.getLogger(__name__)
 
+_GST_AVAILABLE = False
 try:
     import gi
     gi.require_version('Gst', '1.0')
     gi.require_version('GstRtspServer', '1.0')
-    from gi.repository import Gst, GstRtspServer, GLib
-    Gst.init(None)
     _GST_AVAILABLE = True
 except Exception:
-    _GST_AVAILABLE = False
+    pass
+
+# 子进程入口脚本（内联，写入临时文件运行）
+_WORKER_SCRIPT = r'''
+import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer, GLib
+import signal, struct, sys, threading
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+Gst.init(None)
+
+channel_id = sys.argv[1]
+width  = int(sys.argv[2])
+height = int(sys.argv[3])
+fps    = int(sys.argv[4])
+port   = int(sys.argv[5])
+frame_size = width * height * 3
+
+appsrc = None
+
+def on_media_configure(factory, media):
+    global appsrc
+    el = media.get_element()
+    src = el.get_by_name('source')
+    if src:
+        appsrc = src
+        print(f'[RTSP] appsrc acquired: {channel_id}', flush=True)
+
+server = GstRtspServer.RTSPServer()
+server.set_service(str(port))
+
+factory = GstRtspServer.RTSPMediaFactory()
+pipeline_str = (
+    f'( appsrc name=source is-live=true do-timestamp=true format=time '
+    f'caps=video/x-raw,format=BGR,width={width},height={height},'
+    f'framerate={fps}/1 ! '
+    f'videoconvert ! video/x-raw,format=I420 ! '
+    f'x264enc tune=zerolatency speed-preset=ultrafast '
+    f'key-int-max={fps} ! rtph264pay name=pay0 pt=96 )'
+)
+factory.set_launch(pipeline_str)
+factory.set_shared(True)
+factory.connect('media-configure', on_media_configure)
+
+mounts = server.get_mount_points()
+mounts.add_factory(f'/{channel_id}', factory)
+server.attach(None)
+
+loop = GLib.MainLoop()
+threading.Thread(target=loop.run, daemon=True).start()
+
+print(f'[RTSP] READY rtsp://localhost:{port}/{channel_id}', flush=True)
+
+pts = 0
+duration = Gst.util_uint64_scale_int(1, Gst.SECOND, fps)
+stdin = sys.stdin.buffer
+
+while True:
+    try:
+        raw = stdin.read(4)
+        if not raw or len(raw) < 4:
+            break
+        sz = struct.unpack('<I', raw)[0]
+        if sz == 0:
+            break
+        data = b''
+        while len(data) < sz:
+            chunk = stdin.read(sz - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) != sz:
+            break
+        if appsrc is not None:
+            buf = Gst.Buffer.new_allocate(None, sz, None)
+            buf.fill(0, data)
+            buf.pts = pts
+            buf.duration = duration
+            pts += duration
+            appsrc.emit('push-buffer', buf)
+    except Exception:
+        break
+
+loop.quit()
+'''
 
 
 class _ChannelState:
-    def __init__(self, port: int, url: str, fps: int):
+    def __init__(self, port: int, url: str, fps: int, width: int, height: int):
         self.port = port
         self.url = url
         self.fps = fps
-        self.appsrc = None
-        self.pts = 0
-        self.latest_frame = None  # 缓冲最新帧
+        self.width = width
+        self.height = height
+        self.proc = None
         self.lock = threading.Lock()
 
 
 class RTSPServer:
-    """多通道 RTSP Server。"""
+    """多通道 RTSP Server（子进程隔离）。"""
 
     def __init__(self):
         self._channels: Dict[str, _ChannelState] = {}
-        self._servers: Dict[str, object] = {}
-        self._loops: Dict[str, object] = {}
-        self._contexts: Dict[str, object] = {}
         self._available = _GST_AVAILABLE
-
+        self._script_path = None
         if not self._available:
             logger.warning('GStreamer not available; RTSPServer in stub mode')
 
+    def _ensure_script(self) -> str:
+        if self._script_path and os.path.exists(self._script_path):
+            return self._script_path
+        path = '/tmp/_uran_rtsp_worker.py'
+        with open(path, 'w') as f:
+            f.write(_WORKER_SCRIPT)
+        self._script_path = path
+        return path
+
     def start(self, channel_id: str, width: int = 640, height: int = 480,
               fps: int = 30, port: int = 8554) -> str:
-        """启动 RTSP Server，返回 rtsp URL。"""
         url = f'rtsp://localhost:{port}/{channel_id}'
 
         if not self._available:
-            logger.info(f'[RTSP stub] Would start {url}')
-            self._channels[channel_id] = _ChannelState(port, url, fps)
+            logger.info(f'[RTSP stub] {url}')
+            self._channels[channel_id] = _ChannelState(port, url, fps, width, height)
             return url
 
         if channel_id in self._channels:
             return self._channels[channel_id].url
 
-        state = _ChannelState(port, url, fps)
-        self._channels[channel_id] = state
+        state = _ChannelState(port, url, fps, width, height)
 
         try:
-            # 独立 GLib context，避免与 ROS / 其他 GLib 用户冲突
-            context = GLib.MainContext.new()
-            self._contexts[channel_id] = context
-
-            server = GstRtspServer.RTSPServer()
-            server.set_service(str(port))
-
-            factory = GstRtspServer.RTSPMediaFactory()
-            pipeline_str = (
-                f'( appsrc name=source is-live=true do-timestamp=true format=time '
-                f'caps=video/x-raw,format=BGR,width={width},height={height},'
-                f'framerate={fps}/1 ! '
-                f'videoconvert ! video/x-raw,format=I420 ! '
-                f'x264enc tune=zerolatency speed-preset=ultrafast '
-                f'key-int-max={fps} ! rtph264pay name=pay0 pt=96 )'
+            script = self._ensure_script()
+            proc = subprocess.Popen(
+                [sys.executable, script,
+                 channel_id, str(width), str(height), str(fps), str(port)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
-            factory.set_launch(pipeline_str)
-            factory.set_shared(True)
+            state.proc = proc
+            self._channels[channel_id] = state
 
-            def on_media_configure(factory_obj, media, cid=channel_id):
-                element = media.get_element()
-                appsrc = element.get_by_name('source')
-                if appsrc:
-                    with self._channels[cid].lock:
-                        self._channels[cid].appsrc = appsrc
-                    logger.info(f'[RTSP] appsrc acquired: {cid}')
-                    # 立即推送缓冲帧，防止 pipeline preroll 超时
-                    cached = self._channels[cid].latest_frame
-                    if cached is not None:
-                        self._do_push(cid, cached)
+            # 等待子进程 READY 信号
+            def _read_stdout():
+                for line in iter(proc.stdout.readline, b''):
+                    text = line.decode('utf-8', errors='replace').strip()
+                    if text:
+                        logger.info(text)
 
-            factory.connect('media-configure', on_media_configure)
+            threading.Thread(target=_read_stdout, daemon=True).start()
 
-            mounts = server.get_mount_points()
-            mounts.add_factory(f'/{channel_id}', factory)
-            server.attach(context)
+            # 给子进程一点启动时间
+            import time
+            time.sleep(0.5)
 
-            self._servers[channel_id] = server
-
-            loop = GLib.MainLoop.new(context, False)
-            self._loops[channel_id] = loop
-            t = threading.Thread(target=self._run_loop, args=(loop, context),
-                                 daemon=True)
-            t.start()
-
-            logger.info(f'[RTSP] Started: {url}')
+            logger.info(f'[RTSP] Worker started: {url}')
         except Exception as e:
             logger.error(f'[RTSP] Failed to start {channel_id}: {e}')
 
         return url
 
-    @staticmethod
-    def _run_loop(loop, context):
-        """在独立线程中运行 GLib MainLoop，手动 acquire context。"""
-        context.acquire()
-        try:
-            loop.run()
-        finally:
-            context.release()
-
     def push_frame(self, channel_id: str, numpy_frame):
-        """推送 numpy BGR 帧到对应通道。"""
         if not self._available:
             return
         state = self._channels.get(channel_id)
-        if state is None:
+        if state is None or state.proc is None:
             return
-        # 始终缓存最新帧（供 media-configure 首帧使用）
-        state.latest_frame = numpy_frame
-        self._do_push(channel_id, numpy_frame)
+        if state.proc.poll() is not None:
+            return  # 子进程已退出
 
-    def _do_push(self, channel_id: str, numpy_frame):
-        state = self._channels.get(channel_id)
-        if state is None or state.appsrc is None:
-            return
         try:
+            h, w = numpy_frame.shape[:2]
+            if w != state.width or h != state.height:
+                import cv2
+                numpy_frame = cv2.resize(numpy_frame, (state.width, state.height))
+
             data = numpy_frame.tobytes()
-            buf = Gst.Buffer.new_allocate(None, len(data), None)
-            buf.fill(0, data)
-            buf.pts = state.pts
-            buf.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, state.fps)
-            state.pts += buf.duration
-            state.appsrc.emit('push-buffer', buf)
+            header = struct.pack('<I', len(data))
+            with state.lock:
+                state.proc.stdin.write(header)
+                state.proc.stdin.write(data)
+                state.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            logger.warning(f'[RTSP] Pipe broken for {channel_id}')
         except Exception as e:
             logger.debug(f'[RTSP] push error ({channel_id}): {e}')
 
     def stop(self, channel_id: str):
-        """停止对应通道。"""
-        if channel_id in self._loops:
+        state = self._channels.pop(channel_id, None)
+        if state is None:
+            return
+        if state.proc and state.proc.poll() is None:
             try:
-                self._loops[channel_id].quit()
+                state.proc.stdin.write(struct.pack('<I', 0))
+                state.proc.stdin.flush()
+                state.proc.wait(timeout=3.0)
             except Exception:
-                pass
-            del self._loops[channel_id]
-        self._contexts.pop(channel_id, None)
-        self._channels.pop(channel_id, None)
-        self._servers.pop(channel_id, None)
+                state.proc.kill()
         logger.info(f'[RTSP] Stopped: {channel_id}')
 
     def stop_all(self):
