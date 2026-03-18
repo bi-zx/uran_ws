@@ -45,33 +45,36 @@ class CyberDog2CameraAdapter:
             self._available = False
 
     def activate(self) -> bool:
-        """激活摄像头：先 STOP 再 START，返回是否成功。"""
+        """激活摄像头：调用 START_IMAGE_PUBLISH，返回是否成功。
+
+        不再预先调用 STOP —— camera_service 可能被 image_transmission 占用，
+        STOP 超时会白白浪费 5 秒。若 START 也超时（摄像头已由其他节点激活），
+        降级为 WARN 并返回 True，让调用方直接订阅 topic。
+        """
         if not self._available:
             self._node.get_logger().info(
                 '[CyberDog2Camera] Skipping activation (protocol not available)'
             )
-            return True  # 降级模式视为成功，直接订阅 topic
+            return True
 
         if not self._client.wait_for_service(timeout_sec=3.0):
             self._node.get_logger().warning(
-                f'[CyberDog2Camera] Service {self._service_name} not available'
+                f'[CyberDog2Camera] Service {self._service_name} not available, '
+                'will try to subscribe topic directly'
             )
-            return False
+            return True  # 服务不可达时也尝试直接订阅
 
-        # 先停止，确保干净状态
-        self._call_service(CMD_STOP_IMAGE_PUBLISH)
-
-        # 启动图像发布
         result = self._call_service(CMD_START_IMAGE_PUBLISH)
         if result and result.result == RESULT_SUCCESS:
             self._node.get_logger().info('[CyberDog2Camera] Camera activated successfully')
             return True
         else:
             code = result.result if result else -1
-            self._node.get_logger().error(
-                f'[CyberDog2Camera] START_IMAGE_PUBLISH failed, result={code}'
+            self._node.get_logger().warning(
+                f'[CyberDog2Camera] START_IMAGE_PUBLISH result={code} '
+                '(camera may already be active via image_transmission), proceeding anyway'
             )
-            return False
+            return True  # 摄像头可能已由 image_transmission 激活，直接订阅 topic
 
     def deactivate(self):
         """停止摄像头图像发布。"""
