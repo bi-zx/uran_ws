@@ -16,6 +16,8 @@ URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一
 - [uran_media 使用说明](#uran_media-使用说明)
   - [摄像头配置](#摄像头配置)
   - [WebRTC 信令流程](#webrtc-信令流程)
+    - [方案一：本地信令服务器（局域网）](#方案一本地信令服务器局域网)
+    - [方案二：公网信令服务器](#方案二公网信令服务器)
   - [RTSP 推流](#rtsp-推流)
   - [本地录制](#本地录制)
   - [ROS 接口（media）](#ros-接口media)
@@ -553,106 +555,458 @@ ros2 service call /camera_service protocol/srv/CameraService "{command: 4}"
 
 CyberDog2 上已有 `image_transmission` 节点负责完整的 WebRTC 推流，uran_media 只做**信令中继**，无需 aiortc。
 
-**CyberDog2 桥接模式**（`source_type: camera_service`）：
+**桥接架构**（`source_type: camera_service`）：
 
 ```
-云端                    uran_media_node              image_transmission
- │                            │                              │
- │─ media_ctrl(start,webrtc)─►│                              │
- │                     activate camera_service               │
- │                     注册桥接通道，等待 offer               │
- │                            │                              │
- │─ media_ctrl(signal_json=   │                              │
- │    {"type":"offer","sdp":…})►│                             │
- │                     格式转换                               │
- │                            │─ img_trans_signal_in ───────►│
- │                            │   {"uid":"cyberdog_main",    │
- │                            │    "offer_sdp":{…}}          │
- │                            │                       协商 ICE
- │                            │◄─ img_trans_signal_out ──────│
- │                            │   {"uid":…,"answer_sdp":{…}} │
- │◄─ uplink(media_signal,     │                              │
- │    {"type":"answer",…}) ───│                              │
- │                            │                    [WebRTC 推流至 app]
- │─ media_ctrl(stop) ────────►│                              │
- │                            │─ img_trans_signal_in ───────►│
- │                            │   {"uid":…,"is_closed":true} │
+WebRTC 客户端          云端/信令服务器          机器狗 uran_media_node      image_transmission
+     │                      │                          │                          │
+     │── SDP Offer ────────►│                          │                          │
+     │                      │── media_ctrl(start) ────►│  注册桥接通道             │
+     │                      │── media_ctrl(offer) ────►│                          │
+     │                      │                   格式转换│── img_trans_signal_in ──►│
+     │                      │                          │                   ICE 协商│
+     │                      │◄── uplink(answer) ───────│◄─ img_trans_signal_out ──│
+     │◄── SDP Answer ───────│                          │                          │
+     │── ICE Candidate ────►│── media_ctrl(candidate)─►│── img_trans_signal_in ──►│
+     │◄── ICE Candidate ────│◄── uplink(candidate) ────│◄─ img_trans_signal_out ──│
+     │                      │                          │              [推流开始]   │
+     │◄══════════════ WebRTC 视频流（P2P 或经 TURN）══════════════════════════════│
 ```
 
-**通用模式**（`source_type: ros_topic`）：uran_media 使用 aiortc 自行生成 SDP Offer，流程与原设计相同（aiortc 不可用时 stub）。
+ICE 协商成功后，`image_transmission` 自动调用 `camera_service START_LIVE_STREAM`，视频流直接从机器狗推送到客户端（P2P），不经过信令服务器。
 
 ---
 
-**通过 MQTT 发起 WebRTC 流（CyberDog2 主摄像头）：**
+#### 方案一：本地信令服务器（局域网）
+
+机器狗与客户端在同一局域网时，在机器狗本地运行 HTTP 信令服务器，浏览器直接访问。
+
+**启动信令服务器：**
 
 ```bash
-# 1. 启动 WebRTC 通道（激活摄像头，注册桥接）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "start",
-  "protocol": "webrtc",
-  "channel_id": "cyberdog_main",
-  "signal_json": ""
-}'
+# 机器狗上
+source /opt/ros/humble/setup.bash
+source ~/cyberdog_ws/install/setup.bash
+source ~/uran_ws/install/setup.bash
 
-# 2. 发送 SDP Offer（由 WebRTC 客户端生成后转发）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "",
-  "protocol": "",
-  "channel_id": "cyberdog_main",
-  "signal_json": "{\"type\":\"offer\",\"sdp\":\"...\"}"
-}'
-# 上行收到 data_type=media_signal，payload 含 SDP Answer（来自 image_transmission）
-
-# 3. 发送 ICE Candidate（可多次）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "",
-  "protocol": "",
-  "channel_id": "cyberdog_main",
-  "signal_json": "{\"type\":\"candidate\",\"sdpMid\":\"0\",\"sdpMLineIndex\":0,\"candidate\":\"...\"}"
-}'
-
-# 4. 停止通道
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "stop",
-  "protocol": "",
-  "channel_id": "cyberdog_main",
-  "signal_json": ""
-}'
+python3 /SDCARD/uran_ws/src/uran_media/webrtc_signaling_server.py \
+  --ns /mi_desktop_48_b0_2d_5f_b6_d0 \
+  --port 8080
 ```
 
-**通过 ROS topic 直接测试（绕过 MQTT）：**
+**同时启动 uran_media 节点（另一终端）：**
 
 ```bash
-# 启动桥接通道
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "webrtc", channel_id: "cyberdog_main", signal_json: ""}'
-
-# 监听 image_transmission 信令出口（验证桥接是否工作）
-ros2 topic echo /img_trans_signal_out
-
-# 监听上行（验证 answer 是否转发给云端）
-ros2 topic echo /uran/core/uplink/data
-
-# 监听通道状态
-ros2 topic echo /uran/core/state/write
-# 应看到 field_name=media_active_protocol, value_json="webrtc"
+source /opt/ros/humble/setup.bash
+source ~/cyberdog_ws/install/setup.bash
+source ~/uran_ws/install/setup.bash
+ros2 run uran_media uran_media_node
 ```
+
+**客户端访问（局域网内任意设备）：**
+
+```
+http://机器狗IP:8080
+```
+
+点击"连接"，信令自动完成，视频流自动播放。
+
+---
+
+#### 方案二：公网信令服务器
+
+机器狗在公网或 NAT 后，需要一台公网服务器中转信令（SDP/ICE），视频流本身仍尽量走 P2P，NAT 穿透失败时经 TURN 中转。
+
+**整体架构：**
+
+```
+[机器狗]                    [公网服务器]              [浏览器客户端]
+uran_media_node             信令服务器                    │
+     │                      (MQTT Broker +               │
+     │                       WebSocket 信令)              │
+     │                            │                      │
+     │── MQTT uplink(offer) ─────►│── WebSocket ────────►│
+     │◄── MQTT downlink(answer) ──│◄─ WebSocket ─────────│
+     │── MQTT uplink(candidate) ─►│── WebSocket ────────►│
+     │◄── MQTT downlink(candidate)│◄─ WebSocket ─────────│
+     │                            │                      │
+     │◄══════ WebRTC P2P（STUN 穿透）或 TURN 中转 ═══════│
+```
+
+**前提：公网服务器已部署 MQTT Broker（mosquitto）。**
+
+---
+
+**步骤一：公网服务器配置**
+
+```bash
+# 安装 mosquitto（若未安装）
+sudo apt install mosquitto mosquitto-clients
+
+# 配置允许匿名连接（测试用，生产环境应启用认证）
+sudo tee /etc/mosquitto/conf.d/uran.conf <<'EOF'
+listener 1883
+allow_anonymous true
+EOF
+sudo systemctl restart mosquitto
+
+# 确认端口开放
+sudo ufw allow 1883/tcp
+```
+
+若需要 TURN 服务器（NAT 穿透失败时）：
+
+```bash
+# 安装 coturn
+sudo apt install coturn
+
+sudo tee /etc/turnserver.conf <<'EOF'
+listening-port=3478
+fingerprint
+lt-cred-mech
+user=uran:yourpassword
+realm=uran.local
+EOF
+sudo systemctl enable --now coturn
+sudo ufw allow 3478/udp
+sudo ufw allow 49152:65535/udp   # TURN 中继端口范围
+```
+
+---
+
+**步骤二：机器狗配置**
+
+修改 `network.yaml`，将 Broker 地址改为公网服务器 IP：
+
+```bash
+nano ~/uran_ws/install/share/uran_core/config/network.yaml
+```
+
+```yaml
+network:
+  mqtt:
+    broker_host: "公网服务器IP"   # 改这里
+    broker_port: 1883
+```
+
+若使用 TURN，修改 `media.yaml` 加入 TURN 配置：
+
+```bash
+nano ~/uran_ws/install/share/uran_media/config/media.yaml
+```
+
+```yaml
+uran_media:
+  webrtc:
+    stun_server: "stun:stun.l.google.com:19302"
+    turn_server: "turn:公网服务器IP:3478"
+    turn_username: "uran"
+    turn_credential: "yourpassword"
+```
+
+---
+
+**步骤三：公网服务器部署 WebSocket 信令桥**
+
+公网服务器需要一个进程，将 MQTT 上行的 `media_signal` 转发给 WebSocket 客户端，并将客户端的信令通过 MQTT 下行发回机器狗。
+
+```bash
+# 公网服务器上安装依赖
+pip3 install paho-mqtt websockets
+
+# 下载信令桥脚本（见下方）
+python3 mqtt_ws_bridge.py --mqtt-host localhost --ws-port 8765 --http-port 8080
+```
+
+`mqtt_ws_bridge.py` 核心逻辑（保存到公网服务器）：
+
+```python
+#!/usr/bin/env python3
+"""MQTT ↔ WebSocket 信令桥（部署在公网服务器）
+
+MQTT 上行 topic:  /oivs/default/device_001/up   (机器狗 → 服务器)
+MQTT 下行 topic:  /oivs/default/device_001/down (服务器 → 机器狗)
+WebSocket:        ws://服务器IP:8765             (浏览器 ↔ 服务器)
+HTTP:             http://服务器IP:8080           (浏览器页面)
+"""
+import asyncio, json, threading, argparse
+import paho.mqtt.client as mqtt
+import websockets
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+DEVICE_ID  = "device_001"
+TENANT_ID  = "default"
+UP_TOPIC   = f"/oivs/{TENANT_ID}/{DEVICE_ID}/up"
+DOWN_TOPIC = f"/oivs/{TENANT_ID}/{DEVICE_ID}/down"
+
+ws_clients = set()
+loop = None
+
+# ── MQTT 回调 ──────────────────────────────────────────────────────────────
+def on_mqtt_message(client, userdata, msg):
+    try:
+        payload = json.loads(msg.payload)
+        if payload.get("data_type") == "media_signal":
+            signal_payload = json.loads(payload.get("payload", "{}"))
+            data = json.dumps({"event": "signal", "data": signal_payload})
+            asyncio.run_coroutine_threadsafe(_broadcast(data), loop)
+    except Exception as e:
+        print(f"[MQTT] parse error: {e}")
+
+async def _broadcast(msg):
+    for ws in list(ws_clients):
+        try:
+            await ws.send(msg)
+        except Exception:
+            ws_clients.discard(ws)
+
+# ── WebSocket 处理 ─────────────────────────────────────────────────────────
+async def ws_handler(ws):
+    ws_clients.add(ws)
+    print(f"[WS] client connected, total={len(ws_clients)}")
+    try:
+        async for raw in ws:
+            data = json.loads(raw)
+            event = data.get("event", "")
+            if event == "start":
+                _mqtt_publish({"msg_type": "media_ctrl", "msg_version": "1.0",
+                               "device_id": DEVICE_ID, "timestamp_ms": 0,
+                               "action": "start", "protocol": "webrtc",
+                               "channel_id": data.get("channel_id", "cyberdog_main"),
+                               "signal_json": ""})
+            elif event == "signal":
+                sig = data.get("data", {})
+                _mqtt_publish({"msg_type": "media_ctrl", "msg_version": "1.0",
+                               "device_id": DEVICE_ID, "timestamp_ms": 0,
+                               "action": "", "protocol": "",
+                               "channel_id": sig.get("channel_id", "cyberdog_main"),
+                               "signal_json": json.dumps(sig.get("signal", {}))})
+            elif event == "stop":
+                _mqtt_publish({"msg_type": "media_ctrl", "msg_version": "1.0",
+                               "device_id": DEVICE_ID, "timestamp_ms": 0,
+                               "action": "stop", "protocol": "",
+                               "channel_id": data.get("channel_id", "cyberdog_main"),
+                               "signal_json": ""})
+    except Exception:
+        pass
+    finally:
+        ws_clients.discard(ws)
+        print(f"[WS] client disconnected, total={len(ws_clients)}")
+
+def _mqtt_publish(payload):
+    mqtt_client.publish(DOWN_TOPIC, json.dumps(payload))
+
+# ── HTTP 页面 ──────────────────────────────────────────────────────────────
+HTML = open("webrtc_viewer_ws.html").read() if __import__("os").path.exists("webrtc_viewer_ws.html") else "<h1>请放置 webrtc_viewer_ws.html</h1>"
+
+class HttpHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        body = HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+# ── 主程序 ─────────────────────────────────────────────────────────────────
+def main():
+    global loop, mqtt_client
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mqtt-host", default="localhost")
+    parser.add_argument("--ws-port",   type=int, default=8765)
+    parser.add_argument("--http-port", type=int, default=8080)
+    args = parser.parse_args()
+
+    mqtt_client = mqtt.Client()
+    mqtt_client.on_message = on_mqtt_message
+    mqtt_client.connect(args.mqtt_host, 1883)
+    mqtt_client.subscribe(UP_TOPIC)
+    threading.Thread(target=mqtt_client.loop_forever, daemon=True).start()
+    print(f"[MQTT] connected to {args.mqtt_host}, subscribed {UP_TOPIC}")
+
+    http = HTTPServer(("0.0.0.0", args.http_port), HttpHandler)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    print(f"[HTTP] http://0.0.0.0:{args.http_port}")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    print(f"[WS]   ws://0.0.0.0:{args.ws_port}")
+    loop.run_until_complete(
+        websockets.serve(ws_handler, "0.0.0.0", args.ws_port)
+    )
+    loop.run_forever()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+**步骤四：浏览器客户端页面（`webrtc_viewer_ws.html`，放在公网服务器同目录）**
+
+```html
+<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="UTF-8"><title>CyberDog2 远程视频</title>
+<style>
+  body{font-family:monospace;background:#1a1a1a;color:#eee;padding:20px}
+  video{width:100%;max-width:960px;background:#000;border:1px solid #444;display:block}
+  button{padding:8px 18px;margin:4px;background:#2a6;color:#fff;border:none;cursor:pointer}
+  button.stop{background:#a33} button:disabled{background:#555;cursor:default}
+  #log{height:160px;overflow-y:auto;background:#111;border:1px solid #333;
+       padding:8px;font-size:12px;color:#aaa;margin-top:8px}
+</style></head>
+<body>
+<h2>CyberDog2 远程视频</h2>
+<video id="video" autoplay playsinline muted></video>
+<div style="margin:10px 0">
+  <button id="btnStart" onclick="start()">连接</button>
+  <button id="btnStop" class="stop" onclick="stop()" disabled>断开</button>
+  <span id="status" style="margin-left:12px;color:#fa0">未连接</span>
+</div>
+<div id="log"></div>
+<script>
+// WebSocket 地址：自动使用当前页面的主机名
+const WS_URL = `ws://${location.hostname}:8765`;
+const CHANNEL_ID = 'cyberdog_main';
+// TURN 服务器（若需要，填入公网服务器 IP）
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  // { urls: 'turn:公网服务器IP:3478', username: 'uran', credential: 'yourpassword' }
+];
+
+let pc = null, ws = null;
+
+function log(msg, color) {
+  const d = document.getElementById('log');
+  d.innerHTML += `<span style="color:${color||'#aaa'}">[${new Date().toTimeString().slice(0,8)}] ${msg}</span>\n`;
+  d.scrollTop = d.scrollHeight;
+}
+function setStatus(s, c) { const el = document.getElementById('status'); el.textContent=s; el.style.color=c||'#fa0'; }
+
+function send(event, data) { ws.send(JSON.stringify({ event, ...data })); }
+
+async function start() {
+  document.getElementById('btnStart').disabled = true;
+  setStatus('连接信令服务器...', '#fa0');
+
+  ws = new WebSocket(WS_URL);
+  ws.onopen = async () => {
+    log('信令服务器已连接', '#4af');
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+    pc.ontrack = (e) => {
+      log('收到视频轨道！', '#0f0');
+      setStatus('视频流接收中 ▶', '#0f0');
+      document.getElementById('video').srcObject = e.streams[0];
+    };
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      log('ICE: ' + s, '#4af');
+      if (s==='connected'||s==='completed') setStatus('已连接 ✓','#0f0');
+      else if (['failed','disconnected','closed'].includes(s)) setStatus('断开: '+s,'#f44');
+    };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      send('signal', { data: { channel_id: CHANNEL_ID,
+        signal: { type:'candidate', sdpMid:e.candidate.sdpMid,
+                  sdpMLineIndex:e.candidate.sdpMLineIndex, candidate:e.candidate.candidate }}});
+    };
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // 先通知机器狗注册通道，再发 offer
+    send('start', { channel_id: CHANNEL_ID });
+    setTimeout(() => {
+      send('signal', { data: { channel_id: CHANNEL_ID,
+        signal: { type: 'offer', sdp: offer.sdp }}});
+      log('Offer 已发送', '#4af');
+      setStatus('等待 Answer...', '#fa0');
+    }, 500);
+
+    document.getElementById('btnStop').disabled = false;
+  };
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.event !== 'signal') return;
+    const sig = msg.data?.signal || msg.data;
+    if (sig.type === 'answer') {
+      await pc.setRemoteDescription(new RTCSessionDescription(sig));
+      log('Answer 已设置', '#0f0');
+    } else if (sig.type === 'candidate' && sig.candidate) {
+      await pc.addIceCandidate(new RTCIceCandidate(sig));
+      log('添加 Candidate', '#888');
+    } else if (sig.type === 'closed') {
+      log('机器狗关闭了连接', '#f44'); stop();
+    }
+  };
+  ws.onerror = () => { log('WebSocket 错误', '#f44'); setStatus('连接失败','#f44'); };
+  ws.onclose = () => { log('WebSocket 已关闭', '#888'); };
+}
+
+function stop() {
+  if (ws) { try { send('stop', { channel_id: CHANNEL_ID }); } catch(e){} ws.close(); ws=null; }
+  if (pc) { pc.close(); pc=null; }
+  document.getElementById('video').srcObject = null;
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnStop').disabled = true;
+  setStatus('已断开', '#888');
+  log('连接已关闭', '#888');
+}
+</script>
+</body></html>
+```
+
+---
+
+**步骤五：启动顺序**
+
+```bash
+# 公网服务器
+python3 mqtt_ws_bridge.py --mqtt-host localhost --ws-port 8765 --http-port 8080
+
+# 机器狗（两个终端）
+ros2 run uran_core uran_core_node        # 终端 1
+ros2 run uran_media uran_media_node      # 终端 2
+
+# 浏览器访问
+http://公网服务器IP:8080
+```
+
+---
+
+**信令数据流（公网方案）：**
+
+```
+浏览器                  公网服务器                    机器狗
+  │                  MQTT Broker + WS 桥               │
+  │── WS: start ──────────────────────────────────────►│ media_ctrl(start)
+  │── WS: offer ──────────────────────────────────────►│ media_ctrl(signal_json=offer)
+  │                                            img_trans_signal_in → image_transmission
+  │◄── WS: answer ────────────────────────────────────│ uplink(media_signal=answer)
+  │── WS: candidate ─────────────────────────────────►│ media_ctrl(signal_json=candidate)
+  │◄── WS: candidate ─────────────────────────────────│ uplink(media_signal=candidate)
+  │                                                    │
+  │◄══════════════ WebRTC 视频流（P2P / TURN）══════════│
+```
+
+---
+
+**防火墙端口清单：**
+
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| 1883 | TCP | MQTT Broker |
+| 8080 | TCP | HTTP 浏览器页面 |
+| 8765 | TCP | WebSocket 信令 |
+| 3478 | UDP | TURN/STUN（可选） |
+| 49152–65535 | UDP | TURN 中继媒体流（可选） |
+
+> P2P 直连时不需要 TURN，视频流不经过公网服务器，带宽消耗仅为信令（极小）。只有在严格 NAT 或运营商封锁 UDP 时才需要 TURN 中转。
 
 ---
 
