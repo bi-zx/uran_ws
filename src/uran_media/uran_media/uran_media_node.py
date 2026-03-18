@@ -200,26 +200,11 @@ class UranMediaNode(Node):
             self._start_webrtc_aiortc(channel_id, src)
 
     def _start_webrtc_bridge(self, channel_id: str, src: dict):
-        """CyberDog2 桥接模式：激活摄像头，注册通道，等待云端发来 SDP offer。"""
-        svc_name = src.get('camera_service_name', 'camera_service')
-        if self._cyberdog_ns and not svc_name.startswith('/'):
-            svc_name = f'{self._cyberdog_ns}/{svc_name}'
+        """CyberDog2 桥接模式：注册通道，等待云端发来 SDP offer。
 
-        adapter = CyberDog2CameraAdapter(
-            node=self,
-            service_name=svc_name,
-            width=src.get('width', 1280),
-            height=src.get('height', 960),
-            fps=src.get('fps', 10),
-        )
-        ok = adapter.activate()
-        if not ok:
-            self.get_logger().error(
-                f'Failed to activate CyberDog2 camera for channel {channel_id}'
-            )
-            return
-
-        self._cyberdog_adapters[channel_id] = adapter
+        不调用 camera_service —— image_transmission 在 ICE 协商成功后
+        会自行调用 START_LIVE_STREAM，uran_media 无需介入摄像头生命周期。
+        """
         self._bridge_channels.add(channel_id)
         self._update_state()
 
@@ -371,7 +356,7 @@ class UranMediaNode(Node):
 
     # ================================================================== 停止
     def _stop_channel(self, channel_id: str):
-        # 桥接模式：发送 is_closed 给 image_transmission
+        # 桥接模式：发送 is_closed 给 image_transmission（它自己调用 STOP_LIVE_STREAM）
         if channel_id in self._bridge_channels:
             msg = String()
             msg.data = bridge.make_stop(channel_id)
