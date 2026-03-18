@@ -33,16 +33,23 @@ class _ChannelState:
 
 
 class RTSPServer:
-    """多通道 RTSP Server，每个 channel_id 独立端口。"""
+    """多通道 RTSP Server，共享一个 GLib 主循环。"""
 
     def __init__(self):
         self._channels: Dict[str, _ChannelState] = {}
-        self._servers: Dict[str, object] = {}  # channel_id -> GstRtspServer
-        self._glib_loops: Dict[str, object] = {}
+        self._servers: Dict[str, object] = {}
         self._available = _GST_AVAILABLE
+        self._loop = None
 
         if not self._available:
             logger.warning('GStreamer not available; RTSPServer will operate in stub mode')
+            return
+
+        # 启动共享 GLib 主循环（必须在任何 server.attach() 之前运行）
+        self._loop = GLib.MainLoop()
+        t = threading.Thread(target=self._loop.run, daemon=True)
+        t.start()
+        time.sleep(0.1)  # 确保 loop 已进入 run 状态
 
     def start(self, channel_id: str, width: int = 640, height: int = 480,
               fps: int = 30, port: int = 8554) -> str:
@@ -51,7 +58,7 @@ class RTSPServer:
 
         if not self._available:
             logger.info(f'[RTSP stub] Would start {url}')
-            self._channels[channel_id] = _ChannelState(port, url)
+            self._channels[channel_id] = _ChannelState(port, url, fps)
             return url
 
         if channel_id in self._channels:
@@ -74,7 +81,6 @@ class RTSPServer:
             state = _ChannelState(port, url, fps)
             self._channels[channel_id] = state
 
-            # 客户端首次连接时触发，此时才能拿到 appsrc 元素引用
             def on_media_configure(factory, media, cid=channel_id):
                 pipeline = media.get_element()
                 appsrc = pipeline.get_by_name(f'src_{cid}')
@@ -86,16 +92,9 @@ class RTSPServer:
 
             mounts = server.get_mount_points()
             mounts.add_factory(f'/{channel_id}', factory)
-            server.attach(None)
+            server.attach(None)  # attach 到默认 GLib context（loop 已在运行）
 
             self._servers[channel_id] = server
-
-            # GLib 主循环（独立线程）
-            loop = GLib.MainLoop()
-            self._glib_loops[channel_id] = loop
-            t = threading.Thread(target=loop.run, daemon=True)
-            t.start()
-
             logger.info(f'[RTSP] Started: {url}')
         except Exception as e:
             logger.error(f'[RTSP] Failed to start {channel_id}: {e}')
@@ -126,13 +125,6 @@ class RTSPServer:
 
     def stop(self, channel_id: str):
         """停止对应通道。"""
-        if channel_id in self._glib_loops:
-            try:
-                self._glib_loops[channel_id].quit()
-            except Exception:
-                pass
-            del self._glib_loops[channel_id]
-
         self._channels.pop(channel_id, None)
         self._servers.pop(channel_id, None)
         logger.info(f'[RTSP] Stopped channel: {channel_id}')
@@ -140,3 +132,5 @@ class RTSPServer:
     def stop_all(self):
         for cid in list(self._channels.keys()):
             self.stop(cid)
+        if self._loop is not None:
+            self._loop.quit()
