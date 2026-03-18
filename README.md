@@ -219,6 +219,25 @@ mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
 - `manual` 模式 → `controller` 填 `"cloud"` 或 `"field"`
 - `auto` 模式 → `controller` 填 `"auto"`
 
+**CyberDog2 支持的 action 值：**
+
+| action | 说明 | 底层调用 |
+|--------|------|---------|
+| `""` | 速度控制（由 linear_vel_x/y、angular_vel_z 驱动） | motion_servo_cmd topic |
+| `"stop"` | 原地停止，保持站立步态 | 零速 servo |
+| `"stand"` | 从任意姿态恢复站立 | motion_result_cmd（motion_id=111） |
+| `"sit"` | 高阻尼趴下 | motion_result_cmd（motion_id=101） |
+| `"emergency_stop"` | 急停锁关节，进入 ESTOP 状态 | motion_result_cmd（motion_id=0） |
+
+> `action` 与速度字段互斥：填写非空 `action` 时速度字段被忽略。
+
+**extra_json 扩展参数（CyberDog2）：**
+
+| 字段 | 说明 |
+|------|------|
+| `motion_id` | 直接调用指定 motion_id，优先级高于 action |
+| `step_height` | 步高 [前腿, 后腿]（m），默认 [0.05, 0.05] |
+
 ```bash
 # 站立
 mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
@@ -284,6 +303,19 @@ mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
   "action": "emergency_stop",
   "extra_json": ""
 }'
+
+# 调高步高行走（extra_json 扩展）
+mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "timestamp_ms": 0,
+  "controller": "cloud",
+  "linear_vel_x": 0.2, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
+  "action": "",
+  "extra_json": "{\"step_height\": [0.08, 0.08]}"
+}'
 ```
 
 > 速度指令需持续发送才能持续行走。可用 shell 循环模拟：
@@ -334,16 +366,29 @@ mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
 
 #### 上行消息说明
 
-| msg_type | 触发时机 | 关键字段 |
-|----------|---------|---------|
+| msg_type / data_type | 触发时机 | 关键字段 |
+|----------------------|---------|---------|
 | `register` | 节点启动时 | `device_id`, `template_id` |
 | `heartbeat` | 每 5 秒 | `online`, `battery_level`, `control_mode`, `current_controller` |
 | `state_snapshot` | 周期上报 / 关键字段变更 / 模式切换后 | `fields_json`（全量状态） |
-| `uplink_data` | 每次运控指令执行后 | `data_type=move_result`, `success`, `error_code`, `error_msg` |
-| `uplink_data` | 指令被限速截断时 | `data_type=move_clamp_event`, `original_v_norm`, `linear_limit` |
-| `uplink_data` | 指令被模式过滤拒绝时 | `data_type=move_reject_event`, `reason`, `controller` |
-| `uplink_data` | motion_status 异常时 | `data_type=cyberdog2_motion_abnormal`, `switch_status` |
+| `move_result` | 每次运控指令执行后 | `success`, `error_code`, `error_msg`, `plugin_id`, `plugin_internal_state` |
+| `move_clamp_event` | 指令被限速截断时 | `original_v_norm`, `linear_limit`, `angular_limit` |
+| `move_reject_event` | 指令被模式过滤或失控保护拒绝时 | `reason`, `controller`, `control_mode` |
+| `cyberdog2_motion_abnormal` | motion_status 异常时（如 ESTOP/CHARGING） | `switch_status`（整数，见下表） |
+| `plugin_switch_event` | 运行时切换插件后 | `prev_plugin`, `new_plugin` |
+| `failsafe_event` | 失控保护触发或恢复时 | `event`（triggered/recovered）, `failsafe_action`, `duration_s` |
 | `state_query_response` | 收到 state_query 后 | `fields_json` |
+
+**cyberdog2_motion_abnormal 中 switch_status 含义：**
+
+| 值 | 含义 | 恢复方式 |
+|----|------|---------|
+| 0 | NORMAL（正常） | — |
+| 2 | ESTOP（急停） | 发 `action="stand"` |
+| 3 | EDAMP（阻尼模式） | 发 `action="stand"` |
+| 4 | LIFTED（被抬起） | 放回地面 |
+| 7 | LOW_BAT（低电量） | 充电 |
+| 14 | CHARGING（充电中） | 拔充电线 |
 
 ---
 

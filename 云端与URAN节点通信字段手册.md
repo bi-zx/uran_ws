@@ -163,14 +163,33 @@
 
 **action 可选值**：
 
-| action | 说明 |
-|--------|------|
-| `""` | 无特殊动作，执行速度控制 |
-| `"stop"` | 停止运动 |
-| `"emergency_stop"` | 紧急停止 |
-| `"takeoff"` | 起飞（无人机） |
-| `"land"` | 降落（无人机） |
-| `"return_home"` | 返航（无人机） |
+| action | 适用平台 | 说明 |
+|--------|---------|------|
+| `""` | 全部 | 无特殊动作，执行速度控制（由 linear_vel_* / angular_vel_z 驱动） |
+| `"stop"` | 全部 | 停止运动（机器狗：发零速 servo；无人机：切换 HOLD 悬停） |
+| `"emergency_stop"` | 全部 | 紧急停止（机器狗：ESTOP 锁关节；无人机：立即 disarm） |
+| `"stand"` | cyberdog2 | 从任意姿态恢复站立（RECOVERYSTAND，motion_id=111） |
+| `"sit"` | cyberdog2 | 高阻尼趴下（GETDOWN，motion_id=101） |
+| `"takeoff"` | px4_mavros | 解锁 + 切 OFFBOARD + 上升至目标高度 |
+| `"land"` | px4_mavros | 切 AUTO.LAND 降落 |
+| `"return_home"` | px4_mavros | 切 AUTO.RTL 返航 |
+
+> `action` 与速度字段互斥：填写非空 `action` 时，速度字段被忽略（`"stop"` 除外，其本质是零速）。
+
+**extra_json 扩展参数（cyberdog2）**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `motion_id` | int | 直接调用指定 motion_id（优先级高于 action，走 Result 模式） |
+| `step_height` | float[2] | 步高 [前腿, 后腿]（m），默认 [0.05, 0.05]，仅 servo 模式有效 |
+
+```json
+// 示例：直接调用 motion_id=303（WALK_USERTROT）
+{ "extra_json": "{\"motion_id\": 303}" }
+
+// 示例：调高步高行走
+{ "linear_vel_x": 0.3, "action": "", "extra_json": "{\"step_height\": [0.08, 0.08]}" }
+```
 
 **坐标系**：ROS REP-103 右手体坐标系（x前/y左/z上，yaw 逆时针为正）
 
@@ -327,11 +346,14 @@
 | `sensor` | 按传感器配置 | MQTT / WebSocket | 传感数据上报 |
 | `move_result` | 每次指令执行后 | MQTT | 运控执行结果 |
 | `move_clamp_event` | 限速截断时 | MQTT | 限速截断事件 |
+| `move_reject_event` | 指令被模式过滤或失控保护拒绝时 | MQTT | 指令拒绝事件 |
+| `cyberdog2_motion_abnormal` | motion_status 异常时 | MQTT | CyberDog2 运动状态异常 |
+| `plugin_switch_event` | 运行时切换插件后 | MQTT | 插件切换事件 |
+| `failsafe_event` | 失控保护触发/恢复 | MQTT | 失控保护事件 |
 | `task_progress` | 任务执行中实时 | MQTT | 任务进度与事件 |
 | `media_signal` | 信令交互时 | WebSocket / MQTT | 流媒体信令 |
 | `media_upload` | 弱网恢复后 | HTTP / WebSocket | 本地录制文件切片上传 |
 | `frpc_status` | 端口映射变更时 | MQTT | 端口映射状态 |
-| `failsafe_event` | 失控保护触发/恢复 | MQTT | 失控保护事件 |
 
 ### 3.2 UplinkPayload 统一封装结构
 
@@ -451,8 +473,10 @@ timestamp_ns        # 纳秒时间戳（uint64）
   "error_code": 0,
   "error_msg": "",
   "current_control_mode": "manual",
-  "plugin_id": "unitree_go2",
-  "plugin_internal_state": {}
+  "plugin_id": "cyberdog2",
+  "plugin_internal_state": {
+    "switch_status": 0
+  }
 }
 ```
 
@@ -460,13 +484,31 @@ timestamp_ns        # 纳秒时间戳（uint64）
 |------|------|------|
 | `cmd_timestamp_ns` | uint64 | 对应指令的时间戳 |
 | `success` | bool | 执行是否成功 |
-| `error_code` | int | 错误码（0=成功） |
-| `error_msg` | string | 错误描述 |
+| `error_code` | int | 错误码（0=成功，1=失败） |
+| `error_msg` | string | 错误描述（失败时填充） |
 | `current_control_mode` | string | 当前控制模式 |
 | `plugin_id` | string | 当前激活的插件 ID |
-| `plugin_internal_state` | object | 插件内部状态（如 px4_mavros 的飞行状态机） |
+| `plugin_internal_state` | object | 插件内部状态（见各平台说明） |
 
-**px4_mavros 插件内部状态示例**：
+**cyberdog2 插件内部状态**：
+
+```json
+{ "switch_status": 0 }
+```
+
+| `switch_status` | 含义 | 对运控的影响 |
+|-----------------|------|-------------|
+| `0` NORMAL | 正常运行 | 接受所有指令 |
+| `1` TRANSITIONING | 动作切换中 | 暂缓 result 指令 |
+| `2` ESTOP | 急停状态 | 拒绝速度指令，需先 `action="stand"` 恢复 |
+| `3` EDAMP | 阻尼模式 | 拒绝速度指令，需先 `action="stand"` 恢复 |
+| `4` LIFTED | 被抬起 | 拒绝运动指令 |
+| `5` BAN_TRANS | 禁止切换 | 拒绝步态切换 |
+| `6` OVER_HEAT | 过热 | 拒绝运动指令 |
+| `7` LOW_BAT | 低电量 | 写入 `battery_low=true`，仍可运动 |
+| `14` CHARGING | 充电中 | 拒绝所有运动指令 |
+
+**px4_mavros 插件内部状态**：
 
 ```json
 {
@@ -475,6 +517,50 @@ timestamp_ns        # 纳秒时间戳（uint64）
   "mode": "OFFBOARD",
   "altitude_m": 1.47,
   "last_setpoint_age_ms": 50
+}
+```
+
+---
+
+### 3.5a 指令拒绝事件（move_reject_event）
+
+```json
+{
+  "reason": "manual mode rejects auto controller",
+  "controller": "auto",
+  "control_mode": "manual"
+}
+```
+
+| `reason` 值 | 触发条件 |
+|-------------|---------|
+| `"manual mode rejects auto controller"` | manual 模式下收到 `controller="auto"` 的指令 |
+| `"auto mode rejects manual controller"` | auto 模式下收到 `controller="cloud"` 或 `"field"` 的指令 |
+| `"failsafe active"` | 失控保护期间收到任何运控指令 |
+
+---
+
+### 3.5b CyberDog2 运动状态异常（cyberdog2_motion_abnormal）
+
+当 `motion_status.switch_status` 从 NORMAL 变为异常时上报：
+
+```json
+{
+  "switch_status": 14
+}
+```
+
+`switch_status` 含义见 §3.5 cyberdog2 插件内部状态表。
+
+---
+
+### 3.5c 插件切换事件（plugin_switch_event）
+
+```json
+{
+  "prev_plugin": "cyberdog2",
+  "new_plugin": "cyberdog2",
+  "timestamp_ns": 1741564800000000000
 }
 ```
 
@@ -681,20 +767,24 @@ timestamp_ns        # 纳秒时间戳（uint64）
 
 ## 七、各平台对运控指令字段的支持矩阵
 
-| 统一指令字段 | px4_mavros（无人机） | unitree_go2/b2（机器狗） | ros_twist（差速底盘） |
-|-------------|---------------------|------------------------|---------------------|
-| `linear_vel_x` | ✅ | ✅ | ✅ → Twist.linear.x |
-| `linear_vel_y` | ✅ | ✅（侧步） | ❌ 忽略 |
-| `linear_vel_z` | ✅ | ❌ 忽略 | ❌ 忽略 |
-| `angular_vel_z` | ✅ | ✅ | ✅ → Twist.angular.z |
-| `target_roll/pitch` | ❌ 忽略 | ✅ | ❌ 忽略 |
-| `target_yaw` | ✅ | ✅ | ❌ 忽略 |
-| `action="takeoff"` | ✅ 飞行状态机 | ❌ | ❌ |
-| `action="land"` | ✅ | ❌ | ❌ |
-| `action="return_home"` | ✅ RTL 模式 | ❌ | ❌ |
-| `action="stop"` | ✅ 悬停 | ✅ 原地停止 | ✅ 零速度 |
-| `action="emergency_stop"` | ✅ disarm | ✅ 急停锁关节 | ✅ 零速度+报警 |
-| `extra_json` | 飞行模式等 | 步态（gait）等 | 一般忽略 |
+| 统一指令字段 | cyberdog2（小米机器狗） | px4_mavros（无人机） | ros_twist（差速底盘） |
+|-------------|----------------------|---------------------|---------------------|
+| `linear_vel_x` | ✅ → `vel_des[0]`（前进，m/s） | ✅ ENU body_vel x | ✅ → Twist.linear.x |
+| `linear_vel_y` | ✅ → `vel_des[1]`（侧步，左正） | ✅ ENU body_vel y | ❌ 忽略 |
+| `linear_vel_z` | ❌ 忽略 | ✅ ENU body_vel z（上正） | ❌ 忽略 |
+| `angular_vel_z` | ✅ → `vel_des[2]`（偏航，逆时针正） | ✅ yaw_rate | ✅ → Twist.angular.z |
+| `target_roll` | ✅ → `rpy_des[0]`（仅 WALK_STAND 有效） | ❌ 忽略 | ❌ 忽略 |
+| `target_pitch` | ✅ → `rpy_des[1]`（仅 WALK_STAND 有效） | ❌ 忽略 | ❌ 忽略 |
+| `target_yaw` | ❌ 忽略（用 angular_vel_z 转向） | ✅ ENU 世界系绝对偏航角 | ❌ 忽略 |
+| `action="stand"` | ✅ RECOVERYSTAND（motion_id=111） | ❌ | ❌ |
+| `action="sit"` | ✅ GETDOWN（motion_id=101） | ❌ | ❌ |
+| `action="stop"` | ✅ 零速 servo（保持站立步态） | ✅ 切 AUTO.HOLD 悬停 | ✅ 零速度 |
+| `action="emergency_stop"` | ✅ ESTOP（motion_id=0，锁关节） | ✅ 立即 disarm（危险） | ✅ 零速度+报警 |
+| `action="takeoff"` | ❌ | ✅ 飞行状态机 | ❌ |
+| `action="land"` | ❌ | ✅ AUTO.LAND | ❌ |
+| `action="return_home"` | ❌ | ✅ AUTO.RTL | ❌ |
+| `extra_json.motion_id` | ✅ 直接调用 motion_result_cmd | ❌ | ❌ |
+| `extra_json.step_height` | ✅ 覆盖步高 [前腿,后腿]（m） | ❌ | ❌ |
 
 ---
 
