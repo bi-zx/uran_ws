@@ -397,6 +397,10 @@ class UranMediaNode(Node):
         if not topic:
             return
 
+        # 相对 topic 名加命名空间前缀（CyberDog2 环境）
+        if self._cyberdog_ns and not topic.startswith('/'):
+            topic = f'{self._cyberdog_ns}/{topic}'
+
         try:
             if msg_type_str == 'sensor_msgs/Image':
                 from sensor_msgs.msg import Image
