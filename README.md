@@ -559,8 +559,9 @@ ros2 run uran_media uran_media_node
 
 | source_type | 说明 | 适用摄像头 |
 |-------------|------|-----------|
-| `ros_topic` | 直接订阅 ROS topic | RealSense、其他已发布 topic 的摄像头 |
+| `ros_topic` | 直接订阅 ROS topic | 已持续发布 topic 的摄像头 |
 | `camera_service` | 通过 CyberDog2 `CameraService` 激活后订阅 topic | CyberDog2 主 RGB 摄像头 |
+| `realsense_lifecycle` | 自动 launch + lifecycle configure/activate，再订阅 topic | RealSense D430 |
 
 **修改配置（无需重新编译）：**
 
@@ -568,29 +569,39 @@ ros2 run uran_media uran_media_node
 nano ~/uran_ws/install/share/uran_media/config/media.yaml
 ```
 
-**添加自定义摄像头：**
-
-```yaml
-uran_media:
-  video_sources:
-    - channel_id: "my_cam"
-      source_type: "ros_topic"
-      ros_topic: "/my_camera/image_raw"
-      msg_type: "sensor_msgs/Image"
-      fps: 30
-```
-
 **CyberDog2 内置摄像头对应关系：**
 
 | 摄像头 | channel_id | source_type | topic |
 |--------|-----------|-------------|-------|
-| 主 RGB 摄像头（前置高清） | `cyberdog_main` | `camera_service` | `image` |
-| RealSense 深度摄像头 | `cyberdog_depth` | `ros_topic` | `/camera/depth/color/points` |
+| 主 RGB 摄像头（前置高清） | `cyberdog_main` | `camera_service` | `image`（加命名空间前缀） |
+| RealSense 左目红外 | `realsense_left` | `realsense_lifecycle` | `/camera/infra1/image_rect_raw` |
+| RealSense 右目红外 | `realsense_right` | `realsense_lifecycle` | `/camera/infra2/image_rect_raw` |
+| RealSense 深度图 | `realsense_depth` | `realsense_lifecycle` | `/camera/depth/image_rect_raw` |
+| RealSense 对齐深度图 | `realsense_aligned` | `realsense_lifecycle` | `/camera/aligned_depth_to_infra1/image_raw` |
+
+**RealSense 自动启动说明：**
+
+收到 RealSense 通道的 RTSP/WebRTC 启动指令时，`uran_media` 会自动执行：
+
+```
+1. ros2 launch realsense2_camera on_dog.py   （若节点未运行）
+2. ros2 lifecycle set /camera/camera configure
+3. ros2 lifecycle set /camera/camera activate
+```
+
+launch 包和文件在 `media.yaml` 的 `realsense` 段配置：
+
+```yaml
+realsense:
+  launch_pkg: "realsense2_camera"
+  launch_file: "on_dog.py"
+```
 
 验证 CyberDog2 摄像头服务是否可用：
 
 ```bash
-ros2 service call /camera_service protocol/srv/CameraService "{command: 4}"
+ros2 service call /mi_desktop_48_b0_2d_5f_b6_d0/camera_service \
+  protocol/srv/CameraService "{command: 4}"
 # command=4 为 GET_STATE，result=0 表示正常
 ```
 
@@ -1057,8 +1068,43 @@ http://公网服务器IP:8080
 
 ### RTSP 推流
 
+所有通道共享同一个 RTSP Server（端口 8554），每个通道对应独立的 mount point，可同时拉流。
+
+#### 可用通道
+
+| channel_id | 摄像头 | RTSP 地址 |
+|-----------|--------|----------|
+| `cyberdog_main` | CyberDog2 主 RGB 摄像头 | `rtsp://IP:8554/cyberdog_main` |
+| `realsense_left` | RealSense 左目红外 | `rtsp://IP:8554/realsense_left` |
+| `realsense_right` | RealSense 右目红外 | `rtsp://IP:8554/realsense_right` |
+| `realsense_depth` | RealSense 深度图（JET 伪彩色） | `rtsp://IP:8554/realsense_depth` |
+| `realsense_aligned` | RealSense 对齐深度图 | `rtsp://IP:8554/realsense_aligned` |
+
+#### 启动指令（ROS topic）
+
 ```bash
-# 启动 RTSP 通道
+# 启动单个通道（以 realsense_depth 为例）
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "rtsp", channel_id: "realsense_depth", signal_json: ""}'
+
+# 同时启动多个通道（分别发送）
+for ch in realsense_left realsense_right realsense_depth; do
+  ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+    "{action: \"start\", protocol: \"rtsp\", channel_id: \"$ch\", signal_json: \"\"}"
+done
+
+# 停止单个通道
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "stop", protocol: "rtsp", channel_id: "realsense_depth", signal_json: ""}'
+
+# 停止所有通道
+ros2 topic pub --once /uran/core/switch/media uran_msgs/msg/MediaSwitchCmd \
+  '{action: "stop_all", protocol: "", timestamp_ns: 0}'
+```
+
+#### 启动指令（MQTT）
+
+```bash
 mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
   "msg_type": "media_ctrl",
   "msg_version": "1.0",
@@ -1066,14 +1112,31 @@ mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
   "timestamp_ms": 0,
   "action": "start",
   "protocol": "rtsp",
-  "channel_id": "front_cam",
+  "channel_id": "realsense_depth",
   "signal_json": ""
 }'
-# 上行收到 data_type=media_rtsp_url，payload 含 rtsp://localhost:8554/front_cam
-
-# 用 VLC 或 ffplay 拉流验证
-ffplay rtsp://机器狗IP:8554/front_cam
 ```
+
+#### 监听 RTSP URL 上报
+
+```bash
+ros2 topic echo /uran/core/uplink/data
+# 收到 data_type=media_rtsp_url，payload_json 含 url 字段
+```
+
+#### 拉流播放
+
+```bash
+# 单路
+ffplay rtsp://机器狗IP:8554/realsense_depth
+
+# 多路同时（各开一个终端）
+ffplay rtsp://机器狗IP:8554/realsense_left
+ffplay rtsp://机器狗IP:8554/realsense_right
+ffplay rtsp://机器狗IP:8554/realsense_depth
+```
+
+> RealSense 通道首次启动时会自动 launch `realsense2_camera on_dog.py` 并完成 lifecycle 激活（约 15 秒），之后再次启动无需等待。
 
 ---
 
@@ -1437,18 +1500,44 @@ ros2 topic echo /uran/core/state/write
 #        field_name=media_channel_count, value_json=1
 ```
 
-#### 5.9 启动 RTSP 通道（前置摄像头）
+#### 5.9 启动 RTSP 通道
+
+**CyberDog2 主摄像头：**
 
 ```bash
 ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "rtsp", channel_id: "front_cam", signal_json: ""}'
+  '{action: "start", protocol: "rtsp", channel_id: "cyberdog_main", signal_json: ""}'
+```
 
-# 监听 RTSP URL 上报
+**RealSense 摄像头（自动 launch + lifecycle 激活）：**
+
+```bash
+# 深度图（首次启动约等待 15 秒完成 launch + lifecycle）
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "rtsp", channel_id: "realsense_depth", signal_json: ""}'
+
+# 左目红外
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "rtsp", channel_id: "realsense_left", signal_json: ""}'
+
+# 右目红外
+ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
+  '{action: "start", protocol: "rtsp", channel_id: "realsense_right", signal_json: ""}'
+```
+
+**监听 RTSP URL 上报：**
+
+```bash
 ros2 topic echo /uran/core/uplink/data
-# 应看到 data_type=media_rtsp_url，url=rtsp://localhost:8554/front_cam
+# 应看到 data_type=media_rtsp_url，url=rtsp://localhost:8554/<channel_id>
+```
 
-# 在主机上拉流验证（将机器狗 IP 替换为实际 IP）
-ffplay rtsp://192.168.x.x:8554/front_cam
+**在主机上拉流验证（将机器狗 IP 替换为实际 IP）：**
+
+```bash
+ffplay rtsp://192.168.x.x:8554/realsense_depth
+ffplay rtsp://192.168.x.x:8554/realsense_left
+# 多路可同时拉流，各通道独立 mount point，共享 8554 端口
 ```
 
 #### 5.10 本地录制验证
