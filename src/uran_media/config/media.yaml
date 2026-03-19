@@ -42,11 +42,19 @@ uran_media:
       msg_type: "sensor_msgs/Image"
       fps: 30
 
-    # RealSense 对齐深度图（需要 camera_align 节点）
+    # RealSense 对齐深度图（对齐到红外1，无需额外节点）
     - channel_id: "realsense_aligned"
       source_type: "realsense_lifecycle"
-      lifecycle_node: "/camera/camera_align"
-      ros_topic: "/camera/aligned_depth_to_extcolor/image_raw"
+      lifecycle_node: "/camera/camera"
+      ros_topic: "/camera/aligned_depth_to_infra1/image_raw"
+      msg_type: "sensor_msgs/Image"
+      fps: 30
+
+    # RealSense 对齐深度图（对齐到 RGB，需要 camera_align 节点）
+    - channel_id: "realsense_aligned_rgb"
+      source_type: "realsense_lifecycle"
+      lifecycle_node: "/camera/camera"
+      ros_topic: "/camera/aligned_depth_to_rgb/image_raw"
       msg_type: "sensor_msgs/Image"
       fps: 30
 

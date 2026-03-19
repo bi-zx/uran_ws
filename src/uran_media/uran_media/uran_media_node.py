@@ -462,10 +462,10 @@ class UranMediaNode(Node):
             import cv2
             enc = getattr(msg, 'encoding', 'bgr8')
             if enc in ('16UC1', '16SC1'):
-                # 深度图：归一化为 8-bit 灰度后转 BGR
+                # 深度图：归一化后 JET 伪彩色
                 raw = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
                 norm = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                frame = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+                frame = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
             elif enc in ('mono8', '8UC1'):
                 raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
                 frame = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
