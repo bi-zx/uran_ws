@@ -1,6 +1,7 @@
 """rtsp_server.py — RTSP Server 封装
 
 使用 GStreamer appsrc pipeline 推送帧到 RTSP Server。
+所有通道共享同一个 GstRtspServer 实例（同一端口），每个 channel 独立 mount point。
 通过 media-configure 信号在客户端连接时获取 appsrc 引用。
 若 GStreamer 不可用，降级为 stub 模式（仅记录日志）。
 """
@@ -23,9 +24,8 @@ except Exception:
 
 
 class _ChannelState:
-    def __init__(self, channel_id: str, port: int, url: str, fps: int):
+    def __init__(self, channel_id: str, url: str, fps: int):
         self.channel_id = channel_id
-        self.port = port
         self.url = url
         self.fps = fps
         self.appsrc = None
@@ -36,12 +36,14 @@ class _ChannelState:
 
 
 class RTSPServer:
-    """多通道 RTSP Server，每个 channel_id 独立端口。"""
+    """多通道 RTSP Server，所有 channel 共享同一端口，各自独立 mount point。"""
 
-    def __init__(self):
+    def __init__(self, port: int = 8554):
         self._channels: Dict[str, _ChannelState] = {}
-        self._servers: Dict[str, object] = {}
         self._factories: Dict[str, object] = {}
+        self._port = port
+        self._server = None
+        self._mounts = None
         self._loop: object = None
         self._loop_thread: threading.Thread = None
         self._available = _GST_AVAILABLE
@@ -49,32 +51,36 @@ class RTSPServer:
         if not self._available:
             logger.warning('GStreamer not available; RTSPServer will operate in stub mode')
 
-    def _ensure_glib_loop(self):
-        """确保 GLib 主循环在运行（所有通道共享一个）。"""
-        if self._loop is not None:
+    def _ensure_server(self):
+        """确保共享的 GstRtspServer 和 GLib 主循环已启动。"""
+        if self._server is not None:
             return
+
         self._loop = GLib.MainLoop()
         self._loop_thread = threading.Thread(target=self._loop.run, daemon=True)
         self._loop_thread.start()
 
+        self._server = GstRtspServer.RTSPServer()
+        self._server.set_service(str(self._port))
+        self._mounts = self._server.get_mount_points()
+        self._server.attach(None)
+        logger.info(f'[RTSP] Server started on port {self._port}')
+
     def start(self, channel_id: str, width: int = 640, height: int = 480,
               fps: int = 30, port: int = 8554) -> str:
-        """启动 RTSP Server，返回 rtsp URL。"""
-        url = f'rtsp://localhost:{port}/{channel_id}'
+        """为 channel 添加 mount point，返回 rtsp URL。"""
+        url = f'rtsp://localhost:{self._port}/{channel_id}'
 
         if not self._available:
             logger.info(f'[RTSP stub] Would start {url}')
-            self._channels[channel_id] = _ChannelState(channel_id, port, url, fps)
+            self._channels[channel_id] = _ChannelState(channel_id, url, fps)
             return url
 
         if channel_id in self._channels:
             return self._channels[channel_id].url
 
         try:
-            self._ensure_glib_loop()
-
-            server = GstRtspServer.RTSPServer()
-            server.set_service(str(port))
+            self._ensure_server()
 
             factory = GstRtspServer.RTSPMediaFactory()
             pipeline_str = (
@@ -89,21 +95,16 @@ class RTSPServer:
             factory.set_launch(pipeline_str)
             factory.set_shared(True)
 
-            state = _ChannelState(channel_id, port, url, fps)
+            state = _ChannelState(channel_id, url, fps)
             self._channels[channel_id] = state
 
-            # 客户端连接时通过 media-configure 获取 appsrc 引用
             factory.connect('media-configure',
                             lambda fac, media, cid=channel_id: self._on_media_configure(cid, media))
 
-            mounts = server.get_mount_points()
-            mounts.add_factory(f'/{channel_id}', factory)
-            server.attach(None)
-
-            self._servers[channel_id] = server
+            self._mounts.add_factory(f'/{channel_id}', factory)
             self._factories[channel_id] = factory
 
-            logger.info(f'[RTSP] Started: {url} (waiting for client connection to acquire appsrc)')
+            logger.info(f'[RTSP] Mount added: {url}')
         except Exception as e:
             logger.error(f'[RTSP] Failed to start {channel_id}: {e}')
             self._channels.pop(channel_id, None)
@@ -149,7 +150,7 @@ class RTSPServer:
             logger.debug(f'[RTSP] push_frame error ({channel_id}): {e}')
 
     def stop(self, channel_id: str):
-        """停止对应通道。"""
+        """停止对应通道（移除 mount point）。"""
         state = self._channels.pop(channel_id, None)
         if state and state.appsrc:
             try:
@@ -157,16 +158,14 @@ class RTSPServer:
             except Exception:
                 pass
 
-        self._servers.pop(channel_id, None)
+        if self._mounts and channel_id in self._factories:
+            try:
+                self._mounts.remove_factory(f'/{channel_id}')
+            except Exception:
+                pass
         self._factories.pop(channel_id, None)
         logger.info(f'[RTSP] Stopped channel: {channel_id}')
 
     def stop_all(self):
         for cid in list(self._channels.keys()):
             self.stop(cid)
-        if self._loop is not None:
-            try:
-                self._loop.quit()
-            except Exception:
-                pass
-            self._loop = None
