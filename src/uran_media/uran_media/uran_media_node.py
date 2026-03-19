@@ -370,7 +370,12 @@ class UranMediaNode(Node):
         if not lc_node:
             return
         if lc_node not in self._realsense_adapters:
-            self._realsense_adapters[lc_node] = RealSenseLifecycleAdapter(self, lc_node)
+            rs_cfg = self._cfg.get('realsense', {})
+            self._realsense_adapters[lc_node] = RealSenseLifecycleAdapter(
+                self, lc_node,
+                launch_pkg=rs_cfg.get('launch_pkg', ''),
+                launch_file=rs_cfg.get('launch_file', ''),
+            )
         self._realsense_adapters[lc_node].activate()
 
     # ================================================================== 停止
@@ -589,6 +594,8 @@ class UranMediaNode(Node):
     # ================================================================== 生命周期
     def destroy_node(self):
         self._stop_all_channels()
+        for adapter in self._realsense_adapters.values():
+            adapter.shutdown()
         self._loop.call_soon_threadsafe(self._loop.stop)
         super().destroy_node()
 

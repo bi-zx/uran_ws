@@ -58,6 +58,11 @@ uran_media:
       msg_type: "sensor_msgs/Image"
       fps: 30
 
+  # RealSense 节点 launch 配置（lifecycle adapter 会自动启动）
+  realsense:
+    launch_pkg: "realsense2_camera"
+    launch_file: "on_dog.py"
+
   # CyberDog2 命名空间前缀（ros2 node list 输出中 /mi_desktop_xxx/ 部分）
   # 留空则使用裸 topic 名（非 CyberDog2 环境）
   cyberdog_ns: "/mi_desktop_48_b0_2d_5f_b6_d0"

@@ -1,9 +1,14 @@
 """realsense_lifecycle.py — RealSense 生命周期管理
 
-通过 lifecycle_msgs/srv/ChangeState 控制 /camera/camera 或 /camera/camera_align 节点。
+完整流程：
+  1. 检查 lifecycle service 是否存在（节点是否已运行）
+  2. 若不存在，自动 ros2 launch 启动节点，等待 service 就绪
+  3. configure → activate
+
 多个 channel 共享同一 lifecycle 节点时使用引用计数，避免重复激活/停止。
 """
 
+import subprocess
 import time
 
 
@@ -13,13 +18,17 @@ class RealSenseLifecycleAdapter:
     TRANSITION_ACTIVATE = 3
     TRANSITION_DEACTIVATE = 4
 
-    def __init__(self, node, lifecycle_node_name: str):
+    def __init__(self, node, lifecycle_node_name: str,
+                 launch_pkg: str = '', launch_file: str = ''):
         self._node = node
         self._name = lifecycle_node_name
+        self._launch_pkg = launch_pkg
+        self._launch_file = launch_file
         self._ref_count = 0
         self._client = None
         self._ChangeState = None
         self._available = False
+        self._launch_proc = None
         self._init_client()
 
     def _init_client(self):
@@ -35,19 +44,54 @@ class RealSenseLifecycleAdapter:
                 f'[RealSense] lifecycle_msgs unavailable ({e}), will subscribe topic directly'
             )
 
+    def _launch_node(self) -> bool:
+        """自动启动 RealSense 节点（ros2 launch）。"""
+        if not self._launch_pkg or not self._launch_file:
+            self._node.get_logger().warning(
+                '[RealSense] launch_pkg/launch_file not configured, cannot auto-launch'
+            )
+            return False
+
+        if self._launch_proc and self._launch_proc.poll() is None:
+            return True  # 已在运行
+
+        cmd = ['ros2', 'launch', self._launch_pkg, self._launch_file]
+        self._node.get_logger().info(f'[RealSense] Launching: {" ".join(cmd)}')
+        try:
+            self._launch_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception as e:
+            self._node.get_logger().error(f'[RealSense] Launch failed: {e}')
+            return False
+
     def activate(self) -> bool:
         self._ref_count += 1
         if self._ref_count > 1:
-            return True  # 已由其他 channel 激活
+            return True
 
         if not self._available:
             return True
 
-        if not self._client.wait_for_service(timeout_sec=5.0):
-            self._node.get_logger().warning(
-                f'[RealSense] {self._name}/change_state not available, proceeding anyway'
+        # 先尝试连接 service，若不存在则自动 launch
+        if not self._client.wait_for_service(timeout_sec=2.0):
+            self._node.get_logger().info(
+                f'[RealSense] {self._name} not running, attempting auto-launch...'
             )
-            return True
+            if not self._launch_node():
+                self._node.get_logger().warning(
+                    '[RealSense] Auto-launch failed, proceeding anyway'
+                )
+                return True
+
+            # 等待 launch 后 service 就绪
+            if not self._client.wait_for_service(timeout_sec=15.0):
+                self._node.get_logger().warning(
+                    f'[RealSense] {self._name}/change_state still not available '
+                    'after launch, proceeding anyway'
+                )
+                return True
 
         # configure（若已 configured/active 会返回失败，忽略）
         self._transition(self.TRANSITION_CONFIGURE)
@@ -69,6 +113,12 @@ class RealSenseLifecycleAdapter:
             return
         self._transition(self.TRANSITION_DEACTIVATE)
         self._node.get_logger().info(f'[RealSense] {self._name} deactivated')
+
+    def shutdown(self):
+        """终止 launch 进程（节点销毁时调用）。"""
+        if self._launch_proc and self._launch_proc.poll() is None:
+            self._launch_proc.terminate()
+            self._node.get_logger().info('[RealSense] Launch process terminated')
 
     def _transition(self, transition_id: int) -> bool:
         try:
