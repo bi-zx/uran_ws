@@ -27,7 +27,7 @@ from uran_msgs.msg import MediaCtrlCmd, MediaSwitchCmd, UplinkPayload, StateFiel
 from .webrtc_channel import WebRTCChannel
 from .rtsp_server import RTSPServer
 from .cyberdog2_camera import CyberDog2CameraAdapter
-from .lifecycle_camera import LifecycleNodeAdapter
+from .realsense_lifecycle import RealSenseLifecycleAdapter
 from . import cyberdog2_webrtc_bridge as bridge
 
 
@@ -55,10 +55,8 @@ class UranMediaNode(Node):
 
         self._rtsp_server = RTSPServer()
         self._cyberdog_adapters: Dict[str, CyberDog2CameraAdapter] = {}
-        # lifecycle 节点适配器：key=节点全名，value=LifecycleNodeAdapter（引用计数共享）
-        self._lifecycle_adapters: Dict[str, LifecycleNodeAdapter] = {}
-        # channel_id → lifecycle 节点全名（用于 stop 时 release）
-        self._lifecycle_channel_map: Dict[str, str] = {}
+        # RealSense lifecycle adapters，keyed by lifecycle_node_name（多 channel 共享）
+        self._realsense_adapters: Dict[str, RealSenseLifecycleAdapter] = {}
         self._image_subs: Dict[str, object] = {}
         self._recorders: Dict[str, object] = {}
 
@@ -220,9 +218,6 @@ class UranMediaNode(Node):
 
     def _start_webrtc_aiortc(self, channel_id: str, src: dict):
         """通用 aiortc 模式：生成 SDP Offer 并上报。"""
-        if src.get('source_type') == 'lifecycle_node':
-            self._acquire_lifecycle(channel_id, src)
-
         stun = self._cfg.get('webrtc', {}).get('stun_server', 'stun:stun.l.google.com:19302')
         channel = WebRTCChannel(
             channel_id=channel_id,
@@ -233,6 +228,9 @@ class UranMediaNode(Node):
 
         future = self._run_coro(channel.start())
         future.add_done_callback(lambda f: self._on_offer_ready(channel_id, f))
+
+        if src.get('source_type') == 'realsense_lifecycle':
+            self._activate_realsense(channel_id, src)
 
         self._subscribe_topic(channel_id, src)
         self._update_state()
@@ -324,24 +322,6 @@ class UranMediaNode(Node):
                 payload={'channel_id': uid, 'signal': signal},
             )
 
-    # ================================================================== Lifecycle 节点管理
-    def _acquire_lifecycle(self, channel_id: str, src: dict):
-        """激活 lifecycle 节点（引用计数），记录 channel → node 映射。"""
-        if channel_id in self._lifecycle_channel_map:
-            return  # 已激活
-
-        node_name = src.get('lifecycle_node_name', '')
-        if not node_name:
-            return
-        if self._cyberdog_ns and not node_name.startswith('/'):
-            node_name = f'{self._cyberdog_ns}/{node_name}'
-
-        if node_name not in self._lifecycle_adapters:
-            self._lifecycle_adapters[node_name] = LifecycleNodeAdapter(self, node_name)
-
-        self._lifecycle_adapters[node_name].acquire()
-        self._lifecycle_channel_map[channel_id] = node_name
-
     # ================================================================== RTSP（T4.3）
     def _start_rtsp(self, channel_id: str):
         if channel_id not in self._sources:
@@ -364,8 +344,8 @@ class UranMediaNode(Node):
             adapter.activate()
             self._cyberdog_adapters[channel_id] = adapter
 
-        elif src.get('source_type') == 'lifecycle_node':
-            self._acquire_lifecycle(channel_id, src)
+        elif src.get('source_type') == 'realsense_lifecycle':
+            self._activate_realsense(channel_id, src)
 
         url = self._rtsp_server.start(
             channel_id=channel_id,
@@ -382,6 +362,16 @@ class UranMediaNode(Node):
         self._subscribe_topic(channel_id, src)
         self._update_state()
         self.get_logger().info(f'RTSP started: {url}')
+
+    # ================================================================== 停止
+    def _activate_realsense(self, channel_id: str, src: dict):
+        """获取或创建 RealSenseLifecycleAdapter 并激活（引用计数）。"""
+        lc_node = src.get('lifecycle_node', '')
+        if not lc_node:
+            return
+        if lc_node not in self._realsense_adapters:
+            self._realsense_adapters[lc_node] = RealSenseLifecycleAdapter(self, lc_node)
+        self._realsense_adapters[lc_node].activate()
 
     # ================================================================== 停止
     def _stop_channel(self, channel_id: str):
@@ -407,13 +397,12 @@ class UranMediaNode(Node):
             self._cyberdog_adapters[channel_id].deactivate()
             del self._cyberdog_adapters[channel_id]
 
-        if channel_id in self._lifecycle_channel_map:
-            node_name = self._lifecycle_channel_map.pop(channel_id)
-            adapter = self._lifecycle_adapters.get(node_name)
-            if adapter:
-                adapter.release()
-                if adapter._ref_count == 0:
-                    del self._lifecycle_adapters[node_name]
+        # RealSense lifecycle（引用计数，最后一个 channel 停止时才 deactivate）
+        src = self._sources.get(channel_id, {})
+        if src.get('source_type') == 'realsense_lifecycle':
+            lc_node = src.get('lifecycle_node', '')
+            if lc_node in self._realsense_adapters:
+                self._realsense_adapters[lc_node].deactivate()
 
         self._update_state()
         self.get_logger().info(f'Channel stopped: {channel_id}')
@@ -470,7 +459,22 @@ class UranMediaNode(Node):
     def _cb_image(self, channel_id: str, msg):
         try:
             import numpy as np
-            frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+            import cv2
+            enc = getattr(msg, 'encoding', 'bgr8')
+            if enc in ('16UC1', '16SC1'):
+                # 深度图：归一化为 8-bit 灰度后转 BGR
+                raw = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+                norm = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                frame = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+            elif enc in ('mono8', '8UC1'):
+                raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
+                frame = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+            elif enc == 'rgb8':
+                raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+                frame = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+            else:
+                # bgr8 及其他：直接 reshape
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
         except Exception:
             return
         self._dispatch_frame(channel_id, frame)

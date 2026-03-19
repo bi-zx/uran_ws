@@ -18,34 +18,35 @@ uran_media:
       height: 960
       fps: 10
 
-    # CyberDog2 RealSense 深度摄像头（直接订阅 topic）
-    - channel_id: "cyberdog_depth"
-      source_type: "ros_topic"
-      ros_topic: "/camera/depth/color/points"
-      msg_type: "sensor_msgs/PointCloud2"
-      encoding: "rgb8"
-      fps: 15
-
-    # CyberDog2 双目/RGB 相机（通过 stereo_camera lifecycle 节点）
-    # 启动后发布 image_left / image_right / image_rgb 三个 topic
-    - channel_id: "stereo_left"
-      source_type: "lifecycle_node"
-      lifecycle_node_name: "stereo_camera"   # 节点会自动加 cyberdog_ns 前缀
-      ros_topic: "image_left"
+    # RealSense 左目红外图像
+    - channel_id: "realsense_left"
+      source_type: "realsense_lifecycle"
+      lifecycle_node: "/camera/camera"
+      ros_topic: "/camera/infra1/image_rect_raw"
       msg_type: "sensor_msgs/Image"
       fps: 30
 
-    - channel_id: "stereo_right"
-      source_type: "lifecycle_node"
-      lifecycle_node_name: "stereo_camera"
-      ros_topic: "image_right"
+    # RealSense 右目红外图像
+    - channel_id: "realsense_right"
+      source_type: "realsense_lifecycle"
+      lifecycle_node: "/camera/camera"
+      ros_topic: "/camera/infra2/image_rect_raw"
       msg_type: "sensor_msgs/Image"
       fps: 30
 
-    - channel_id: "stereo_rgb"
-      source_type: "lifecycle_node"
-      lifecycle_node_name: "stereo_camera"
-      ros_topic: "image_rgb"
+    # RealSense 深度图
+    - channel_id: "realsense_depth"
+      source_type: "realsense_lifecycle"
+      lifecycle_node: "/camera/camera"
+      ros_topic: "/camera/depth/image_rect_raw"
+      msg_type: "sensor_msgs/Image"
+      fps: 30
+
+    # RealSense 对齐深度图（需要 camera_align 节点）
+    - channel_id: "realsense_aligned"
+      source_type: "realsense_lifecycle"
+      lifecycle_node: "/camera/camera_align"
+      ros_topic: "/camera/aligned_depth_to_extcolor/image_raw"
       msg_type: "sensor_msgs/Image"
       fps: 30
 
