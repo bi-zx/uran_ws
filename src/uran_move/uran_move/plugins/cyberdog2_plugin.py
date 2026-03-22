@@ -92,7 +92,12 @@ class CyberDog2Plugin(MovePluginBase):
     # ------------------------------------------------------------------ #
 
     def execute(self, cmd) -> tuple:
-        # 解析 extra_json（需要提前解析以判断是否为恢复指令）
+        # 检查 motion_status
+        if self._switch_status != _SWITCH_STATUS_NORMAL:
+            name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
+            return False, json.dumps({'reason': 'motion not normal', 'switch_status': name})
+
+        # 解析 extra_json
         extra = {}
         if cmd.extra_json:
             try:
@@ -100,26 +105,18 @@ class CyberDog2Plugin(MovePluginBase):
             except Exception:
                 pass
 
-        action = cmd.action
-        
-        # 恢复性指令（stand）允许在任何状态下执行，用于从异常状态恢复
-        if action == 'stand':
-            self._last_execute_ts = 0.0
-            return self._call_result_cmd(_MOTION_RECOVERYSTAND)
-        
-        # 检查 motion_status - 非 NORMAL 状态拒绝其他指令
-        if self._switch_status != _SWITCH_STATUS_NORMAL:
-            name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
-            return False, json.dumps({'reason': 'motion not normal', 'switch_status': name})
-
         # 若 extra 含 motion_id → Result 模式（动作指令，禁用保活）
         if 'motion_id' in extra:
             self._last_execute_ts = 0.0
             return self._call_result_cmd(int(extra['motion_id']))
 
+        action = cmd.action
         if action == 'emergency_stop':
             self._last_execute_ts = 0.0
             return self._call_result_cmd(_MOTION_ESTOP)
+        elif action == 'stand':
+            self._last_execute_ts = 0.0
+            return self._call_result_cmd(_MOTION_RECOVERYSTAND)
         elif action == 'sit':
             self._last_execute_ts = 0.0
             return self._call_result_cmd(_MOTION_GETDOWN)
