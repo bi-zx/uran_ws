@@ -308,9 +308,6 @@ class CyberDog2Plugin(MovePluginBase):
         if self._switch_status == prev:
             return False
 
-        if self._switch_status != _SWITCH_STATUS_CHARGING:
-            self._charger_disconnected_since = None
-
         self._node._write_state(
             'cyberdog2_switch_status',
             self._switch_status,
@@ -344,12 +341,27 @@ class CyberDog2Plugin(MovePluginBase):
         return True
 
     def _cb_motion_status(self, msg):
-        self._set_switch_status(msg.switch_status, source='motion_status')
+        new_status = int(msg.switch_status)
+        if new_status == _SWITCH_STATUS_CHARGING and self._charger_disconnected_timed_out():
+            if self._switch_status != _SWITCH_STATUS_NORMAL:
+                self._set_switch_status(_SWITCH_STATUS_NORMAL, source='bms_status')
+            return
+        self._set_switch_status(new_status, source='motion_status')
 
     def _charger_state_name(self) -> str:
         if self._charger_connected is None:
             return 'UNKNOWN'
         return 'CONNECTED' if self._charger_connected else 'DISCONNECTED'
+
+    def _charger_disconnected_timed_out(self) -> bool:
+        if self._charger_connected is not False:
+            return False
+        if self._charger_disconnected_since is None:
+            return False
+        return (
+            time.monotonic() - self._charger_disconnected_since >=
+            self._charging_recover_timeout_s
+        )
 
     def _cb_bms_status(self, msg):
         self._charger_connected = any((
@@ -358,23 +370,20 @@ class CyberDog2Plugin(MovePluginBase):
             bool(msg.power_finished_charging),
             bool(msg.power_expower_supply),
         ))
-        if self._switch_status != _SWITCH_STATUS_CHARGING:
-            self._charger_disconnected_since = None
-            return
 
         if not self._charger_connected:
             if self._charger_disconnected_since is None:
                 self._charger_disconnected_since = time.monotonic()
-            return
+        else:
+            self._charger_disconnected_since = None
 
-        self._charger_disconnected_since = None
+        if self._switch_status != _SWITCH_STATUS_CHARGING:
+            return
 
     def _maybe_recover_from_stale_charging(self):
         if self._switch_status != _SWITCH_STATUS_CHARGING:
             return
-        if self._charger_disconnected_since is None:
-            return
-        if time.monotonic() - self._charger_disconnected_since < self._charging_recover_timeout_s:
+        if not self._charger_disconnected_timed_out():
             return
         self._set_switch_status(_SWITCH_STATUS_NORMAL, source='bms_status')
 
