@@ -27,9 +27,7 @@ _SOURCE_APP = -1
 
 # switch_status 含义（来自 MotionStatus.msg）
 _SWITCH_STATUS_NORMAL = 0
-_SWITCH_STATUS_TRANSITIONING = 1
 _SWITCH_STATUS_ESTOP = 2
-_SWITCH_STATUS_EDAMP = 3
 _SWITCH_STATUS_NAMES = {
     0: 'NORMAL', 1: 'TRANSITIONING', 2: 'ESTOP', 3: 'EDAMP',
     4: 'LIFTED', 5: 'BAN_TRANS', 6: 'OVER_HEAT', 7: 'LOW_BAT',
@@ -46,7 +44,6 @@ class CyberDog2Plugin(MovePluginBase):
         self._result_timeout = 3.0
         self._recovery_wait_timeout = float(params.get('recovery_wait_timeout_s', 5.0))
         self._auto_recover_from_estop = bool(params.get('auto_recover_from_estop', True))
-        self._auto_recover_from_edamp = bool(params.get('auto_recover_from_edamp', True))
         self._cmd_timeout_s = 0.5
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
@@ -226,26 +223,18 @@ class CyberDog2Plugin(MovePluginBase):
         if motion_id == _MOTION_ESTOP:
             return True, ''
 
-        if self._can_recover_with_stand() and motion_id == _MOTION_RECOVERYSTAND:
+        if self._switch_status == _SWITCH_STATUS_ESTOP and motion_id == _MOTION_RECOVERYSTAND:
             return True, ''
 
         if self._switch_status == _SWITCH_STATUS_ESTOP and self._auto_recover_from_estop:
             if motion_id is None and self._has_motion_request(cmd):
-                return self._recover_with_recovery_stand()
-
-        if self._switch_status == _SWITCH_STATUS_EDAMP and self._auto_recover_from_edamp:
-            if motion_id is None and self._has_motion_request(cmd):
-                return self._recover_with_recovery_stand()
+                return self._recover_from_estop()
 
         return False, self._motion_blocked_reason()
 
-    def _can_recover_with_stand(self) -> bool:
-        return self._switch_status in (_SWITCH_STATUS_ESTOP, _SWITCH_STATUS_EDAMP)
-
-    def _recover_with_recovery_stand(self) -> tuple:
-        switch_status_name = self._switch_status_name()
+    def _recover_from_estop(self) -> tuple:
         self._node.get_logger().info(
-            f'CyberDog2: switch_status={switch_status_name}, sending RECOVERYSTAND before motion command'
+            'CyberDog2: switch_status=ESTOP, sending RECOVERYSTAND before motion command'
         )
         success, result = self._call_result_cmd(_MOTION_RECOVERYSTAND)
         if not success:
@@ -288,29 +277,21 @@ class CyberDog2Plugin(MovePluginBase):
             self._node._write_state(
                 'cyberdog2_switch_status',
                 self._switch_status,
+                urgent=self._switch_status != _SWITCH_STATUS_NORMAL,
+            )
+        if self._switch_status != _SWITCH_STATUS_NORMAL and prev == _SWITCH_STATUS_NORMAL:
+            name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
+            self._node.get_logger().warn(
+                f'CyberDog2: motion switch_status -> {name} ({self._switch_status})'
+            )
+            # 上报事件
+            self._node._publish_uplink(
+                data_type='cyberdog2_motion_abnormal',
+                payload={'switch_status': self._switch_status},
                 urgent=True,
             )
-            prev_name = _SWITCH_STATUS_NAMES.get(prev, str(prev))
-            curr_name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
-            if self._switch_status == _SWITCH_STATUS_NORMAL:
-                self._node.get_logger().info(
-                    f'CyberDog2: motion switch_status {prev_name} -> NORMAL'
-                )
-            else:
-                self._node.get_logger().warn(
-                    f'CyberDog2: motion switch_status {prev_name} -> {curr_name} ({self._switch_status})'
-                )
-                # 上报异常状态变化，便于区分 CHARGING -> EDAMP 等恢复链路
-                self._node._publish_uplink(
-                    data_type='cyberdog2_motion_abnormal',
-                    payload={
-                        'switch_status': self._switch_status,
-                        'switch_status_name': curr_name,
-                        'prev_switch_status': prev,
-                        'prev_switch_status_name': prev_name,
-                    },
-                    urgent=True,
-                )
+        elif self._switch_status == _SWITCH_STATUS_NORMAL and prev != _SWITCH_STATUS_NORMAL:
+            self._node.get_logger().info('CyberDog2: motion switch_status recovered to NORMAL')
 
     def _cb_keepalive(self):
         """保活：若距上次 execute 超过 cmd_timeout_s，发布零速 servo 指令。"""
