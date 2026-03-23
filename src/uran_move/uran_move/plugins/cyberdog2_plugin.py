@@ -27,6 +27,7 @@ _SOURCE_APP = -1
 
 # switch_status 含义（来自 MotionStatus.msg）
 _SWITCH_STATUS_NORMAL = 0
+_SWITCH_STATUS_ESTOP = 2
 _SWITCH_STATUS_NAMES = {
     0: 'NORMAL', 1: 'TRANSITIONING', 2: 'ESTOP', 3: 'EDAMP',
     4: 'LIFTED', 5: 'BAN_TRANS', 6: 'OVER_HEAT', 7: 'LOW_BAT',
@@ -41,6 +42,8 @@ class CyberDog2Plugin(MovePluginBase):
     def init(self, node, params: dict) -> bool:
         self._node = node
         self._result_timeout = 3.0
+        self._recovery_wait_timeout = float(params.get('recovery_wait_timeout_s', 5.0))
+        self._auto_recover_from_estop = bool(params.get('auto_recover_from_estop', True))
         self._cmd_timeout_s = 0.5
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
@@ -92,11 +95,6 @@ class CyberDog2Plugin(MovePluginBase):
     # ------------------------------------------------------------------ #
 
     def execute(self, cmd) -> tuple:
-        # 检查 motion_status
-        if self._switch_status != _SWITCH_STATUS_NORMAL:
-            name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
-            return False, json.dumps({'reason': 'motion not normal', 'switch_status': name})
-
         # 解析 extra_json
         extra = {}
         if cmd.extra_json:
@@ -105,36 +103,50 @@ class CyberDog2Plugin(MovePluginBase):
             except Exception:
                 pass
 
-        # 若 extra 含 motion_id → Result 模式（动作指令，禁用保活）
-        if 'motion_id' in extra:
-            self._last_execute_ts = 0.0
-            return self._call_result_cmd(int(extra['motion_id']))
-
         action = cmd.action
         if action == 'emergency_stop':
             self._last_execute_ts = 0.0
             return self._call_result_cmd(_MOTION_ESTOP)
-        elif action == 'stand':
-            self._last_execute_ts = 0.0
-            return self._call_result_cmd(_MOTION_RECOVERYSTAND)
-        elif action == 'sit':
-            self._last_execute_ts = 0.0
-            return self._call_result_cmd(_MOTION_GETDOWN)
         elif action == 'stop':
             self._last_execute_ts = 0.0
             self._publish_servo(0.0, 0.0, 0.0)
             return True, ''
-        else:
-            # 速度指令 — 启用保活
-            self._last_execute_ts = time.monotonic()
-            self._publish_servo(
-                cmd.linear_vel_x,
-                cmd.linear_vel_y,
-                cmd.angular_vel_z,
-                roll=cmd.target_roll,
-                pitch=cmd.target_pitch,
-            )
-            return True, ''
+
+        motion_id = self._extract_motion_id(extra)
+        if motion_id is not None:
+            ready, error = self._ensure_motion_ready(cmd, motion_id=motion_id)
+            if not ready:
+                return False, error
+            self._last_execute_ts = 0.0
+            return self._call_result_cmd(motion_id)
+
+        if action == 'stand':
+            ready, error = self._ensure_motion_ready(cmd, motion_id=_MOTION_RECOVERYSTAND)
+            if not ready:
+                return False, error
+            self._last_execute_ts = 0.0
+            return self._call_result_cmd(_MOTION_RECOVERYSTAND)
+        elif action == 'sit':
+            ready, error = self._ensure_motion_ready(cmd, motion_id=_MOTION_GETDOWN)
+            if not ready:
+                return False, error
+            self._last_execute_ts = 0.0
+            return self._call_result_cmd(_MOTION_GETDOWN)
+
+        ready, error = self._ensure_motion_ready(cmd)
+        if not ready:
+            return False, error
+
+        # 速度指令 — 启用保活
+        self._last_execute_ts = time.monotonic()
+        self._publish_servo(
+            cmd.linear_vel_x,
+            cmd.linear_vel_y,
+            cmd.angular_vel_z,
+            roll=cmd.target_roll,
+            pitch=cmd.target_pitch,
+        )
+        return True, ''
 
     def on_failsafe(self):
         """失控保护：停止运动，禁用保活。"""
@@ -196,19 +208,81 @@ class CyberDog2Plugin(MovePluginBase):
         resp = future.result()
         return bool(resp.result), f'code={resp.code}'
 
+    def _extract_motion_id(self, extra: dict):
+        if 'motion_id' not in extra:
+            return None
+        try:
+            return int(extra['motion_id'])
+        except (TypeError, ValueError):
+            return None
+
+    def _ensure_motion_ready(self, cmd, motion_id: int = None) -> tuple:
+        if self._switch_status == _SWITCH_STATUS_NORMAL:
+            return True, ''
+
+        if motion_id == _MOTION_ESTOP:
+            return True, ''
+
+        if self._switch_status == _SWITCH_STATUS_ESTOP and motion_id == _MOTION_RECOVERYSTAND:
+            return True, ''
+
+        if self._switch_status == _SWITCH_STATUS_ESTOP and self._auto_recover_from_estop:
+            if motion_id is None and self._has_motion_request(cmd):
+                return self._recover_from_estop()
+
+        return False, self._motion_blocked_reason()
+
+    def _recover_from_estop(self) -> tuple:
+        self._node.get_logger().info(
+            'CyberDog2: switch_status=ESTOP, sending RECOVERYSTAND before motion command'
+        )
+        success, result = self._call_result_cmd(_MOTION_RECOVERYSTAND)
+        if not success:
+            return False, json.dumps({'reason': 'recovery stand failed', 'detail': result})
+
+        deadline = time.monotonic() + self._recovery_wait_timeout
+        while self._switch_status != _SWITCH_STATUS_NORMAL and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        if self._switch_status != _SWITCH_STATUS_NORMAL:
+            return False, json.dumps({
+                'reason': 'recovery stand timeout',
+                'switch_status': self._switch_status_name(),
+            })
+
+        return True, ''
+
+    def _has_motion_request(self, cmd) -> bool:
+        return any(abs(v) > 1e-6 for v in (
+            cmd.linear_vel_x,
+            cmd.linear_vel_y,
+            cmd.angular_vel_z,
+            cmd.target_roll,
+            cmd.target_pitch,
+        ))
+
+    def _motion_blocked_reason(self) -> str:
+        return json.dumps({
+            'reason': 'motion not normal',
+            'switch_status': self._switch_status_name(),
+        })
+
+    def _switch_status_name(self) -> str:
+        return _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
+
     def _cb_motion_status(self, msg):
         prev = self._switch_status
         self._switch_status = msg.switch_status
+        if self._switch_status != prev:
+            self._node._write_state(
+                'cyberdog2_switch_status',
+                self._switch_status,
+                urgent=self._switch_status != _SWITCH_STATUS_NORMAL,
+            )
         if self._switch_status != _SWITCH_STATUS_NORMAL and prev == _SWITCH_STATUS_NORMAL:
             name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
             self._node.get_logger().warn(
                 f'CyberDog2: motion switch_status -> {name} ({self._switch_status})'
-            )
-            # 写入状态空间
-            self._node._write_state(
-                'cyberdog2_switch_status',
-                self._switch_status,
-                urgent=True,
             )
             # 上报事件
             self._node._publish_uplink(
@@ -216,6 +290,8 @@ class CyberDog2Plugin(MovePluginBase):
                 payload={'switch_status': self._switch_status},
                 urgent=True,
             )
+        elif self._switch_status == _SWITCH_STATUS_NORMAL and prev != _SWITCH_STATUS_NORMAL:
+            self._node.get_logger().info('CyberDog2: motion switch_status recovered to NORMAL')
 
     def _cb_keepalive(self):
         """保活：若距上次 execute 超过 cmd_timeout_s，发布零速 servo 指令。"""
