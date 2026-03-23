@@ -37,20 +37,6 @@ _SWITCH_STATUS_NAMES = {
     14: 'CHARGING',
 }
 
-# sensor_msgs/BatteryState.power_supply_status
-_BATTERY_STATUS_UNKNOWN = 0
-_BATTERY_STATUS_CHARGING = 1
-_BATTERY_STATUS_DISCHARGING = 2
-_BATTERY_STATUS_NOT_CHARGING = 3
-_BATTERY_STATUS_FULL = 4
-_BATTERY_STATUS_NAMES = {
-    0: 'UNKNOWN',
-    1: 'CHARGING',
-    2: 'DISCHARGING',
-    3: 'NOT_CHARGING',
-    4: 'FULL',
-}
-
 
 class CyberDog2Plugin(MovePluginBase):
 
@@ -63,23 +49,18 @@ class CyberDog2Plugin(MovePluginBase):
         self._charging_recover_timeout_s = float(params.get('charging_recover_timeout_s', 1.0))
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
-        self._battery_power_supply_status = None
-        self._battery_not_charging_since = None
+        self._charger_connected = None
+        self._charger_disconnected_since = None
 
         # cyberdog_ws 节点的 ROS namespace（如 /mi_desktop_48_b0_2d_5f_b6_d0）
         ns = params.get('namespace', '').rstrip('/')
 
         try:
-            from protocol.msg import MotionServoCmd, MotionStatus
+            from protocol.msg import MotionServoCmd, MotionStatus, BmsStatus
             from protocol.srv import MotionResultCmd
         except ImportError as e:
             node.get_logger().error(f'CyberDog2Plugin: protocol package not found: {e}')
             return False
-
-        try:
-            from sensor_msgs.msg import BatteryState
-        except ImportError:
-            BatteryState = None
 
         self._MotionServoCmd = MotionServoCmd
         self._MotionResultCmd = MotionResultCmd
@@ -95,23 +76,21 @@ class CyberDog2Plugin(MovePluginBase):
             10,
         )
 
-        battery_status_topic = str(params.get('battery_status_topic', '/battery_status')).strip()
-        self._battery_status_sub = None
-        if BatteryState is None:
-            node.get_logger().warn(
-                'CyberDog2Plugin: sensor_msgs/BatteryState not available, charging recovery fallback disabled'
-            )
-        elif battery_status_topic:
-            resolved_battery_status_topic = self._resolve_topic(ns, battery_status_topic)
-            self._battery_status_sub = node.create_subscription(
-                BatteryState,
-                resolved_battery_status_topic,
-                self._cb_battery_status,
+        bms_status_topic = str(
+            params.get('bms_status_topic', params.get('battery_status_topic', 'bms_status'))
+        ).strip()
+        self._bms_status_sub = None
+        if bms_status_topic:
+            resolved_bms_status_topic = self._resolve_topic(ns, bms_status_topic)
+            self._bms_status_sub = node.create_subscription(
+                BmsStatus,
+                resolved_bms_status_topic,
+                self._cb_bms_status,
                 10,
             )
             node.get_logger().info(
                 'CyberDog2Plugin charging recovery enabled, '
-                f'battery_status_topic="{resolved_battery_status_topic}", '
+                f'bms_status_topic="{resolved_bms_status_topic}", '
                 f'charging_recover_timeout_s={self._charging_recover_timeout_s}'
             )
 
@@ -323,20 +302,6 @@ class CyberDog2Plugin(MovePluginBase):
     def _switch_status_name(self) -> str:
         return _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))
 
-    def _battery_status_name(self) -> str:
-        if self._battery_power_supply_status is None:
-            return _BATTERY_STATUS_NAMES[_BATTERY_STATUS_UNKNOWN]
-        return _BATTERY_STATUS_NAMES.get(
-            self._battery_power_supply_status,
-            str(self._battery_power_supply_status),
-        )
-
-    def _battery_indicates_charger_disconnected(self) -> bool:
-        return self._battery_power_supply_status in (
-            _BATTERY_STATUS_DISCHARGING,
-            _BATTERY_STATUS_NOT_CHARGING,
-        )
-
     def _set_switch_status(self, new_status: int, source: str = 'motion_status') -> bool:
         prev = self._switch_status
         self._switch_status = int(new_status)
@@ -344,7 +309,7 @@ class CyberDog2Plugin(MovePluginBase):
             return False
 
         if self._switch_status != _SWITCH_STATUS_CHARGING:
-            self._battery_not_charging_since = None
+            self._charger_disconnected_since = None
 
         self._node._write_state(
             'cyberdog2_switch_status',
@@ -365,10 +330,10 @@ class CyberDog2Plugin(MovePluginBase):
                 urgent=True,
             )
         elif self._switch_status == _SWITCH_STATUS_NORMAL and prev != _SWITCH_STATUS_NORMAL:
-            if source == 'battery_status':
+            if source == 'bms_status':
                 self._node.get_logger().warn(
                     'CyberDog2: '
-                    f'battery_status={self._battery_status_name()}, '
+                    f'bms_status={self._charger_state_name()}, '
                     f'forcing motion switch_status {prev_name} -> NORMAL ({_SWITCH_STATUS_NORMAL})'
                 )
             else:
@@ -381,27 +346,37 @@ class CyberDog2Plugin(MovePluginBase):
     def _cb_motion_status(self, msg):
         self._set_switch_status(msg.switch_status, source='motion_status')
 
-    def _cb_battery_status(self, msg):
-        self._battery_power_supply_status = int(msg.power_supply_status)
+    def _charger_state_name(self) -> str:
+        if self._charger_connected is None:
+            return 'UNKNOWN'
+        return 'CONNECTED' if self._charger_connected else 'DISCONNECTED'
+
+    def _cb_bms_status(self, msg):
+        self._charger_connected = any((
+            bool(msg.power_wired_charging),
+            bool(msg.power_wp_charging),
+            bool(msg.power_finished_charging),
+            bool(msg.power_expower_supply),
+        ))
         if self._switch_status != _SWITCH_STATUS_CHARGING:
-            self._battery_not_charging_since = None
+            self._charger_disconnected_since = None
             return
 
-        if self._battery_indicates_charger_disconnected():
-            if self._battery_not_charging_since is None:
-                self._battery_not_charging_since = time.monotonic()
+        if not self._charger_connected:
+            if self._charger_disconnected_since is None:
+                self._charger_disconnected_since = time.monotonic()
             return
 
-        self._battery_not_charging_since = None
+        self._charger_disconnected_since = None
 
     def _maybe_recover_from_stale_charging(self):
         if self._switch_status != _SWITCH_STATUS_CHARGING:
             return
-        if self._battery_not_charging_since is None:
+        if self._charger_disconnected_since is None:
             return
-        if time.monotonic() - self._battery_not_charging_since < self._charging_recover_timeout_s:
+        if time.monotonic() - self._charger_disconnected_since < self._charging_recover_timeout_s:
             return
-        self._set_switch_status(_SWITCH_STATUS_NORMAL, source='battery_status')
+        self._set_switch_status(_SWITCH_STATUS_NORMAL, source='bms_status')
 
     def _cb_keepalive(self):
         """保活：若距上次 execute 超过 cmd_timeout_s，发布零速 servo 指令。"""

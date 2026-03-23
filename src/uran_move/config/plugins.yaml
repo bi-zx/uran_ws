@@ -9,10 +9,10 @@ uran_move:
         # 执行 `ros2 service list | grep motion_result_cmd` 查看完整路径
         # 留空则使用相对名（无 namespace）
         namespace: "/mi_desktop_48_b0_2d_5f_b6_d0"
-        # 充电状态恢复兜底使用的电池 topic。
-        # 若设备发布的是命名空间内相对 topic，可改成 "battery_status"
-        battery_status_topic: "/battery_status"
-        # battery_status 已明确变为非充电后，超过该时间仍卡在 CHARGING
+        # 充电状态恢复兜底使用的 BMS topic。
+        # 默认按 namespace 解析为 "<namespace>/bms_status"
+        bms_status_topic: "bms_status"
+        # bms_status 已明确变为非充电后，超过该时间仍卡在 CHARGING
         # 则强制恢复为 NORMAL
         charging_recover_timeout_s: 1.0
   failsafe:
