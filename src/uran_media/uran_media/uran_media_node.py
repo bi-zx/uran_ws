@@ -137,12 +137,14 @@ class UranMediaNode(Node):
         channel_id = cmd.channel_id
         protocol = cmd.protocol
         signal_json = cmd.signal_json
+        handle_signal = False
 
         self.get_logger().info(
             f'media_ctrl: action={action}, channel={channel_id}, protocol={protocol}'
         )
 
         if action == 'start':
+            handle_signal = True
             if protocol == 'webrtc':
                 self._start_webrtc(channel_id)
             elif protocol == 'rtsp':
@@ -154,6 +156,7 @@ class UranMediaNode(Node):
             self._stop_channel(channel_id)
 
         elif action == 'switch':
+            handle_signal = True
             self._stop_all_channels()
             if protocol == 'webrtc':
                 self._start_webrtc(channel_id)
@@ -167,6 +170,11 @@ class UranMediaNode(Node):
             self._stop_record(channel_id)
 
         elif signal_json and signal_json not in ('', '{}'):
+            handle_signal = True
+
+        # 部分云端/网关会把 start 和首个 offer 合并在同一条 media_ctrl 里下发。
+        # 通道注册完成后继续处理 signal_json，避免桥接模式丢掉 offer。
+        if handle_signal and signal_json and signal_json not in ('', '{}'):
             self._handle_signal(channel_id, signal_json)
 
     def _cb_media_switch(self, cmd: MediaSwitchCmd):
