@@ -364,6 +364,9 @@ class CyberDog2Plugin(MovePluginBase):
         )
 
     def _cb_bms_status(self, msg):
+        battery_level = max(0.0, min(100.0, float(msg.batt_soc)))
+        self._node._write_state('battery_level', battery_level)
+
         self._charger_connected = any((
             bool(msg.power_wired_charging),
             bool(msg.power_wp_charging),
