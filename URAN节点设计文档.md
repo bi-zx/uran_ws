@@ -935,7 +935,7 @@ CyberDog2 提供两类 ROS 接口，插件根据指令类型自动选择：
 
 | `MotionServoCmd` 字段 | 来源                                | 说明                                      |
 | --------------------- | ----------------------------------- | ----------------------------------------- |
-| `motion_id`           | 固定 `WALK_USERTROT = 303`          | 自适应步频行走模式                        |
+| `motion_id`           | 固定 `WALK_ADAPTIVELY = 304`        | 自变频步态行走模式                        |
 | `cmd_type`            | 固定 `SERVO_START = 0`              | 每帧均以 SERVO_START 发送（SDK 要求）     |
 | `vel_des[0]`          | `linear_vel_x`                      | 前进速度（m/s），前正后负                 |
 | `vel_des[1]`          | `linear_vel_y`                      | 侧移速度（m/s），左正右负                 |
@@ -950,7 +950,7 @@ CyberDog2 提供两类 ROS 接口，插件根据指令类型自动选择：
 
 | `action` 值        | 控制方式     | SDK 调用                                                     | 说明                         |
 | ------------------ | ------------ | ------------------------------------------------------------ | ---------------------------- |
-| `"stop"`           | Servo 模式   | 发布零速度 `vel_des=[0,0,0]`，`motion_id=WALK_USERTROT`      | 原地停止，保持站立步态       |
+| `"stop"`           | Servo 模式   | 发布零速度 `vel_des=[0,0,0]`，`motion_id=WALK_ADAPTIVELY`      | 原地停止，保持站立步态       |
 | `"emergency_stop"` | Result 模式  | `motion_result_cmd`，`motion_id=ESTOP(0)`                    | 急停，进入阻尼模式           |
 | `"stand"`          | Result 模式  | `motion_result_cmd`，`motion_id=RECOVERYSTAND(111)`          | 从任意姿态恢复站立           |
 | `"sit"`            | Result 模式  | `motion_result_cmd`，`motion_id=GETDOWN(101)`                | 高阻尼趴下                   |

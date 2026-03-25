@@ -14,7 +14,7 @@ import rclpy
 from uran_move.plugin_base import MovePluginBase
 
 # CyberDog2 motion_id 常量
-_MOTION_WALK_USERTROT = 303
+_MOTION_WALK_ADAPTIVELY = 304
 _MOTION_RECOVERYSTAND = 111
 _MOTION_GETDOWN = 101
 _MOTION_ESTOP = 0
@@ -203,7 +203,7 @@ class CyberDog2Plugin(MovePluginBase):
         if step_height is None:
             step_height = [0.05, 0.05]
         msg = self._MotionServoCmd()
-        msg.motion_id = _MOTION_WALK_USERTROT
+        msg.motion_id = _MOTION_WALK_ADAPTIVELY
         msg.cmd_type = _SERVO_START
         msg.cmd_source = _SOURCE_APP
         msg.vel_des = [float(vx), float(vy), float(wz)]
