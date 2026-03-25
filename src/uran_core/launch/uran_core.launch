@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="uran_core" type="uran_core_node" name="uran_core_node" output="screen" />
+</launch>

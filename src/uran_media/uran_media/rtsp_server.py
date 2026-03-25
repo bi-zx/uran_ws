@@ -38,10 +38,13 @@ class _ChannelState:
 class RTSPServer:
     """多通道 RTSP Server，所有 channel 共享同一端口，各自独立 mount point。"""
 
-    def __init__(self, port: int = 8554):
+    def __init__(self, port: int = 8554, encoder_pipeline: str = ''):
         self._channels: Dict[str, _ChannelState] = {}
         self._factories: Dict[str, object] = {}
         self._port = port
+        self._encoder_pipeline = encoder_pipeline or (
+            'x264enc tune=zerolatency speed-preset=ultrafast key-int-max={fps}'
+        )
         self._server = None
         self._mounts = None
         self._loop: object = None
@@ -83,13 +86,13 @@ class RTSPServer:
             self._ensure_server()
 
             factory = GstRtspServer.RTSPMediaFactory()
+            encoder_pipeline = self._encoder_pipeline.format(fps=fps, width=width, height=height)
             pipeline_str = (
                 f'( appsrc name=src is-live=true block=false do-timestamp=true format=time '
                 f'caps=video/x-raw,format=BGR,width={width},height={height},'
                 f'framerate={fps}/1 ! '
                 f'videoconvert ! video/x-raw,format=I420 ! '
-                f'x264enc tune=zerolatency speed-preset=ultrafast '
-                f'key-int-max={fps} ! '
+                f'{encoder_pipeline} ! '
                 f'rtph264pay name=pay0 pt=96 config-interval=1 )'
             )
             factory.set_launch(pipeline_str)

@@ -3,7 +3,7 @@ import json
 import logging
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class MqttClient:
         self._connected = False
         self._registered = False
         self._reg_event = threading.Event()
+        self._reg_result = 'timeout'
 
         device_id = net_cfg.get('device_id', 'device_001')
         tenant_id = net_cfg.get('tenant_id', 'default')
@@ -91,7 +92,8 @@ class MqttClient:
         }
         self._reg_event.clear()
         self._reg_result = 'timeout'
-        self.publish_raw(payload)
+        if not self.publish_raw(payload):
+            return 'publish_failed'
         self._reg_event.wait(timeout=timeout_s)
         return self._reg_result
 
@@ -116,9 +118,14 @@ class MqttClient:
         with self._lock:
             return self._connected
 
+    def is_registered(self) -> bool:
+        with self._lock:
+            return self._registered
+
     def get_protocol_entry(self) -> dict:
         return {
             'available': self.is_connected(),
+            'registered': self.is_registered(),
             'latency_ms': self._latency_ms,
             'last_check_ts': self._last_check_ts,
         }
@@ -137,6 +144,7 @@ class MqttClient:
     def _on_disconnect(self, client, userdata, rc):
         with self._lock:
             self._connected = False
+            self._registered = False
         self._last_check_ts = int(time.time())
         logger.warning(f'MQTT disconnected rc={rc}')
 
@@ -151,7 +159,10 @@ class MqttClient:
 
         # 处理注册响应
         if msg_type == 'register_response':
-            self._reg_result = payload.get('result', 'rejected')
+            result = payload.get('result', 'rejected')
+            with self._lock:
+                self._registered = result in ('registered', 'auto_registered', 'accepted', 'ok', 'success')
+            self._reg_result = result
             self._reg_event.set()
             return
 

@@ -1,29 +1,32 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.0.2)
 project(uran_srvs)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
-
-find_package(ament_cmake REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(builtin_interfaces REQUIRED)
-
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "srv/GetStateField.srv"
-  "srv/SetStateField.srv"
-  "srv/ConnectProtocol.srv"
-  "srv/GetNetworkStatus.srv"
-  "srv/SwitchMovePlugin.srv"
-  "srv/ReloadConfig.srv"
-  "srv/ListSensors.srv"
-  "srv/GetTaskStatus.srv"
-  "srv/TriggerStateReport.srv"
-  "srv/ConfigureStateReport.srv"
-  DEPENDENCIES std_msgs builtin_interfaces
+find_package(catkin REQUIRED COMPONENTS
+  message_generation
+  std_msgs
 )
 
-ament_export_dependencies(rosidl_default_runtime)
+add_service_files(
+  FILES
+  GetStateField.srv
+  SetStateField.srv
+  ConnectProtocol.srv
+  GetNetworkStatus.srv
+  SwitchMovePlugin.srv
+  ReloadConfig.srv
+  ListSensors.srv
+  GetTaskStatus.srv
+  TriggerStateReport.srv
+  ConfigureStateReport.srv
+)
 
-ament_package()
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+)
+
+catkin_package(
+  CATKIN_DEPENDS
+  message_runtime
+  std_msgs
+)
