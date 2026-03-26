@@ -18,6 +18,8 @@ uran_move:
         cmd_timeout_s: 0.05
         # 连续零速度维持该时长后，自动从原地踏步切回 stand；<=0 表示关闭
         idle_to_stand_timeout_s: 1.5
+        # 自动 stand 失败后的重试冷却时间，避免周期性踏步
+        auto_stand_retry_interval_s: 10.0
         # 判定为“零速度”的阈值，避免微小抖动导致无法自动 stand
         zero_velocity_epsilon: 0.02
         # bms_status 已明确变为非充电后，超过该时间仍卡在 CHARGING

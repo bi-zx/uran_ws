@@ -49,6 +49,7 @@ class CyberDog2Plugin(MovePluginBase):
         self._servo_publish_hz = float(params.get('servo_publish_hz', 20.0))
         self._charging_recover_timeout_s = float(params.get('charging_recover_timeout_s', 1.0))
         self._idle_to_stand_timeout_s = float(params.get('idle_to_stand_timeout_s', 0.0))
+        self._auto_stand_retry_interval_s = float(params.get('auto_stand_retry_interval_s', 10.0))
         self._zero_velocity_epsilon = float(params.get('zero_velocity_epsilon', 0.02))
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
@@ -56,6 +57,7 @@ class CyberDog2Plugin(MovePluginBase):
         self._charger_disconnected_since = None
         self._idle_zero_since = None
         self._auto_stand_sent = False
+        self._auto_stand_retry_after = 0.0
 
         if self._cmd_timeout_s < 0.0:
             node.get_logger().warn(
@@ -74,6 +76,12 @@ class CyberDog2Plugin(MovePluginBase):
                 f'invalid idle_to_stand_timeout_s={self._idle_to_stand_timeout_s}, fallback to 0.0'
             )
             self._idle_to_stand_timeout_s = 0.0
+        if self._auto_stand_retry_interval_s < 0.0:
+            node.get_logger().warn(
+                'CyberDog2Plugin: '
+                f'invalid auto_stand_retry_interval_s={self._auto_stand_retry_interval_s}, fallback to 10.0'
+            )
+            self._auto_stand_retry_interval_s = 10.0
         if self._zero_velocity_epsilon < 0.0:
             node.get_logger().warn(
                 'CyberDog2Plugin: '
@@ -164,11 +172,13 @@ class CyberDog2Plugin(MovePluginBase):
             self._last_execute_ts = 0.0
             self._idle_zero_since = None
             self._auto_stand_sent = False
+            self._auto_stand_retry_after = 0.0
             return self._call_result_cmd(_MOTION_ESTOP)
         elif action == 'stop':
             self._last_execute_ts = 0.0
             self._idle_zero_since = time.monotonic()
             self._auto_stand_sent = False
+            self._auto_stand_retry_after = 0.0
             self._publish_servo(0.0, 0.0, 0.0)
             return True, ''
 
@@ -187,6 +197,7 @@ class CyberDog2Plugin(MovePluginBase):
             self._last_execute_ts = 0.0
             self._idle_zero_since = None
             self._auto_stand_sent = False
+            self._auto_stand_retry_after = 0.0
             return self._call_result_cmd(_MOTION_RECOVERYSTAND)
         elif action == 'sit':
             ready, error = self._ensure_motion_ready(cmd, motion_id=_MOTION_GETDOWN)
@@ -195,6 +206,7 @@ class CyberDog2Plugin(MovePluginBase):
             self._last_execute_ts = 0.0
             self._idle_zero_since = None
             self._auto_stand_sent = False
+            self._auto_stand_retry_after = 0.0
             return self._call_result_cmd(_MOTION_GETDOWN)
 
         ready, error = self._ensure_motion_ready(cmd)
@@ -209,6 +221,7 @@ class CyberDog2Plugin(MovePluginBase):
         else:
             self._idle_zero_since = None
             self._auto_stand_sent = False
+            self._auto_stand_retry_after = 0.0
         self._publish_servo(
             cmd.linear_vel_x,
             cmd.linear_vel_y,
@@ -223,6 +236,7 @@ class CyberDog2Plugin(MovePluginBase):
         self._last_execute_ts = 0.0
         self._idle_zero_since = time.monotonic()
         self._auto_stand_sent = False
+        self._auto_stand_retry_after = 0.0
         self._publish_servo(0.0, 0.0, 0.0)
         self._node.get_logger().warn('CyberDog2: failsafe triggered, sending zero-velocity')
 
@@ -362,20 +376,27 @@ class CyberDog2Plugin(MovePluginBase):
             return
         if self._switch_status != _SWITCH_STATUS_NORMAL:
             return
-        if time.monotonic() - self._idle_zero_since < self._idle_to_stand_timeout_s:
+        now = time.monotonic()
+        if now < self._auto_stand_retry_after:
+            return
+        if now - self._idle_zero_since < self._idle_to_stand_timeout_s:
             return
 
+        self._last_execute_ts = 0.0
         self._node.get_logger().info(
-            'CyberDog2: idle zero-velocity timeout reached, sending RECOVERYSTAND'
+            'CyberDog2: idle zero-velocity timeout reached, stopping keepalive and sending RECOVERYSTAND'
         )
         success, result = self._call_result_cmd(_MOTION_RECOVERYSTAND)
         if success:
             self._auto_stand_sent = True
             self._idle_zero_since = None
-            self._last_execute_ts = 0.0
+            self._auto_stand_retry_after = 0.0
         else:
+            self._idle_zero_since = now
+            self._auto_stand_retry_after = now + self._auto_stand_retry_interval_s
             self._node.get_logger().warn(
-                f'CyberDog2: auto stand failed: {result}'
+                'CyberDog2: '
+                f'auto stand failed: {result}, retry after {self._auto_stand_retry_interval_s:.1f}s'
             )
 
     def _motion_blocked_reason(self) -> str:
