@@ -16,6 +16,10 @@ uran_move:
         servo_publish_hz: 20.0
         # 距最后一条速度指令超过该时间后，插件自动补发零速度
         cmd_timeout_s: 0.05
+        # 连续零速度维持该时长后，自动从原地踏步切回 stand；<=0 表示关闭
+        idle_to_stand_timeout_s: 1.5
+        # 判定为“零速度”的阈值，避免微小抖动导致无法自动 stand
+        zero_velocity_epsilon: 0.02
         # bms_status 已明确变为非充电后，超过该时间仍卡在 CHARGING
         # 则强制恢复为 NORMAL
         charging_recover_timeout_s: 1.0
