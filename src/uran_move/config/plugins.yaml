@@ -12,6 +12,10 @@ uran_move:
         # 充电状态恢复兜底使用的 BMS topic。
         # 默认按 namespace 解析为 "<namespace>/bms_status"
         bms_status_topic: "bms_status"
+        # servo 保活频率；值越高，停发后补零速的调度粒度越细
+        servo_publish_hz: 20.0
+        # 距最后一条速度指令超过该时间后，插件自动补发零速度
+        cmd_timeout_s: 0.05
         # bms_status 已明确变为非充电后，超过该时间仍卡在 CHARGING
         # 则强制恢复为 NORMAL
         charging_recover_timeout_s: 1.0

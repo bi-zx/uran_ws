@@ -45,12 +45,25 @@ class CyberDog2Plugin(MovePluginBase):
         self._result_timeout = 3.0
         self._recovery_wait_timeout = float(params.get('recovery_wait_timeout_s', 5.0))
         self._auto_recover_from_estop = bool(params.get('auto_recover_from_estop', True))
-        self._cmd_timeout_s = 0.5
+        self._cmd_timeout_s = float(params.get('cmd_timeout_s', 0.5))
+        self._servo_publish_hz = float(params.get('servo_publish_hz', 20.0))
         self._charging_recover_timeout_s = float(params.get('charging_recover_timeout_s', 1.0))
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
         self._charger_connected = None
         self._charger_disconnected_since = None
+
+        if self._cmd_timeout_s < 0.0:
+            node.get_logger().warn(
+                f'CyberDog2Plugin: invalid cmd_timeout_s={self._cmd_timeout_s}, fallback to 0.5'
+            )
+            self._cmd_timeout_s = 0.5
+        if self._servo_publish_hz <= 0.0:
+            node.get_logger().warn(
+                'CyberDog2Plugin: '
+                f'invalid servo_publish_hz={self._servo_publish_hz}, fallback to 20.0'
+            )
+            self._servo_publish_hz = 20.0
 
         # cyberdog_ws 节点的 ROS namespace（如 /mi_desktop_48_b0_2d_5f_b6_d0）
         ns = params.get('namespace', '').rstrip('/')
@@ -97,10 +110,15 @@ class CyberDog2Plugin(MovePluginBase):
         # Result 服务 client
         self._result_client = node.create_client(MotionResultCmd, ns + '/motion_result_cmd')
 
-        # 保活定时器（20Hz）
-        self._keepalive_timer = node.create_timer(0.05, self._cb_keepalive)
+        # 保活定时器（频率可配置）
+        self._keepalive_timer = node.create_timer(1.0 / self._servo_publish_hz, self._cb_keepalive)
 
-        node.get_logger().info(f'CyberDog2Plugin initialized, namespace="{ns}"')
+        node.get_logger().info(
+            'CyberDog2Plugin initialized, '
+            f'namespace="{ns}", '
+            f'servo_publish_hz={self._servo_publish_hz}, '
+            f'cmd_timeout_s={self._cmd_timeout_s}'
+        )
         return True
 
     def device_type(self) -> str:
