@@ -1,6 +1,16 @@
 # URAN — 统一机器人接入节点
 
-URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一接入与能力承载层，以 ROS 2 软件包形态交付。
+URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一接入与能力承载层。
+
+当前仓库已完成 **ROS1 Noetic** 适配，现阶段主要包含：
+- `uran_core`：统一接入、状态管理、MQTT 上下行
+- `uran_media`：基于 **aiortc** 的标准 WebRTC / RTSP 媒体通道
+- `uran_msgs` / `uran_srvs`：统一消息与服务定义
+
+同时，项目方向已做如下调整：
+- ROS1 版本 `uran_move` **不再适配 CyberDog2**，后续面向 **px4_mavros**
+- `uran_media` **抛弃桥接方案**，采用 **aiortc 标准实现**
+- **移除 `camera_service` 方案**，仅适配 **RealSense 原生 ROS 话题**
 
 ---
 
@@ -14,15 +24,14 @@ URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一
   - [配置文件](#配置文件)
   - [ROS 接口](#ros-接口)
 - [uran_media 使用说明](#uran_media-使用说明)
+  - [依赖安装](#依赖安装)
   - [摄像头配置](#摄像头配置)
-  - [WebRTC 信令流程](#webrtc-信令流程)
-    - [方案一：本地信令服务器（局域网）](#方案一本地信令服务器局域网)
-    - [方案二：公网信令服务器](#方案二公网信令服务器)
+  - [WebRTC](#webrtc)
   - [RTSP 推流](#rtsp-推流)
   - [本地录制](#本地录制)
   - [ROS 接口（media）](#ros-接口media)
 - [消息与服务定义](#消息与服务定义)
-- [实机测试（CyberDog2）](#实机测试cyberdog2)
+- [项目说明与迁移备注](#项目说明与迁移备注)
 - [相关文档](#相关文档)
 
 ---
@@ -31,160 +40,131 @@ URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一
 
 | 项目 | 版本 |
 |------|------|
-| 操作系统 | Ubuntu 22.04 |
-| ROS 2 | Humble |
-| Python | 3.10（conda 环境） |
-| Conda | Miniconda / Anaconda |
+| 操作系统 | Ubuntu 20.04 |
+| ROS | ROS1 Noetic |
+| Python | 3 |
+
+推荐先安装：
+
+```bash
+sudo apt install python3-catkin-tools python3-rospkg python3-yaml python3-pip
+```
+
+`uran_media` 额外依赖见下文的[依赖安装](#依赖安装)。
 
 ---
 
 ## 快速开始
 
-### 1. 创建 Conda 环境
+### 1. 编译工作空间
 
 ```bash
-conda create -n uran python=3.10 -y
-conda activate uran
-pip install empy==3.3.4 lark catkin_pkg rospkg numpy colcon-common-extensions paho-mqtt
-```
-
-> Python 必须为 3.10，与 ROS 2 Humble 绑定的系统 Python 版本一致。
-
-### 2. 编译工作空间
-
-```bash
-conda activate uran
-source /opt/ros/humble/setup.bash
 cd ~/uran_ws
-python -m colcon build
+catkin_make
 ```
 
-使用 `python -m colcon` 而非直接 `colcon build`，确保编译使用 conda 环境中的 Python，避免与系统 Python 冲突。
-
-编译单个包：
+### 2. 加载环境
 
 ```bash
-python -m colcon build --packages-select uran_core
+source /opt/ros/noetic/setup.bash
+source ~/uran_ws/devel/setup.bash
 ```
 
-### 3. 加载环境
-
-每次新开终端都需要执行：
+### 3. 启动 uran_core
 
 ```bash
-conda activate uran
-source /opt/ros/humble/setup.bash
-source ~/uran_ws/install/setup.bash
+rosrun uran_core uran_core_node
+# 或
+roslaunch uran_core uran_core.launch
 ```
 
-### 4. 启动 uran_core 节点
+### 4. 启动 uran_media
 
 ```bash
-ros2 run uran_core uran_core_node
-# 或使用 launch 文件
-ros2 launch uran_core uran_core.launch.py
+rosrun uran_media uran_media_node
 ```
 
 ---
 
 ## 软件包结构
 
-```
+```text
 uran_ws/
 ├── src/
-│   ├── uran_msgs/          # 自定义消息定义（12 条）
-│   ├── uran_srvs/          # 自定义服务定义（10 条）
-│   ├── uran_core/          # 核心包 ← 已实现
-│   ├── uran_move/          # 运控包 ← 已实现（T2.1–T2.3）
-│   ├── uran_media/         # 流媒体包 ← 已实现（T4）
-│   ├── uran_sensor/        # 传感器包（待开发）
-│   ├── uran_frpcpoint/     # 端口转发服务（待开发）
-│   └── uran_autotask/      # 自动化巡检服务（待开发）
+│   ├── uran_core/     # ROS1 核心接入节点
+│   ├── uran_media/    # ROS1 媒体节点（aiortc + RTSP）
+│   ├── uran_msgs/     # 自定义消息定义
+│   └── uran_srvs/     # 自定义服务定义
 ├── URAN节点设计文档.md
 ├── 云端与URAN节点通信字段手册.md
 └── URAN开发任务清单.md
 ```
 
+说明：
+- 当前仓库中 **未包含 ROS1 版 `uran_move` 实现**
+- `uran_move` 的 ROS1 适配方向已调整为 **px4_mavros**，不再维护 CyberDog2 适配路线
+
 ---
 
 ## uran_core 使用说明
+
+`uran_core` 负责：
+- 设备状态空间管理
+- MQTT 上下行通信
+- 云端控制指令下发
+- 统一 ROS Topic / Service 对外接口
 
 ### MQTT 控制说明
 
 #### 网络拓扑
 
+```text
+[主机 / 云端]                    [设备侧]
+MQTT Broker  ◄──── 网络 ────►  uran_core_node
+                                    │
+                                    ├── /uran/core/downlink/move_cmd
+                                    ├── /uran/core/downlink/media_ctrl
+                                    └── /uran/core/uplink/data
 ```
-[主机 / 云端]                        [机器狗]
-mosquitto broker ◄──── WiFi ────► uran_core_node
-mosquitto_pub/sub                       │
-                                   uran_move_node
-                                        │
-                                  motion_manager
-```
 
-机器狗上的 `uran_core_node` 作为 MQTT 客户端连接到主机（或云端）的 Broker，所有控制指令通过 MQTT 下行，执行结果通过 MQTT 上行。
+节点使用以下 MQTT Topic 与云端通信：
+- 上行：`/oivs/{tenant_id}/{device_id}/up`
+- 下行：`/oivs/{tenant_id}/{device_id}/down`
 
-#### 前置准备
+#### 支持的下行 `msg_type`
 
-**主机上安装并启动 Broker：**
+| msg_type | 处理方式 |
+|----------|---------|
+| `control_switch` | 更新模式/控制者/媒体状态 |
+| `move_cmd` | 路由到 `/uran/core/downlink/move_cmd` |
+| `task_ctrl` | 路由到 `/uran/core/downlink/task_ctrl` |
+| `media_ctrl` | 路由到 `/uran/core/downlink/media_ctrl` |
+| `frpc_ctrl` | 路由到 `/uran/core/downlink/frpc_ctrl` |
+| `param_update` | 路由到 `/uran/core/downlink/param_update` |
+| `state_query` | 直接响应状态查询 |
+
+#### 常用调试命令
+
+启动本地 broker：
 
 ```bash
 sudo apt install mosquitto mosquitto-clients
-mosquitto -p 1883 -v   # -v 显示所有收发消息，便于调试
+mosquitto -p 1883 -v
 ```
 
-**机器狗上修改 Broker 地址（改为主机 IP）：**
+监听上行：
 
 ```bash
-# 查看主机 IP
-ip addr show | grep "inet " | grep -v 127.0.0.1
-
-# 编辑配置（改完需重新编译或直接改 install 目录下的副本）
-nano /SDCARD/uran_ws/src/uran_core/config/network.yaml
-# 将 broker_host: "localhost" 改为 broker_host: "192.168.x.x"
-
-# 若直接改 install 目录下的副本则无需重新编译：
-nano /SDCARD/uran_ws/install/share/uran_core/config/network.yaml
+mosquitto_sub -h localhost -t '/oivs/default/device_002/up' -v
 ```
 
-**主机上开启上行监听（另开终端，全程保持）：**
+发送模式切换：
 
 ```bash
-mosquitto_sub -h localhost -t '/oivs/default/device_001/up' -v
-```
-
-节点启动后 5 秒内应收到第一条 `msg_type=register`，随后每 5 秒收到 `msg_type=heartbeat`。
-
----
-
-#### 消息格式
-
-所有下行消息均为 JSON，必须包含以下公共字段：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `msg_type` | string | 消息类型，见下表 |
-| `msg_version` | string | 固定 `"1.0"` |
-| `device_id` | string | 与 `network.yaml` 中一致，默认 `"device_001"` |
-| `timestamp_ms` | int | Unix 毫秒时间戳，调试时填 `0` |
-
-下行 Topic：`/oivs/default/device_001/down`
-上行 Topic：`/oivs/default/device_001/up`
-
----
-
-#### 下行指令参考
-
-**1. 控制模式切换（control_switch）**
-
-切换 manual / auto 模式，影响 uran_move 的指令来源过滤。
-
-```bash
-# 切换为 manual 模式（接受 cloud/field 来源，拒绝 auto）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
+mosquitto_pub -h localhost -p 1884 -t '/oivs/default/device_002/down' -m '{
   "msg_type": "control_switch",
   "msg_version": "1.0",
-  "device_id": "device_001",
+  "device_id": "device_002",
   "timestamp_ms": 0,
   "switch": {
     "control_mode": "manual",
@@ -193,1012 +173,253 @@ mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
     "media": {"action": "stop", "protocol": ""}
   }
 }'
-
-# 切换为 auto 模式（接受 auto 来源，拒绝 cloud/field）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "control_switch",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "switch": {
-    "control_mode": "auto",
-    "controller": "cloud",
-    "primary_uplink_protocol": "mqtt",
-    "media": {"action": "stop", "protocol": ""}
-  }
-}'
 ```
 
-切换后上行会收到 `msg_type=state_snapshot`，其中 `control_mode` 字段反映新状态。
-
----
-
-**2. 运控指令（move_cmd）**
-
-`controller` 字段须与当前 `control_mode` 匹配：
-- `manual` 模式 → `controller` 填 `"cloud"` 或 `"field"`
-- `auto` 模式 → `controller` 填 `"auto"`
-
-**CyberDog2 支持的 action 值：**
-
-| action | 说明 | 底层调用 |
-|--------|------|---------|
-| `""` | 速度控制（由 linear_vel_x/y、angular_vel_z 驱动） | motion_servo_cmd topic |
-| `"stop"` | 原地停止，保持站立步态 | 零速 servo |
-| `"stand"` | 从任意姿态恢复站立 | motion_result_cmd（motion_id=111） |
-| `"sit"` | 高阻尼趴下 | motion_result_cmd（motion_id=101） |
-| `"emergency_stop"` | 急停锁关节，进入 ESTOP 状态 | motion_result_cmd（motion_id=0） |
-
-> `action` 与速度字段互斥：填写非空 `action` 时速度字段被忽略。
-
-**extra_json 扩展参数（CyberDog2）：**
-
-| 字段 | 说明 |
-|------|------|
-| `motion_id` | 直接调用指定 motion_id，优先级高于 action |
-| `step_height` | 步高 [前腿, 后腿]（m），默认 [0.05, 0.05] |
+发送媒体控制：
 
 ```bash
-# 站立
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
+mosquitto_pub -h localhost -p 1884 -t '/oivs/default/device_002/down' -m '{
+  "msg_type": "media_ctrl",
   "msg_version": "1.0",
-  "device_id": "device_001",
+  "device_id": "device_002",
   "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
-  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
-  "action": "stand",
-  "extra_json": ""
-}'
-
-# 坐下
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
-  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
-  "action": "sit",
-  "extra_json": ""
-}'
-
-# 向前走 0.3 m/s（单次发送，保活定时器 0.5s 后自动停止）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.3, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
-  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
-  "action": "",
-  "extra_json": ""
-}'
-
-# 原地左转（angular_vel_z 正值为左转）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
-  "angular_vel_z": 0.5, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
-  "action": "",
-  "extra_json": ""
-}'
-
-# 急停
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.0, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
-  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
-  "action": "emergency_stop",
-  "extra_json": ""
-}'
-
-# 调高步高行走（extra_json 扩展）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "move_cmd",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "controller": "cloud",
-  "linear_vel_x": 0.2, "linear_vel_y": 0.0, "linear_vel_z": 0.0,
-  "angular_vel_z": 0.0, "target_roll": 0.0, "target_pitch": 0.0, "target_yaw": 0.0,
-  "action": "",
-  "extra_json": "{\"step_height\": [0.08, 0.08]}"
+  "action": "start",
+  "protocol": "webrtc",
+  "channel_id": "color",
+  "signal_json": ""
 }'
 ```
-
-> 速度指令需持续发送才能持续行走。可用 shell 循环模拟：
-> ```bash
-> while true; do
->   mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m \
->     '{"msg_type":"move_cmd","msg_version":"1.0","device_id":"device_001","timestamp_ms":0,"controller":"cloud","linear_vel_x":0.3,"linear_vel_y":0.0,"linear_vel_z":0.0,"angular_vel_z":0.0,"target_roll":0.0,"target_pitch":0.0,"target_yaw":0.0,"action":"","extra_json":""}'
->   sleep 0.2
-> done
-> # Ctrl+C 停止后，保活定时器 0.5s 内自动发零速
-> ```
-
----
-
-**3. 状态查询（state_query）**
-
-```bash
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "state_query",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "field_names": ["control_mode", "battery_level", "cyberdog2_switch_status"]
-}'
-# 上行收到 msg_type=state_query_response，fields_json 包含查询结果
-```
-
----
-
-**4. 参数更新（param_update）**
-
-动态修改速度限制，无需重启节点：
-
-```bash
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "param_update",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "params": {
-    "linear_vel_limit": 0.5,
-    "angular_vel_limit": 0.8
-  }
-}'
-```
-
----
-
-#### 上行消息说明
-
-| msg_type / data_type | 触发时机 | 关键字段 |
-|----------------------|---------|---------|
-| `register` | 节点启动时 | `device_id`, `template_id` |
-| `heartbeat` | 每 5 秒 | `online`, `battery_level`, `control_mode`, `current_controller` |
-| `state_snapshot` | 周期上报 / 关键字段变更 / 模式切换后 | `fields_json`（全量状态） |
-| `move_result` | 每次运控指令执行后 | `success`, `error_code`, `error_msg`, `plugin_id`, `plugin_internal_state` |
-| `move_clamp_event` | 指令被限速截断时 | `original_v_norm`, `linear_limit`, `angular_limit` |
-| `move_reject_event` | 指令被模式过滤或失控保护拒绝时 | `reason`, `controller`, `control_mode` |
-| `cyberdog2_motion_abnormal` | motion_status 异常时（如 ESTOP/CHARGING） | `switch_status`（整数，见下表） |
-| `plugin_switch_event` | 运行时切换插件后 | `prev_plugin`, `new_plugin` |
-| `failsafe_event` | 失控保护触发或恢复时 | `event`（triggered/recovered）, `failsafe_action`, `duration_s` |
-| `state_query_response` | 收到 state_query 后 | `fields_json` |
-
-**cyberdog2_motion_abnormal 中 switch_status 含义：**
-
-| 值 | 含义 | 恢复方式 |
-|----|------|---------|
-| 0 | NORMAL（正常） | — |
-| 2 | ESTOP（急停） | 发 `action="stand"` |
-| 3 | EDAMP（阻尼模式） | 发 `action="stand"` |
-| 4 | LIFTED（被抬起） | 放回地面 |
-| 7 | LOW_BAT（低电量） | 充电 |
-| 14 | CHARGING（充电中） | 拔充电线 |
-
----
-
-#### 常见问题
-
-**Q: 机器狗收不到 MQTT 指令**
-
-检查 Broker 地址配置和网络连通性：
-```bash
-# 在机器狗上 ping 主机
-ping 192.168.x.x
-
-# 确认 uran_core 已连接（日志应有 MQTT connected）
-# 或查询网络状态
-ros2 service call /uran/core/network/status uran_srvs/srv/GetNetworkStatus '{}'
-```
-
-**Q: 发送 move_cmd 后上行收到 move_reject_event**
-
-`controller` 与当前 `control_mode` 不匹配。先发 `control_switch` 切换到正确模式，或将 `controller` 改为 `"cloud"` / `"field"`（manual 模式下有效）。
-
-**Q: 上行收到 move_result 但 success=false，error_msg 含 CHARGING**
-
-机器狗正在充电，motion_manager 拒绝运动指令。拔掉充电线后重试。
-
----
 
 ### 配置文件
 
-启动前修改 `install/share/uran_core/config/` 下的配置文件（或直接修改源码 `src/uran_core/config/`，重新编译后生效）。
+#### `src/uran_core/config/network.yaml`
 
-**`config/network.yaml`** — 入网与 MQTT 配置：
+当前默认配置示例：
 
 ```yaml
 network:
-  device_id: "device_001"      # 装备实例主键，须与云端一致
-  template_id: "template_001"  # 装备模板主键
-  tenant_id: "default"         # 租户 ID
+  device_id: "device_002"
+  template_id: "template_002"
+  tenant_id: "default"
   auth:
-    token: "changeme"          # 云端鉴权 Token
+    username: "cynlux_device"
+    token: "cynlux_device"
+    cert_path: ""
   mqtt:
     enabled: true
-    broker_host: "localhost"   # MQTT Broker 地址
-    broker_port: 1883
+    broker_host: "43.138.18.163"
+    broker_port: 1884
     keepalive: 60
     topic_prefix: "/oivs/{tenant_id}/{device_id}"
-  heartbeat_interval_ms: 5000  # 心跳间隔（ms）
+  websocket:
+    enabled: false
+    url: ""
+  tcp:
+    enabled: false
+    host: ""
+    port: 0
+  udp:
+    enabled: false
+    host: ""
+    port: 0
+  heartbeat_interval_ms: 5000
 ```
 
-**`config/core.yaml`** — 状态上报配置：
+#### `src/uran_core/config/core.yaml`
 
 ```yaml
 uran_core:
-  state_broadcast_interval_ms: 1000   # 对内广播周期（ms）
-  state_report_interval_ms: 10000     # 对外上报周期（ms）
-  state_report_on_change: true        # 关键字段变更时立即上报
-  state_report_change_fields:
-    - "online_status"
-    - "error_code"
-    - "control_mode"
-    - "current_controller"
-    - "battery_level"
-  db_path: "/tmp/uran_core_state.db"  # 持久化 SQLite 路径
+  state_broadcast_interval_ms: 1000
+  state_report_interval_ms: 10000
+  state_report_protocol: "mqtt"
+  state_report_on_change: true
+  db_path: "/tmp/uran_core_state.db"
 ```
 
 ### ROS 接口
 
-**发布的 Topic：**
+#### 发布的 Topic
 
 | Topic | 消息类型 | 说明 |
 |-------|---------|------|
-| `/uran/core/state/broadcast` | `StateSnapshot` | 状态空间全量快照（1s 周期） |
+| `/uran/core/state/broadcast` | `StateSnapshot` | 状态空间全量快照 |
 | `/uran/core/heartbeat/status` | `HeartbeatStatus` | 心跳发送状态 |
-| `/uran/core/switch/mode` | `ModeSwitchCmd` | 模式/控制者切换通知 |
-| `/uran/core/switch/media` | `MediaSwitchCmd` | 流媒体通道切换通知 |
-| `/uran/core/switch/uplink_protocol` | `UplinkProtocolCmd` | 上行协议切换通知 |
+| `/uran/core/switch/mode` | `ModeSwitchCmd` | 模式切换通知 |
+| `/uran/core/switch/media` | `MediaSwitchCmd` | 媒体切换通知 |
+| `/uran/core/switch/uplink_protocol` | `UplinkProtocolCmd` | 上行协议切换 |
 | `/uran/core/downlink/move_cmd` | `UnifiedMoveCmd` | 运控指令下发 |
-| `/uran/core/downlink/task_ctrl` | `TaskCtrlCmd` | 任务控制指令下发 |
-| `/uran/core/downlink/media_ctrl` | `MediaCtrlCmd` | 媒体通道控制指令下发 |
-| `/uran/core/downlink/frpc_ctrl` | `FrpcCtrlCmd` | 端口转发控制指令下发 |
-| `/uran/core/downlink/param_update` | `ParamUpdateCmd` | 参数更新广播 |
+| `/uran/core/downlink/task_ctrl` | `TaskCtrlCmd` | 任务控制 |
+| `/uran/core/downlink/media_ctrl` | `MediaCtrlCmd` | 媒体控制 |
+| `/uran/core/downlink/frpc_ctrl` | `FrpcCtrlCmd` | FRP 控制 |
+| `/uran/core/downlink/param_update` | `ParamUpdateCmd` | 参数更新 |
 
-**订阅的 Topic：**
+#### 订阅的 Topic
 
 | Topic | 消息类型 | 说明 |
 |-------|---------|------|
-| `/uran/core/state/write` | `StateField` | 功能包写入状态空间字段 |
-| `/uran/core/uplink/data` | `UplinkPayload` | 功能包上报数据统一入口 |
+| `/uran/core/state/write` | `StateField` | 功能包写入状态 |
+| `/uran/core/uplink/data` | `UplinkPayload` | 功能包统一上报入口 |
 
-**提供的 Service：**
+#### 提供的 Service
 
 | Service | 类型 | 说明 |
 |---------|------|------|
-| `/uran/core/state/get` | `GetStateField` | 查询状态空间字段 |
-| `/uran/core/state/set` | `SetStateField` | 写入状态空间字段 |
-| `/uran/core/network/connect` | `ConnectProtocol` | 连接/断开协议通路 |
-| `/uran/core/network/status` | `GetNetworkStatus` | 查询各协议连接状态 |
-| `/uran/core/state_report/trigger` | `TriggerStateReport` | 手动触发即时状态上报 |
-| `/uran/core/state_report/configure` | `ConfigureStateReport` | 修改上报周期与协议 |
-
-### MQTT 通信格式
-
-节点使用以下 MQTT Topic 与云端通信：
-
-- **上行**：`/oivs/{tenant_id}/{device_id}/up`
-- **下行**：`/oivs/{tenant_id}/{device_id}/down`
-
-**支持的下行 `msg_type`：**
-
-| msg_type | 处理方式 |
-|----------|---------|
-| `control_switch` | 更新状态空间，发布 switch 系列 Topic |
-| `move_cmd` | 路由到 `/uran/core/downlink/move_cmd` |
-| `task_ctrl` | 路由到 `/uran/core/downlink/task_ctrl` |
-| `media_ctrl` | 路由到 `/uran/core/downlink/media_ctrl` |
-| `frpc_ctrl` | 路由到 `/uran/core/downlink/frpc_ctrl` |
-| `param_update` | 路由到 `/uran/core/downlink/param_update`，同时更新本地状态 |
-| `state_query` | 直接响应，返回状态空间字段 |
+| `/uran/core/state/get` | `GetStateField` | 查询状态字段 |
+| `/uran/core/state/set` | `SetStateField` | 写入状态字段 |
+| `/uran/core/network/connect` | `ConnectProtocol` | 连接/断开协议 |
+| `/uran/core/network/status` | `GetNetworkStatus` | 查询网络状态 |
+| `/uran/core/state_report/trigger` | `TriggerStateReport` | 手动触发上报 |
+| `/uran/core/state_report/configure` | `ConfigureStateReport` | 修改上报参数 |
 
 ---
 
 ## uran_media 使用说明
 
-`uran_media` 负责 WebRTC / RTSP 流媒体通道管理，并对 CyberDog2 多摄像头做专项适配。
+`uran_media` 是 ROS1 版本的媒体主节点，负责：
+- 订阅 RealSense 原生 ROS 图像话题
+- 基于 **aiortc** 建立标准 WebRTC PeerConnection
+- 提供 RTSP 推流
+- 支持本地录制
 
 ### 依赖安装
 
 ```bash
-conda activate uran
-# WebRTC（可选，不安装则以 stub 模式运行）
-pip install aiortc av aioice
-
-# RTSP 推流依赖 GStreamer（Ubuntu 系统包）
+pip3 install aiortc av aioice opencv-python-headless numpy
 sudo apt install python3-gi gir1.2-gst-rtsp-server-1.0 \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-x264 gstreamer1.0-rtsp
-
-# 图像处理
-pip install opencv-python-headless numpy
 ```
-
-> aiortc / GStreamer 均为可选依赖。未安装时节点以 stub 模式启动，不影响其他功能包运行。
-
-### 编译与启动
-
-```bash
-# 编译
-python -m colcon build --packages-select uran_media
-
-# 启动（需先 source）
-source ~/uran_ws/install/setup.bash
-ros2 launch uran_media uran_media.launch.py
-```
-
-CyberDog2 实机上需先 source cyberdog_ws，使 `protocol` 包可见：
-
-```bash
-source ~/cyberdog_ws/install/setup.bash
-source ~/uran_ws/install/setup.bash
-ros2 run uran_media uran_media_node
-```
-
----
 
 ### 摄像头配置
 
-视频源在 `config/media.yaml` 中定义，`source_type` 控制接入方式：
+配置文件：`src/uran_media/config/media.yaml`
 
-| source_type | 说明 | 适用摄像头 |
-|-------------|------|-----------|
-| `ros_topic` | 直接订阅 ROS topic | 已持续发布 topic 的摄像头 |
-| `camera_service` | 通过 CyberDog2 `CameraService` 激活后订阅 topic | CyberDog2 主 RGB 摄像头 |
-| `realsense_lifecycle` | 自动 launch + lifecycle configure/activate，再订阅 topic | RealSense D430 |
+当前仅使用 `ros_topic` 方式接入视频源，不再支持 `camera_service` 或 `realsense_lifecycle`。
 
-**修改配置（无需重新编译）：**
+当前默认视频源：
 
-```bash
-nano ~/uran_ws/install/share/uran_media/config/media.yaml
-```
+| channel_id | ROS 话题 | 说明 |
+|-----------|---------|------|
+| `color` | `/camera/color/image_raw` | RealSense 彩色图像 |
+| `depth` | `/camera/depth/image_rect_raw` | RealSense 深度图 |
+| `infra1` | `/camera/infra1/image_rect_raw` | RealSense 左红外 |
+| `infra2` | `/camera/infra2/image_rect_raw` | RealSense 右红外 |
+| `aligned_depth` | `/camera/aligned_depth_to_color/image_raw` | 对齐深度图 |
 
-**CyberDog2 内置摄像头对应关系：**
-
-| 摄像头 | channel_id | source_type | topic |
-|--------|-----------|-------------|-------|
-| 主 RGB 摄像头（前置高清） | `cyberdog_main` | `camera_service` | `image`（加命名空间前缀） |
-| RealSense 左目红外 | `realsense_left` | `realsense_lifecycle` | `/camera/infra1/image_rect_raw` |
-| RealSense 右目红外 | `realsense_right` | `realsense_lifecycle` | `/camera/infra2/image_rect_raw` |
-| RealSense 深度图 | `realsense_depth` | `realsense_lifecycle` | `/camera/depth/image_rect_raw` |
-| RealSense 对齐深度图 | `realsense_aligned` | `realsense_lifecycle` | `/camera/aligned_depth_to_infra1/image_raw` |
-
-**RealSense 自动启动说明：**
-
-收到 RealSense 通道的 RTSP/WebRTC 启动指令时，`uran_media` 会自动执行：
-
-```
-1. ros2 launch realsense2_camera on_dog.py   （若节点未运行）
-2. ros2 lifecycle set /camera/camera configure
-3. ros2 lifecycle set /camera/camera activate
-```
-
-launch 包和文件在 `media.yaml` 的 `realsense` 段配置：
-
-```yaml
-realsense:
-  launch_pkg: "realsense2_camera"
-  launch_file: "on_dog.py"
-```
-
-验证 CyberDog2 摄像头服务是否可用：
-
-```bash
-ros2 service call /mi_desktop_48_b0_2d_5f_b6_d0/camera_service \
-  protocol/srv/CameraService "{command: 4}"
-# command=4 为 GET_STATE，result=0 表示正常
-```
-
----
-
-### WebRTC 信令流程
-
-CyberDog2 上已有 `image_transmission` 节点负责完整的 WebRTC 推流，uran_media 只做**信令中继**，无需 aiortc。
-
-**桥接架构**（`source_type: camera_service`）：
-
-```
-WebRTC 客户端          云端/信令服务器          机器狗 uran_media_node      image_transmission
-     │                      │                          │                          │
-     │── SDP Offer ────────►│                          │                          │
-     │                      │── media_ctrl(start) ────►│  注册桥接通道             │
-     │                      │── media_ctrl(offer) ────►│                          │
-     │                      │                   格式转换│── img_trans_signal_in ──►│
-     │                      │                          │                   ICE 协商│
-     │                      │◄── uplink(answer) ───────│◄─ img_trans_signal_out ──│
-     │◄── SDP Answer ───────│                          │                          │
-     │── ICE Candidate ────►│── media_ctrl(candidate)─►│── img_trans_signal_in ──►│
-     │◄── ICE Candidate ────│◄── uplink(candidate) ────│◄─ img_trans_signal_out ──│
-     │                      │                          │              [推流开始]   │
-     │◄══════════════ WebRTC 视频流（P2P 或经 TURN）══════════════════════════════│
-```
-
-ICE 协商成功后，`image_transmission` 自动调用 `camera_service START_LIVE_STREAM`，视频流直接从机器狗推送到客户端（P2P），不经过信令服务器。
-
----
-
-#### 方案一：本地信令服务器（局域网）
-
-机器狗与客户端在同一局域网时，在机器狗本地运行 HTTP 信令服务器，浏览器直接访问。
-
-**启动信令服务器：**
-
-```bash
-# 机器狗上
-source /opt/ros/humble/setup.bash
-source ~/cyberdog_ws/install/setup.bash
-source ~/uran_ws/install/setup.bash
-
-python3 /SDCARD/uran_ws/src/uran_media/webrtc_signaling_server.py \
-  --ns /mi_desktop_48_b0_2d_5f_b6_d0 \
-  --port 8080
-```
-
-**同时启动 uran_media 节点（另一终端）：**
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/cyberdog_ws/install/setup.bash
-source ~/uran_ws/install/setup.bash
-ros2 run uran_media uran_media_node
-```
-
-**客户端访问（局域网内任意设备）：**
-
-```
-http://机器狗IP:8080
-```
-
-点击"连接"，信令自动完成，视频流自动播放。
-
----
-
-#### 方案二：公网信令服务器
-
-机器狗在公网或 NAT 后，需要一台公网服务器中转信令（SDP/ICE），视频流本身仍尽量走 P2P，NAT 穿透失败时经 TURN 中转。
-
-**整体架构：**
-
-```
-[机器狗]                    [公网服务器]              [浏览器客户端]
-uran_media_node             信令服务器                    │
-     │                      (MQTT Broker +               │
-     │                       WebSocket 信令)              │
-     │                            │                      │
-     │── MQTT uplink(offer) ─────►│── WebSocket ────────►│
-     │◄── MQTT downlink(answer) ──│◄─ WebSocket ─────────│
-     │── MQTT uplink(candidate) ─►│── WebSocket ────────►│
-     │◄── MQTT downlink(candidate)│◄─ WebSocket ─────────│
-     │                            │                      │
-     │◄══════ WebRTC P2P（STUN 穿透）或 TURN 中转 ═══════│
-```
-
-**前提：公网服务器已部署 MQTT Broker（mosquitto）。**
-
----
-
-**步骤一：公网服务器配置**
-
-```bash
-# 安装 mosquitto（若未安装）
-sudo apt install mosquitto mosquitto-clients
-
-# 配置允许匿名连接（测试用，生产环境应启用认证）
-sudo tee /etc/mosquitto/conf.d/uran.conf <<'EOF'
-listener 1883
-allow_anonymous true
-EOF
-sudo systemctl restart mosquitto
-
-# 确认端口开放
-sudo ufw allow 1883/tcp
-```
-
-若需要 TURN 服务器（NAT 穿透失败时）：
-
-```bash
-# 安装 coturn
-sudo apt install coturn
-
-sudo tee /etc/turnserver.conf <<'EOF'
-listening-port=3478
-fingerprint
-lt-cred-mech
-user=uran:yourpassword
-realm=uran.local
-EOF
-sudo systemctl enable --now coturn
-sudo ufw allow 3478/udp
-sudo ufw allow 49152:65535/udp   # TURN 中继端口范围
-```
-
----
-
-**步骤二：机器狗配置**
-
-修改 `network.yaml`，将 Broker 地址改为公网服务器 IP：
-
-```bash
-nano ~/uran_ws/install/share/uran_core/config/network.yaml
-```
-
-```yaml
-network:
-  mqtt:
-    broker_host: "公网服务器IP"   # 改这里
-    broker_port: 1883
-```
-
-若使用 TURN，修改 `media.yaml` 加入 TURN 配置：
-
-```bash
-nano ~/uran_ws/install/share/uran_media/config/media.yaml
-```
+配置示例：
 
 ```yaml
 uran_media:
-  webrtc:
-    stun_server: "stun:stun.l.google.com:19302"
-    turn_server: "turn:公网服务器IP:3478"
-    turn_username: "uran"
-    turn_credential: "yourpassword"
+  video_sources:
+    - channel_id: "color"
+      source_type: "ros_topic"
+      ros_topic: "/camera/color/image_raw"
+      msg_type: "sensor_msgs/Image"
+      width: 640
+      height: 480
+      fps: 30
 ```
 
----
+### WebRTC
 
-**步骤三：公网服务器部署 WebSocket 信令桥**
+ROS1 版本 `uran_media` 直接使用 `aiortc` 建立标准 WebRTC 通道，不再依赖外部桥接节点。
 
-公网服务器需要一个进程，将 MQTT 上行的 `media_signal` 转发给 WebSocket 客户端，并将客户端的信令通过 MQTT 下行发回机器狗。
+WebRTC 启动流程：
+1. 向 `/uran/core/downlink/media_ctrl` 发送 `start + protocol=webrtc`
+2. `uran_media` 创建 `RTCPeerConnection`
+3. 自动生成 SDP Offer，并通过 `/uran/core/uplink/data` 上报 `data_type=media_signal`
+4. 云端/客户端回传 SDP Answer 与 ICE Candidate
+5. `uran_media` 继续完成协商并发送视频流
+
+启动 WebRTC：
 
 ```bash
-# 公网服务器上安装依赖
-pip3 install paho-mqtt websockets
-
-# 下载信令桥脚本（见下方）
-python3 mqtt_ws_bridge.py --mqtt-host localhost --ws-port 8765 --http-port 8080
+rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
+  '{action: "start", protocol: "webrtc", channel_id: "color", signal_json: ""}'
 ```
 
-`mqtt_ws_bridge.py` 核心逻辑（保存到公网服务器）：
-
-```python
-#!/usr/bin/env python3
-"""MQTT ↔ WebSocket 信令桥（部署在公网服务器）
-
-MQTT 上行 topic:  /oivs/default/device_001/up   (机器狗 → 服务器)
-MQTT 下行 topic:  /oivs/default/device_001/down (服务器 → 机器狗)
-WebSocket:        ws://服务器IP:8765             (浏览器 ↔ 服务器)
-HTTP:             http://服务器IP:8080           (浏览器页面)
-"""
-import asyncio, json, threading, argparse
-import paho.mqtt.client as mqtt
-import websockets
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-DEVICE_ID  = "device_001"
-TENANT_ID  = "default"
-UP_TOPIC   = f"/oivs/{TENANT_ID}/{DEVICE_ID}/up"
-DOWN_TOPIC = f"/oivs/{TENANT_ID}/{DEVICE_ID}/down"
-
-ws_clients = set()
-loop = None
-
-# ── MQTT 回调 ──────────────────────────────────────────────────────────────
-def on_mqtt_message(client, userdata, msg):
-    try:
-        payload = json.loads(msg.payload)
-        if payload.get("data_type") == "media_signal":
-            signal_payload = json.loads(payload.get("payload", "{}"))
-            data = json.dumps({"event": "signal", "data": signal_payload})
-            asyncio.run_coroutine_threadsafe(_broadcast(data), loop)
-    except Exception as e:
-        print(f"[MQTT] parse error: {e}")
-
-async def _broadcast(msg):
-    for ws in list(ws_clients):
-        try:
-            await ws.send(msg)
-        except Exception:
-            ws_clients.discard(ws)
-
-# ── WebSocket 处理 ─────────────────────────────────────────────────────────
-async def ws_handler(ws):
-    ws_clients.add(ws)
-    print(f"[WS] client connected, total={len(ws_clients)}")
-    try:
-        async for raw in ws:
-            data = json.loads(raw)
-            event = data.get("event", "")
-            if event == "start":
-                _mqtt_publish({"msg_type": "media_ctrl", "msg_version": "1.0",
-                               "device_id": DEVICE_ID, "timestamp_ms": 0,
-                               "action": "start", "protocol": "webrtc",
-                               "channel_id": data.get("channel_id", "cyberdog_main"),
-                               "signal_json": ""})
-            elif event == "signal":
-                sig = data.get("data", {})
-                _mqtt_publish({"msg_type": "media_ctrl", "msg_version": "1.0",
-                               "device_id": DEVICE_ID, "timestamp_ms": 0,
-                               "action": "", "protocol": "",
-                               "channel_id": sig.get("channel_id", "cyberdog_main"),
-                               "signal_json": json.dumps(sig.get("signal", {}))})
-            elif event == "stop":
-                _mqtt_publish({"msg_type": "media_ctrl", "msg_version": "1.0",
-                               "device_id": DEVICE_ID, "timestamp_ms": 0,
-                               "action": "stop", "protocol": "",
-                               "channel_id": data.get("channel_id", "cyberdog_main"),
-                               "signal_json": ""})
-    except Exception:
-        pass
-    finally:
-        ws_clients.discard(ws)
-        print(f"[WS] client disconnected, total={len(ws_clients)}")
-
-def _mqtt_publish(payload):
-    mqtt_client.publish(DOWN_TOPIC, json.dumps(payload))
-
-# ── HTTP 页面 ──────────────────────────────────────────────────────────────
-HTML = open("webrtc_viewer_ws.html").read() if __import__("os").path.exists("webrtc_viewer_ws.html") else "<h1>请放置 webrtc_viewer_ws.html</h1>"
-
-class HttpHandler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        body = HTML.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
-
-# ── 主程序 ─────────────────────────────────────────────────────────────────
-def main():
-    global loop, mqtt_client
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mqtt-host", default="localhost")
-    parser.add_argument("--ws-port",   type=int, default=8765)
-    parser.add_argument("--http-port", type=int, default=8080)
-    args = parser.parse_args()
-
-    mqtt_client = mqtt.Client()
-    mqtt_client.on_message = on_mqtt_message
-    mqtt_client.connect(args.mqtt_host, 1883)
-    mqtt_client.subscribe(UP_TOPIC)
-    threading.Thread(target=mqtt_client.loop_forever, daemon=True).start()
-    print(f"[MQTT] connected to {args.mqtt_host}, subscribed {UP_TOPIC}")
-
-    http = HTTPServer(("0.0.0.0", args.http_port), HttpHandler)
-    threading.Thread(target=http.serve_forever, daemon=True).start()
-    print(f"[HTTP] http://0.0.0.0:{args.http_port}")
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    print(f"[WS]   ws://0.0.0.0:{args.ws_port}")
-    loop.run_until_complete(
-        websockets.serve(ws_handler, "0.0.0.0", args.ws_port)
-    )
-    loop.run_forever()
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-**步骤四：浏览器客户端页面（`webrtc_viewer_ws.html`，放在公网服务器同目录）**
-
-```html
-<!DOCTYPE html>
-<html lang="zh">
-<head><meta charset="UTF-8"><title>CyberDog2 远程视频</title>
-<style>
-  body{font-family:monospace;background:#1a1a1a;color:#eee;padding:20px}
-  video{width:100%;max-width:960px;background:#000;border:1px solid #444;display:block}
-  button{padding:8px 18px;margin:4px;background:#2a6;color:#fff;border:none;cursor:pointer}
-  button.stop{background:#a33} button:disabled{background:#555;cursor:default}
-  #log{height:160px;overflow-y:auto;background:#111;border:1px solid #333;
-       padding:8px;font-size:12px;color:#aaa;margin-top:8px}
-</style></head>
-<body>
-<h2>CyberDog2 远程视频</h2>
-<video id="video" autoplay playsinline muted></video>
-<div style="margin:10px 0">
-  <button id="btnStart" onclick="start()">连接</button>
-  <button id="btnStop" class="stop" onclick="stop()" disabled>断开</button>
-  <span id="status" style="margin-left:12px;color:#fa0">未连接</span>
-</div>
-<div id="log"></div>
-<script>
-// WebSocket 地址：自动使用当前页面的主机名
-const WS_URL = `ws://${location.hostname}:8765`;
-const CHANNEL_ID = 'cyberdog_main';
-// TURN 服务器（若需要，填入公网服务器 IP）
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  // { urls: 'turn:公网服务器IP:3478', username: 'uran', credential: 'yourpassword' }
-];
-
-let pc = null, ws = null;
-
-function log(msg, color) {
-  const d = document.getElementById('log');
-  d.innerHTML += `<span style="color:${color||'#aaa'}">[${new Date().toTimeString().slice(0,8)}] ${msg}</span>\n`;
-  d.scrollTop = d.scrollHeight;
-}
-function setStatus(s, c) { const el = document.getElementById('status'); el.textContent=s; el.style.color=c||'#fa0'; }
-
-function send(event, data) { ws.send(JSON.stringify({ event, ...data })); }
-
-async function start() {
-  document.getElementById('btnStart').disabled = true;
-  setStatus('连接信令服务器...', '#fa0');
-
-  ws = new WebSocket(WS_URL);
-  ws.onopen = async () => {
-    log('信令服务器已连接', '#4af');
-    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    pc.ontrack = (e) => {
-      log('收到视频轨道！', '#0f0');
-      setStatus('视频流接收中 ▶', '#0f0');
-      document.getElementById('video').srcObject = e.streams[0];
-    };
-    pc.oniceconnectionstatechange = () => {
-      const s = pc.iceConnectionState;
-      log('ICE: ' + s, '#4af');
-      if (s==='connected'||s==='completed') setStatus('已连接 ✓','#0f0');
-      else if (['failed','disconnected','closed'].includes(s)) setStatus('断开: '+s,'#f44');
-    };
-    pc.onicecandidate = (e) => {
-      if (!e.candidate) return;
-      send('signal', { data: { channel_id: CHANNEL_ID,
-        signal: { type:'candidate', sdpMid:e.candidate.sdpMid,
-                  sdpMLineIndex:e.candidate.sdpMLineIndex, candidate:e.candidate.candidate }}});
-    };
-
-    pc.addTransceiver('video', { direction: 'recvonly' });
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // 先通知机器狗注册通道，再发 offer
-    send('start', { channel_id: CHANNEL_ID });
-    setTimeout(() => {
-      send('signal', { data: { channel_id: CHANNEL_ID,
-        signal: { type: 'offer', sdp: offer.sdp }}});
-      log('Offer 已发送', '#4af');
-      setStatus('等待 Answer...', '#fa0');
-    }, 500);
-
-    document.getElementById('btnStop').disabled = false;
-  };
-
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.event !== 'signal') return;
-    const sig = msg.data?.signal || msg.data;
-    if (sig.type === 'answer') {
-      await pc.setRemoteDescription(new RTCSessionDescription(sig));
-      log('Answer 已设置', '#0f0');
-    } else if (sig.type === 'candidate' && sig.candidate) {
-      await pc.addIceCandidate(new RTCIceCandidate(sig));
-      log('添加 Candidate', '#888');
-    } else if (sig.type === 'closed') {
-      log('机器狗关闭了连接', '#f44'); stop();
-    }
-  };
-  ws.onerror = () => { log('WebSocket 错误', '#f44'); setStatus('连接失败','#f44'); };
-  ws.onclose = () => { log('WebSocket 已关闭', '#888'); };
-}
-
-function stop() {
-  if (ws) { try { send('stop', { channel_id: CHANNEL_ID }); } catch(e){} ws.close(); ws=null; }
-  if (pc) { pc.close(); pc=null; }
-  document.getElementById('video').srcObject = null;
-  document.getElementById('btnStart').disabled = false;
-  document.getElementById('btnStop').disabled = true;
-  setStatus('已断开', '#888');
-  log('连接已关闭', '#888');
-}
-</script>
-</body></html>
-```
-
----
-
-**步骤五：启动顺序**
+监听信令上报：
 
 ```bash
-# 公网服务器
-python3 mqtt_ws_bridge.py --mqtt-host localhost --ws-port 8765 --http-port 8080
-
-# 机器狗（两个终端）
-ros2 run uran_core uran_core_node        # 终端 1
-ros2 run uran_media uran_media_node      # 终端 2
-
-# 浏览器访问
-http://公网服务器IP:8080
+rostopic echo /uran/core/uplink/data
 ```
-
----
-
-**信令数据流（公网方案）：**
-
-```
-浏览器                  公网服务器                    机器狗
-  │                  MQTT Broker + WS 桥               │
-  │── WS: start ──────────────────────────────────────►│ media_ctrl(start)
-  │── WS: offer ──────────────────────────────────────►│ media_ctrl(signal_json=offer)
-  │                                            img_trans_signal_in → image_transmission
-  │◄── WS: answer ────────────────────────────────────│ uplink(media_signal=answer)
-  │── WS: candidate ─────────────────────────────────►│ media_ctrl(signal_json=candidate)
-  │◄── WS: candidate ─────────────────────────────────│ uplink(media_signal=candidate)
-  │                                                    │
-  │◄══════════════ WebRTC 视频流（P2P / TURN）══════════│
-```
-
----
-
-**防火墙端口清单：**
-
-| 端口 | 协议 | 用途 |
-|------|------|------|
-| 1883 | TCP | MQTT Broker |
-| 8080 | TCP | HTTP 浏览器页面 |
-| 8765 | TCP | WebSocket 信令 |
-| 3478 | UDP | TURN/STUN（可选） |
-| 49152–65535 | UDP | TURN 中继媒体流（可选） |
-
-> P2P 直连时不需要 TURN，视频流不经过公网服务器，带宽消耗仅为信令（极小）。只有在严格 NAT 或运营商封锁 UDP 时才需要 TURN 中转。
-
----
 
 ### RTSP 推流
 
-所有通道共享同一个 RTSP Server（端口 8554），每个通道对应独立的 mount point，可同时拉流。
+默认 RTSP 端口为 `8554`。
 
-#### 可用通道
-
-| channel_id | 摄像头 | RTSP 地址 |
-|-----------|--------|----------|
-| `cyberdog_main` | CyberDog2 主 RGB 摄像头 | `rtsp://IP:8554/cyberdog_main` |
-| `realsense_left` | RealSense 左目红外 | `rtsp://IP:8554/realsense_left` |
-| `realsense_right` | RealSense 右目红外 | `rtsp://IP:8554/realsense_right` |
-| `realsense_depth` | RealSense 深度图（JET 伪彩色） | `rtsp://IP:8554/realsense_depth` |
-| `realsense_aligned` | RealSense 对齐深度图 | `rtsp://IP:8554/realsense_aligned` |
-
-#### 启动指令（ROS topic）
+启动单路 RTSP：
 
 ```bash
-# 启动单个通道（以 realsense_depth 为例）
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "rtsp", channel_id: "realsense_depth", signal_json: ""}'
-
-# 同时启动多个通道（分别发送）
-for ch in realsense_left realsense_right realsense_depth; do
-  ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-    "{action: \"start\", protocol: \"rtsp\", channel_id: \"$ch\", signal_json: \"\"}"
-done
-
-# 停止单个通道
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "stop", protocol: "rtsp", channel_id: "realsense_depth", signal_json: ""}'
-
-# 停止所有通道
-ros2 topic pub --once /uran/core/switch/media uran_msgs/msg/MediaSwitchCmd \
-  '{action: "stop_all", protocol: "", timestamp_ns: 0}'
+rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
+  '{action: "start", protocol: "rtsp", channel_id: "depth", signal_json: ""}'
 ```
 
-#### 启动指令（MQTT）
+停止单路 RTSP：
 
 ```bash
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "start",
-  "protocol": "rtsp",
-  "channel_id": "realsense_depth",
-  "signal_json": ""
-}'
+rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
+  '{action: "stop", protocol: "rtsp", channel_id: "depth", signal_json: ""}'
 ```
 
-#### 监听 RTSP URL 上报
+监听 RTSP URL：
 
 ```bash
-ros2 topic echo /uran/core/uplink/data
-# 收到 data_type=media_rtsp_url，payload_json 含 url 字段
+rostopic echo /uran/core/uplink/data
 ```
 
-#### 拉流播放
+拉流示例：
 
 ```bash
-# 单路
-ffplay rtsp://机器狗IP:8554/realsense_depth
-
-# 多路同时（各开一个终端）
-ffplay rtsp://机器狗IP:8554/realsense_left
-ffplay rtsp://机器狗IP:8554/realsense_right
-ffplay rtsp://机器狗IP:8554/realsense_depth
+ffplay rtsp://设备IP:8554/depth
 ```
-
-> RealSense 通道首次启动时会自动 launch `realsense2_camera on_dog.py` 并完成 lifecycle 激活（约 15 秒），之后再次启动无需等待。
-
----
 
 ### 本地录制
 
+开始录制：
+
 ```bash
-# 开始录制
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "record_start",
-  "protocol": "",
-  "channel_id": "front_cam",
-  "signal_json": ""
-}'
-
-# 停止录制（触发上行 data_type=media_upload 通知）
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "media_ctrl",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "action": "record_stop",
-  "protocol": "",
-  "channel_id": "front_cam",
-  "signal_json": ""
-}'
-
-# 录制文件保存在（默认路径）
-ls /tmp/uran_media_record/
+rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
+  '{action: "record_start", protocol: "", channel_id: "color", signal_json: ""}'
 ```
 
-录制路径和分片时长在 `media.yaml` 的 `local_record` 段配置。
+停止录制：
 
----
+```bash
+rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
+  '{action: "record_stop", protocol: "", channel_id: "color", signal_json: ""}'
+```
+
+默认录制目录：
+
+```bash
+ls /tmp/uran_media_record
+```
 
 ### ROS 接口（media）
 
-**订阅的 Topic：**
+#### 订阅的 Topic
 
 | Topic | 消息类型 | 说明 |
 |-------|---------|------|
-| `/uran/core/downlink/media_ctrl` | `MediaCtrlCmd` | 通道控制（start/stop/switch/record/signal） |
-| `/uran/core/switch/media` | `MediaSwitchCmd` | 全局流媒体切换 |
-| 各视频源 topic（动态） | `sensor_msgs/Image` 等 | 按 media.yaml 配置动态订阅 |
+| `/uran/core/downlink/media_ctrl` | `MediaCtrlCmd` | 通道控制 |
+| `/uran/core/switch/media` | `MediaSwitchCmd` | 全局媒体切换 |
+| 各视频源话题 | `sensor_msgs/Image` / `sensor_msgs/CompressedImage` | 图像输入 |
 
-**发布的 Topic：**
+#### 发布的 Topic
 
 | Topic | 消息类型 | 说明 |
 |-------|---------|------|
-| `/uran/core/uplink/data` | `UplinkPayload` | SDP Offer/ICE、RTSP URL、录制完成通知 |
-| `/uran/core/state/write` | `StateField` | `media_active_protocol`、`media_channel_count` |
+| `/uran/core/uplink/data` | `UplinkPayload` | Offer / ICE / RTSP URL / 录制完成通知 |
+| `/uran/core/state/write` | `StateField` | 写入媒体状态 |
 
-**上行 data_type 说明：**
+#### 上行 `data_type`
 
-| data_type | 触发时机 | payload 关键字段 |
-|-----------|---------|----------------|
-| `media_signal` | WebRTC SDP Offer 生成 / ICE candidate | `channel_id`, `signal`（含 type/sdp 或 candidate） |
-| `media_rtsp_url` | RTSP 通道启动 | `channel_id`, `url` |
-| `media_upload` | 录制停止 | `channel_id`, `status="ready"` |
+| data_type | 说明 |
+|-----------|------|
+| `media_signal` | WebRTC SDP / ICE 信令 |
+| `media_rtsp_url` | RTSP 通道地址 |
+| `media_upload` | 录制完成通知 |
 
 ---
 
@@ -1206,504 +427,57 @@ ls /tmp/uran_media_record/
 
 ### uran_msgs
 
-| 消息 | 关键字段 | 用途 |
-|------|---------|------|
-| `StateField` | field_name, value_json, persistent, urgent | 写入状态空间字段 |
-| `StateSnapshot` | msg_version, device_id, fields_json | 状态空间全量快照 |
-| `HeartbeatStatus` | protocol, success, timestamp_ns | 心跳发送状态 |
-| `UnifiedMoveCmd` | controller, linear_vel_x/y/z, angular_vel_z, action | 统一运控指令 |
-| `ModeSwitchCmd` | control_mode, controller | 模式/控制者切换 |
-| `MediaSwitchCmd` | action, protocol | 流媒体通道切换 |
-| `UplinkProtocolCmd` | protocol | 上行协议切换 |
-| `UplinkPayload` | source_pkg, data_type, payload_json, urgent | 统一上行数据载体 |
-| `MediaCtrlCmd` | action, protocol, channel_id, signal_json | 媒体通道控制 |
-| `FrpcCtrlCmd` | action, frps_host, frps_port, local_port, remote_port | 端口转发控制 |
-| `TaskCtrlCmd` | task_id, action, task_type, task_params_json | 任务控制 |
-| `ParamUpdateCmd` | params_json | 参数更新广播 |
+| 消息 | 用途 |
+|------|------|
+| `StateField` | 写入状态空间字段 |
+| `StateSnapshot` | 状态空间全量快照 |
+| `HeartbeatStatus` | 心跳发送状态 |
+| `UnifiedMoveCmd` | 统一运控指令 |
+| `ModeSwitchCmd` | 模式切换 |
+| `MediaSwitchCmd` | 流媒体切换 |
+| `UplinkProtocolCmd` | 上行协议切换 |
+| `UplinkPayload` | 统一上行数据载体 |
+| `MediaCtrlCmd` | 媒体控制 |
+| `FrpcCtrlCmd` | 端口转发控制 |
+| `TaskCtrlCmd` | 任务控制 |
+| `ParamUpdateCmd` | 参数更新 |
 
 ### uran_srvs
 
-| 服务 | 请求 | 响应 | 用途 |
-|------|------|------|------|
-| `GetStateField` | field_names[] | fields_json, success | 查询状态字段 |
-| `SetStateField` | field_name, value_json, persistent | success, message | 写入状态字段 |
-| `ConnectProtocol` | protocol, action | success, message | 控制协议连接 |
-| `GetNetworkStatus` | — | protocol_table_json | 查询网络状态 |
-| `SwitchMovePlugin` | plugin_id | success, current_plugin | 切换运控插件 |
-| `ReloadConfig` | config_path | success, message | 重载配置 |
-| `ListSensors` | — | sensors_json | 列出传感器 |
-| `GetTaskStatus` | task_id | status_json | 查询任务状态 |
-| `TriggerStateReport` | reason | success, message | 触发即时上报 |
-| `ConfigureStateReport` | interval_ms, protocol, report_on_change | success, current_interval_ms | 配置上报参数 |
+| 服务 | 用途 |
+|------|------|
+| `GetStateField` | 查询状态字段 |
+| `SetStateField` | 写入状态字段 |
+| `ConnectProtocol` | 控制协议连接 |
+| `GetNetworkStatus` | 查询网络状态 |
+| `TriggerStateReport` | 触发即时状态上报 |
+| `ConfigureStateReport` | 配置状态上报 |
 
-查看任意接口定义：
+查看接口定义：
 
 ```bash
-ros2 interface show uran_msgs/msg/StateField
-ros2 interface show uran_srvs/srv/GetStateField
+rosmsg show uran_msgs/StateField
+rossrv show uran_srvs/GetStateField
 ```
 
 ---
 
-## 实机测试（CyberDog2）
+## 项目说明与迁移备注
 
-本节说明如何在小米 CyberDog2 上联合启动 cyberdog_ws 原生节点与 URAN 节点，并进行端到端验证。
+### 1. ROS 版本迁移
 
-### 前提条件
+本仓库 README 已按当前代码同步到 **ROS1 Noetic**，不再适用 ROS2 Humble 的构建与启动方式。
 
-- 已通过 SSH 连接到机器狗板载计算机（NX 板），或在机器狗上直接操作
-- cyberdog_ws 已在机器狗上编译完成（原厂固件已包含，通常无需重新编译）
-- uran_ws 已在机器狗上编译完成（见[快速开始](#快速开始)）
-- 机器狗处于趴下/待机状态，电量充足（建议 > 30%）
+### 2. uran_move 方向调整
 
-> **安全提示**：首次测试时将机器狗放置在开阔平地，周围留出至少 1m 净空。确认急停方式：直接断电或通过 App 切换为手动模式。
+ROS1 版本 `uran_move` 已不再面向 CyberDog2。后续若恢复/补充运控实现，应以 **px4_mavros** 为统一适配方向。
 
----
+### 3. uran_media 架构调整
 
-### 架构说明
-
-```
-[云端 / MQTT] ──► uran_core_node ──► /uran/core/downlink/move_cmd
-                        │                         │
-                        │                uran_move_node（cyberdog2 插件）
-                        │                         │
-                        │         ┌───────────────┴───────────────┐
-                        │         ▼                               ▼
-                        │ motion_servo_cmd               motion_result_cmd
-                        │ （速度 Servo 指令）              （站立/坐下等动作）
-                        │         │                               │
-                        │    motion_manager（cyberdog_ws 原生节点）
-                        │
-                        └──► /uran/core/downlink/media_ctrl
-                                          │
-                               uran_media_node
-                                          │
-                          ┌───────────────┴───────────────┐
-                          ▼                               ▼
-                   camera_service                   ros_topic 订阅
-                 （主 RGB 摄像头激活）           （RealSense 等直接订阅）
-                          │                               │
-                    WebRTC / RTSP 推流 ◄──────────────────┘
-```
-
-uran_move_node 通过 `protocol` 包的 ROS 接口与 cyberdog_ws 的 `motion_manager` 通信，**不需要修改任何 cyberdog_ws 代码**。
-
----
-
-### 步骤一：确认 cyberdog_ws 节点已运行
-
-机器狗开机后，cyberdog_ws 的核心节点（包括 `motion_manager`）通常由系统服务自动启动。验证：
-
-```bash
-# 检查 motion_manager 是否在线
-ros2 node list | grep motion
-
-# 检查关键 topic/service 是否存在
-ros2 topic list | grep motion_servo_cmd
-ros2 service list | grep motion_result_cmd
-```
-
-预期输出中应包含：
-- `/motion_servo_cmd`（topic）
-- `/motion_result_cmd`（service）
-- `/motion_status`（topic）
-
-如果节点未启动，手动启动 cyberdog_ws（在机器狗上执行）：
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/cyberdog_ws/install/setup.bash
-ros2 launch cyberdog_bringup main.launch.py
-```
-
----
-
-### 步骤二：编译并安装 uran_ws
-
-在机器狗上（或通过 SSH）：
-
-```bash
-# 激活 conda 环境（若机器狗上已安装 conda）
-eval "$(conda shell.bash hook)" && conda activate uran
-
-# 若机器狗上没有 conda，直接使用系统 Python 3.10
-source /opt/ros/humble/setup.bash
-cd ~/uran_ws
-python -m colcon build
-```
-
----
-
-### 步骤三：启动 URAN 节点
-
-需要开三个终端（或使用 tmux）。
-
-**终端 1 — uran_core：**
-
-```bash
-eval "$(conda shell.bash hook)" && conda activate uran
-source /opt/ros/humble/setup.bash
-source ~/uran_ws/install/setup.bash
-ros2 run uran_core uran_core_node
-```
-
-**终端 2 — uran_move：**
-
-```bash
-eval "$(conda shell.bash hook)" && conda activate uran
-source /opt/ros/humble/setup.bash
-source ~/cyberdog_ws/install/setup.bash   # 必须先 source，使 protocol 包可见
-source ~/uran_ws/install/setup.bash
-ros2 run uran_move uran_move_node
-```
-
-**终端 3 — uran_media：**
-
-```bash
-eval "$(conda shell.bash hook)" && conda activate uran
-source /opt/ros/humble/setup.bash
-source ~/cyberdog_ws/install/setup.bash   # 使 protocol/srv/CameraService 可见
-source ~/uran_ws/install/setup.bash
-ros2 run uran_media uran_media_node
-```
-
-> `cyberdog_ws/install/setup.bash` 必须在 `uran_ws/install/setup.bash` **之前** source，否则 `protocol` 包找不到。
-
-启动成功后，uran_move 日志应显示：
-
-```
-[INFO] [uran_move_node]: CyberDog2Plugin initialized
-[INFO] [uran_move_node]: Plugin loaded: cyberdog2 (cyberdog2 v1.0.0)
-[INFO] [uran_move_node]: uran_move_node ready, active_plugin=cyberdog2
-```
-
-uran_media 日志应显示：
-
-```
-[INFO] [uran_media_node]: Loaded 3 video sources: ['front_cam', 'cyberdog_main', 'cyberdog_depth']
-[INFO] [uran_media_node]: uran_media_node started
-```
-
-也可以用 launch 文件启动：
-
-```bash
-ros2 launch uran_core uran_core.launch.py &
-ros2 launch uran_move uran_move.launch.py &
-ros2 launch uran_media uran_media.launch.py
-```
-
----
-
-### 步骤四：验证 ROS 接口注册
-
-```bash
-# 确认 uran_move 订阅/发布正常
-ros2 topic list | grep uran
-ros2 service list | grep uran/move
-
-# 预期包含：
-# /uran/core/downlink/move_cmd
-# /uran/core/uplink/data
-# /uran/core/state/write
-# /uran/move/switch_plugin
-```
-
----
-
-### 步骤五：功能验证
-
-#### 5.1 站立指令
-
-```bash
-# 通过 ROS topic 直接发送（绕过 MQTT，用于调试）
-ros2 topic pub --once /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd \
-  '{controller: "field", action: "stand", timestamp_ns: 0}'
-```
-
-机器狗应执行站立动作（RECOVERYSTAND，motion_id=111）。
-
-#### 5.2 坐下指令
-
-```bash
-ros2 topic pub --once /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd \
-  '{controller: "field", action: "sit", timestamp_ns: 0}'
-```
-
-#### 5.3 速度行走
-
-```bash
-# 以 0.2 m/s 向前走（持续发送，停止后自动零速保活）
-ros2 topic pub -r 10 /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd \
-  '{controller: "field", linear_vel_x: 0.2, angular_vel_z: 0.0, action: "", timestamp_ns: 0}'
-```
-
-停止发送后，uran_move 的保活定时器（20Hz）会在 0.5s 内自动发布零速指令，机器狗停止行走。
-
-#### 5.4 急停
-
-```bash
-ros2 topic pub --once /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd \
-  '{controller: "field", action: "emergency_stop", timestamp_ns: 0}'
-```
-
-#### 5.5 通过 MQTT 下发运控指令
-
-参见 [MQTT 控制说明](#mqtt-控制说明) 中的完整指令参考。主机 IP 需填入机器狗的 `network.yaml`，Broker 在主机上启动：
-
-```bash
-mosquitto -p 1883 -v
-```
-
-#### 5.6 切换运控插件（运行时）
-
-```bash
-ros2 service call /uran/move/switch_plugin uran_srvs/srv/SwitchMovePlugin \
-  "{plugin_id: 'cyberdog2'}"
-```
-
----
-
-### 步骤五（续）：流媒体验证
-
-#### 5.7 验证 camera_service 可用
-
-```bash
-# 查询摄像头当前状态（command=4 为 GET_STATE）
-ros2 service call /camera_service protocol/srv/CameraService "{command: 4}"
-# result=0 表示正常
-```
-
-#### 5.8 启动 WebRTC 通道（主摄像头，桥接模式）
-
-uran_media 不使用 aiortc，而是将信令中继给 `image_transmission` 节点处理。
-
-```bash
-# 1. 启动桥接通道（激活 camera_service，注册信令中继）
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "webrtc", channel_id: "cyberdog_main", signal_json: ""}'
-
-# 2. 发送 SDP Offer（由 WebRTC 客户端生成）
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "", protocol: "", channel_id: "cyberdog_main",
-    signal_json: "{\"type\":\"offer\",\"sdp\":\"v=0...\"}"}'
-
-# 3. 监听 image_transmission 信令出口（验证 offer 已转发）
-ros2 topic echo /img_trans_signal_out
-# 应收到 {"uid":"cyberdog_main","answer_sdp":{...}}
-
-# 4. 监听上行（验证 answer 已转发给云端）
-ros2 topic echo /uran/core/uplink/data
-
-# 验证状态写入
-ros2 topic echo /uran/core/state/write
-# 应看到 field_name=media_active_protocol, value_json="webrtc"
-#        field_name=media_channel_count, value_json=1
-```
-
-#### 5.9 启动 RTSP 通道
-
-**CyberDog2 主摄像头：**
-
-```bash
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "rtsp", channel_id: "cyberdog_main", signal_json: ""}'
-```
-
-**RealSense 摄像头（自动 launch + lifecycle 激活）：**
-
-```bash
-# 深度图（首次启动约等待 15 秒完成 launch + lifecycle）
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "rtsp", channel_id: "realsense_depth", signal_json: ""}'
-
-# 左目红外
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "rtsp", channel_id: "realsense_left", signal_json: ""}'
-
-# 右目红外
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "start", protocol: "rtsp", channel_id: "realsense_right", signal_json: ""}'
-```
-
-**监听 RTSP URL 上报：**
-
-```bash
-ros2 topic echo /uran/core/uplink/data
-# 应看到 data_type=media_rtsp_url，url=rtsp://localhost:8554/<channel_id>
-```
-
-**在主机上拉流验证（将机器狗 IP 替换为实际 IP）：**
-
-```bash
-ffplay rtsp://192.168.x.x:8554/realsense_depth
-ffplay rtsp://192.168.x.x:8554/realsense_left
-# 多路可同时拉流，各通道独立 mount point，共享 8554 端口
-```
-
-#### 5.10 本地录制验证
-
-```bash
-# 开始录制
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "record_start", protocol: "", channel_id: "front_cam", signal_json: ""}'
-
-# 等待 10 秒后停止
-ros2 topic pub --once /uran/core/downlink/media_ctrl uran_msgs/msg/MediaCtrlCmd \
-  '{action: "record_stop", protocol: "", channel_id: "front_cam", signal_json: ""}'
-
-# 检查录制文件
-ls /tmp/uran_media_record/
-```
-
-#### 5.11 停止所有通道
-
-```bash
-ros2 topic pub --once /uran/core/switch/media uran_msgs/msg/MediaSwitchCmd \
-  '{action: "stop_all", protocol: "", timestamp_ns: 0}'
-```
-
----
-
-### 步骤六：模式切换验证
-
-uran_move 会过滤与当前控制模式不匹配的指令来源：
-
-```bash
-# 切换为 manual 模式（只接受 cloud/field 指令，拒绝 auto）
-ros2 topic pub --once /uran/core/switch/mode uran_msgs/msg/ModeSwitchCmd \
-  '{control_mode: "manual", controller: "cloud", timestamp_ns: 0}'
-
-# 此时发送 auto 来源的指令会被拒绝，并上报 move_reject_event
-ros2 topic pub --once /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd \
-  '{controller: "auto", linear_vel_x: 0.2, action: "", timestamp_ns: 0}'
-
-# 监听拒绝事件
-ros2 topic echo /uran/core/uplink/data
-```
-
----
-
-### 常见问题
-
-**Q: uran_media 启动时报 `protocol package not found`（camera_service 不可用）**
-
-正常现象，节点会自动降级：跳过 `camera_service` 激活，直接订阅 ros_topic。若需要激活主摄像头，确保先 source cyberdog_ws：
-
-```bash
-source ~/cyberdog_ws/install/setup.bash
-source ~/uran_ws/install/setup.bash
-ros2 run uran_media uran_media_node
-```
-
-**Q: WebRTC 启动后收不到 SDP Offer**
-
-1. 确认 aiortc 已安装：`pip show aiortc`
-2. 检查 uran_media 日志是否有 `aiortc not available`（stub 模式不生成真实 Offer）
-3. 确认 channel_id 在 `media.yaml` 中存在
-
-**Q: RTSP 拉流失败**
-
-1. 确认 GStreamer 已安装：`gst-launch-1.0 --version`
-2. 检查端口是否被占用：`ss -tlnp | grep 8554`
-3. 确认防火墙放行 8554 端口：`sudo ufw allow 8554`
-
-**Q: 录制文件为空或无法播放**
-
-确认 opencv-python 已安装：`pip show opencv-python-headless`。录制依赖 cv2.VideoWriter，需要 XVID 编解码器支持。
-
-`protocol` 包来自 cyberdog_ws，需要先 source cyberdog_ws 的 install：
-
-```bash
-source ~/cyberdog_ws/install/setup.bash
-source ~/uran_ws/install/setup.bash
-ros2 run uran_move uran_move_node
-```
-
-**Q: `motion_result_cmd` service not ready**
-
-motion_manager 未启动或未就绪。检查：
-
-```bash
-ros2 service list | grep motion_result_cmd
-```
-
-若不存在，等待 cyberdog_ws 完全启动（通常需要 10–30s）。
-
-**Q: 发送速度指令后机器狗没有反应**
-
-1. 确认机器狗已站立（先发 `action: "stand"`）
-2. 检查 `motion_status` topic 的 `switch_status` 是否为 0（NORMAL）：
-   ```bash
-   ros2 topic echo /motion_status
-   ```
-3. 检查 uran_move 日志是否有 `motion not normal` 错误
-
-**Q: 机器狗行走后无法停止**
-
-uran_move 保活定时器会在停止发布指令后 0.5s 内自动发零速。若异常，手动急停：
-
-```bash
-ros2 topic pub --once /uran/core/downlink/move_cmd uran_msgs/msg/UnifiedMoveCmd \
-  '{controller: "field", action: "emergency_stop", timestamp_ns: 0}'
-```
-
----
-
-### uran_core 本地调试（无 CyberDog2）
-
-以下测试只需本地 MQTT Broker，不需要机器狗。
-
-```bash
-# 安装 mosquitto
-sudo apt install mosquitto mosquitto-clients
-
-# 终端 1：启动 Broker
-mosquitto -p 1883
-
-# 终端 2：启动节点
-conda activate uran && source /opt/ros/humble/setup.bash && source ~/uran_ws/install/setup.bash
-ros2 run uran_core uran_core_node
-```
-
-验证心跳上报：
-
-```bash
-mosquitto_sub -h localhost -t '/oivs/default/device_001/up'
-```
-
-模拟控制切换下行：
-
-```bash
-mosquitto_pub -h localhost -t '/oivs/default/device_001/down' -m '{
-  "msg_type": "control_switch",
-  "msg_version": "1.0",
-  "device_id": "device_001",
-  "timestamp_ms": 0,
-  "switch": {
-    "control_mode": "auto",
-    "controller": "cloud",
-    "primary_uplink_protocol": "mqtt",
-    "media": {"action": "start", "protocol": "webrtc"}
-  }
-}'
-```
-
-查询/写入状态空间：
-
-```bash
-ros2 service call /uran/core/state/get uran_srvs/srv/GetStateField \
-  "{field_names: ['control_mode', 'battery_level']}"
-
-ros2 service call /uran/core/state/set uran_srvs/srv/SetStateField \
-  "{field_name: 'battery_level', value_json: '85.0', persistent: false}"
-```
-
-触发即时状态上报：
-
-```bash
-ros2 service call /uran/core/state_report/trigger uran_srvs/srv/TriggerStateReport \
-  "{reason: 'manual'}"
-```
+相比早期方案，当前实现有三个明确变化：
+- 使用 **aiortc** 做标准 WebRTC 实现
+- 不再依赖面向特定平台的桥接流媒体方案
+- 不再使用 `camera_service`，统一改为订阅 **RealSense 原生话题**
 
 ---
 
