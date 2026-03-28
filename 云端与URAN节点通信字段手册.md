@@ -284,10 +284,10 @@
 
 **WebRTC 信令流程**：
 1. 云端发送 `action="start", protocol="webrtc", channel_id="<通道ID>"`
-2. URAN-media 为该 channel_id 创建独立 PeerConnection
-3. URAN-media 生成 SDP Offer，携带 channel_id 经 URAN-core 上行发送
-4. 云端返回 SDP Answer，经 URAN-core 下行发送
-5. 双端交换 ICE Candidate（始终携带 channel_id）
+2. URAN-media 为该 `channel_id` 创建独立 PeerConnection
+3. 若 `signal_json` 为空：URAN-media 生成 SDP Offer，携带 `channel_id` 经 URAN-core 上行发送
+4. 若 `signal_json.type == "offer"`：URAN-media 接收该 Offer，生成 SDP Answer，并携带 `channel_id` 经 URAN-core 上行发送
+5. 对端继续回传或接收 ICE Candidate（始终携带 `channel_id`）
 6. PeerConnection 建立，启动流推送
 
 ---

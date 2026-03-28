@@ -76,9 +76,23 @@ class UranMediaNode:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def _cb_media_ctrl(self, cmd: MediaCtrlCmd):
+        signal_json = cmd.signal_json if cmd.signal_json not in ('', '{}') else ''
+        signal = None
+        if signal_json:
+            try:
+                signal = json.loads(signal_json)
+            except json.JSONDecodeError:
+                rospy.logwarn('Invalid signal_json for %s', cmd.channel_id)
+                return
+
         if cmd.action == 'start':
             if cmd.protocol == 'webrtc':
-                self._start_webrtc(cmd.channel_id)
+                if signal and signal.get('type') == 'offer':
+                    self._start_webrtc_from_offer(cmd.channel_id, signal_json)
+                else:
+                    self._start_webrtc(cmd.channel_id)
+                    if signal_json:
+                        self._handle_signal(cmd.channel_id, signal_json, signal=signal)
             elif cmd.protocol == 'rtsp':
                 self._start_rtsp(cmd.channel_id)
         elif cmd.action == 'stop':
@@ -96,8 +110,8 @@ class UranMediaNode:
             self._start_record(cmd.channel_id)
         elif cmd.action == 'record_stop':
             self._stop_record(cmd.channel_id)
-        elif cmd.signal_json and cmd.signal_json not in ('', '{}'):
-            self._handle_signal(cmd.channel_id, cmd.signal_json)
+        elif signal_json:
+            self._handle_signal(cmd.channel_id, signal_json, signal=signal)
 
     def _cb_media_switch(self, cmd: MediaSwitchCmd):
         if cmd.action == 'stop_all':
@@ -109,17 +123,19 @@ class UranMediaNode:
                 elif cmd.protocol == 'rtsp':
                     self._start_rtsp(cid)
 
-    def _start_webrtc(self, channel_id: str):
+    def _ensure_webrtc_channel(self, channel_id: str, recreate: bool = False):
         if channel_id not in self._sources:
             rospy.logwarn('Unknown channel_id: %s', channel_id)
-            return
-        if channel_id in self._webrtc_channels:
-            rospy.loginfo('WebRTC channel already active: %s', channel_id)
-            return
+            return None
         src = self._sources[channel_id]
         if src.get('source_type') != 'ros_topic':
             rospy.logwarn('Unsupported source_type for WebRTC: %s', src.get('source_type'))
-            return
+            return None
+        if recreate and channel_id in self._webrtc_channels:
+            self._stop_channel(channel_id)
+        channel = self._webrtc_channels.get(channel_id)
+        if channel is not None:
+            return channel
 
         webrtc_cfg = self._cfg.get('webrtc', {})
         channel = WebRTCChannel(
@@ -129,36 +145,60 @@ class UranMediaNode:
             on_signal_cb=self._on_webrtc_signal,
         )
         self._webrtc_channels[channel_id] = channel
-        future = self._run_coro(channel.start())
-        future.add_done_callback(lambda f, cid=channel_id: self._on_offer_ready(cid, f))
         self._subscribe_topic(channel_id, src)
         self._update_state()
+        return channel
 
-    def _on_offer_ready(self, channel_id: str, future):
+    def _start_webrtc(self, channel_id: str):
+        if channel_id in self._webrtc_channels:
+            rospy.loginfo('WebRTC channel already active: %s', channel_id)
+            return
+        channel = self._ensure_webrtc_channel(channel_id)
+        if channel is None:
+            return
+        future = self._run_coro(channel.start())
+        future.add_done_callback(lambda f, cid=channel_id: self._on_offer_ready(cid, f))
+
+    def _start_webrtc_from_offer(self, channel_id: str, signal_json: str):
+        channel = self._ensure_webrtc_channel(channel_id, recreate=channel_id in self._webrtc_channels)
+        if channel is None:
+            return
+        future = self._run_coro(channel.accept_offer(signal_json))
+        future.add_done_callback(lambda f, cid=channel_id: self._on_local_signal_ready(cid, f, 'answer'))
+
+    def _on_local_signal_ready(self, channel_id: str, future, signal_type: str):
         try:
-            offer_json = future.result()
+            signal_json = future.result()
             self._publish_uplink('media_signal', {
                 'channel_id': channel_id,
-                'signal': json.loads(offer_json),
+                'signal': json.loads(signal_json),
             })
-            rospy.loginfo('SDP Offer published for channel: %s', channel_id)
+            rospy.loginfo('SDP %s published for channel: %s', signal_type.capitalize(), channel_id)
         except Exception as exc:
-            rospy.logerr('Failed to generate SDP offer for %s: %s', channel_id, exc)
+            rospy.logerr('Failed to generate SDP %s for %s: %s', signal_type, channel_id, exc)
+
+    def _on_offer_ready(self, channel_id: str, future):
+        self._on_local_signal_ready(channel_id, future, 'offer')
 
     def _on_webrtc_signal(self, channel_id: str, signal: dict):
         self._publish_uplink('media_signal', {'channel_id': channel_id, 'signal': signal})
 
-    def _handle_signal(self, channel_id: str, signal_json: str):
+    def _handle_signal(self, channel_id: str, signal_json: str, signal: dict = None):
+        if signal is None:
+            try:
+                signal = json.loads(signal_json)
+            except json.JSONDecodeError:
+                rospy.logwarn('Invalid signal_json for %s', channel_id)
+                return
+        sig_type = signal.get('type', '')
+        if sig_type == 'offer':
+            self._start_webrtc_from_offer(channel_id, signal_json)
+            return
+
         channel = self._webrtc_channels.get(channel_id)
         if channel is None:
             rospy.logwarn('No active WebRTC channel for %s', channel_id)
             return
-        try:
-            signal = json.loads(signal_json)
-        except json.JSONDecodeError:
-            rospy.logwarn('Invalid signal_json for %s', channel_id)
-            return
-        sig_type = signal.get('type', '')
         if sig_type == 'answer':
             self._run_coro(channel.set_answer(signal_json))
         elif sig_type == 'candidate':

@@ -1224,8 +1224,8 @@ URAN-media → /uran/core/uplink/data（data_type="media_signal"）→ URAN-core
 ```
 1. 云端发送 media_ctrl（action="start", protocol="webrtc", channel_id="<通道ID>"）
 2. URAN-media 接收，为该 channel_id 创建独立的 PeerConnection
-3. URAN-media 生成该通道的 SDP Offer，携带 channel_id，经 URAN-core 上行发送至云端
-4. 云端返回对应 channel_id 的 SDP Answer，经 URAN-core 下行发送至 URAN-media
+3. 若 `signal_json` 为空，URAN-media 生成该通道的 SDP Offer，携带 channel_id，经 URAN-core 上行发送至云端
+4. 若 `signal_json.type == "offer"`，URAN-media 接收该通道的远端 Offer，生成 SDP Answer，并携带 channel_id，经 URAN-core 上行发送至云端
 5. 双端交换该通道的 ICE Candidate（经 URAN-core 中转，始终携带 channel_id 以区分归属）
 6. 该通道 PeerConnection 建立，启动对应视频/音频流推送
 7. 多路通道可并发建立，各通道独立管理生命周期与重连逻辑

@@ -61,10 +61,7 @@ class WebRTCChannel:
         self._track = None
         self._available = _AIORTC_AVAILABLE
 
-    async def start(self) -> str:
-        if not self._available:
-            return json.dumps({'type': 'offer', 'sdp': '', 'stub': True})
-
+    def _build_ice_servers(self):
         ice_servers = []
         if self._stun_server:
             ice_servers.append(RTCIceServer(urls=[self._stun_server]))
@@ -74,7 +71,12 @@ class WebRTCChannel:
                 username=server.get('username'),
                 credential=server.get('credential'),
             ))
-        self._pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        return ice_servers
+
+    def _ensure_pc(self):
+        if self._pc is not None:
+            return self._pc
+        self._pc = RTCPeerConnection(RTCConfiguration(iceServers=self._build_ice_servers()))
         self._track = _RosVideoTrack._Track(self._frame_queue)
         self._pc.addTrack(self._track)
 
@@ -87,12 +89,33 @@ class WebRTCChannel:
                     'sdpMid': candidate.sdpMid,
                     'sdpMLineIndex': candidate.sdpMLineIndex,
                 })
+        return self._pc
 
-        offer = await self._pc.createOffer()
-        await self._pc.setLocalDescription(offer)
+    async def start(self) -> str:
+        if not self._available:
+            return json.dumps({'type': 'offer', 'sdp': '', 'stub': True})
+
+        pc = self._ensure_pc()
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
         return json.dumps({
-            'type': self._pc.localDescription.type,
-            'sdp': self._pc.localDescription.sdp,
+            'type': pc.localDescription.type,
+            'sdp': pc.localDescription.sdp,
+        })
+
+    async def accept_offer(self, offer_json: str) -> str:
+        if not self._available:
+            return json.dumps({'type': 'answer', 'sdp': '', 'stub': True})
+
+        pc = self._ensure_pc()
+        data = json.loads(offer_json)
+        offer = RTCSessionDescription(sdp=data['sdp'], type=data['type'])
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        return json.dumps({
+            'type': pc.localDescription.type,
+            'sdp': pc.localDescription.sdp,
         })
 
     async def set_answer(self, answer_json: str):

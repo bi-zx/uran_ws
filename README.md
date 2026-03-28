@@ -324,18 +324,30 @@ uran_media:
 
 ROS1 版本 `uran_media` 直接使用 `aiortc` 建立标准 WebRTC 通道，不再依赖外部桥接节点。
 
+支持两种协商方式：
+1. 设备生成 SDP Offer，云端/前端回传 SDP Answer
+2. 云端/前端在 `start` 中携带 SDP Offer，设备返回 SDP Answer
+
 WebRTC 启动流程：
 1. 向 `/uran/core/downlink/media_ctrl` 发送 `start + protocol=webrtc`
-2. `uran_media` 创建 `RTCPeerConnection`
-3. 自动生成 SDP Offer，并通过 `/uran/core/uplink/data` 上报 `data_type=media_signal`
-4. 云端/客户端回传 SDP Answer 与 ICE Candidate
-5. `uran_media` 继续完成协商并发送视频流
+2. `uran_media` 为对应 `channel_id` 创建 `RTCPeerConnection`
+3. 若 `signal_json` 为空：设备生成 SDP Offer，并通过 `/uran/core/uplink/data` 上报 `data_type=media_signal`
+4. 若 `signal_json.type == "offer"`：设备直接生成 SDP Answer，并通过 `/uran/core/uplink/data` 上报 `data_type=media_signal`
+5. 双端继续交换 ICE Candidate
+6. `uran_media` 完成协商并发送视频流
 
-启动 WebRTC：
+启动 WebRTC（设备先发 Offer）：
 
 ```bash
 rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
   '{action: "start", protocol: "webrtc", channel_id: "color", signal_json: ""}'
+```
+
+启动 WebRTC（前端先发 Offer）：
+
+```bash
+rostopic pub -1 /uran/core/downlink/media_ctrl uran_msgs/MediaCtrlCmd \
+  '{action: "start", protocol: "webrtc", channel_id: "color", signal_json: "{\"type\":\"offer\",\"sdp\":\"...\"}"}'
 ```
 
 监听信令上报：
