@@ -7,6 +7,7 @@
 """
 
 import json
+import threading
 import time
 
 import rclpy
@@ -58,6 +59,7 @@ class CyberDog2Plugin(MovePluginBase):
         self._idle_zero_since = None
         self._auto_stand_sent = False
         self._auto_stand_retry_after = 0.0
+        self._auto_stand_in_progress = False  # 防止并发触发
 
         if self._cmd_timeout_s < 0.0:
             node.get_logger().warn(
@@ -222,6 +224,7 @@ class CyberDog2Plugin(MovePluginBase):
             self._idle_zero_since = None
             self._auto_stand_sent = False
             self._auto_stand_retry_after = 0.0
+            self._auto_stand_in_progress = False
         self._publish_servo(
             cmd.linear_vel_x,
             cmd.linear_vel_y,
@@ -374,6 +377,8 @@ class CyberDog2Plugin(MovePluginBase):
             return
         if self._auto_stand_sent:
             return
+        if self._auto_stand_in_progress:
+            return
         if self._switch_status != _SWITCH_STATUS_NORMAL:
             return
         now = time.monotonic()
@@ -383,21 +388,28 @@ class CyberDog2Plugin(MovePluginBase):
             return
 
         self._last_execute_ts = 0.0
+        self._auto_stand_in_progress = True
         self._node.get_logger().info(
             'CyberDog2: idle zero-velocity timeout reached, stopping keepalive and sending RECOVERYSTAND'
         )
-        success, result = self._call_result_cmd(_MOTION_RECOVERYSTAND)
-        if success:
-            self._auto_stand_sent = True
-            self._idle_zero_since = None
-            self._auto_stand_retry_after = 0.0
-        else:
-            self._idle_zero_since = now
-            self._auto_stand_retry_after = now + self._auto_stand_retry_interval_s
-            self._node.get_logger().warn(
-                'CyberDog2: '
-                f'auto stand failed: {result}, retry after {self._auto_stand_retry_interval_s:.1f}s'
-            )
+
+        def _do_stand():
+            success, result = self._call_result_cmd(_MOTION_RECOVERYSTAND)
+            now2 = time.monotonic()
+            if success:
+                self._auto_stand_sent = True
+                self._idle_zero_since = None
+                self._auto_stand_retry_after = 0.0
+            else:
+                self._idle_zero_since = now2
+                self._auto_stand_retry_after = now2 + self._auto_stand_retry_interval_s
+                self._node.get_logger().warn(
+                    'CyberDog2: '
+                    f'auto stand failed: {result}, retry after {self._auto_stand_retry_interval_s:.1f}s'
+                )
+            self._auto_stand_in_progress = False
+
+        threading.Thread(target=_do_stand, daemon=True).start()
 
     def _motion_blocked_reason(self) -> str:
         return json.dumps({
