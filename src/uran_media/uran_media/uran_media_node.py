@@ -225,7 +225,7 @@ class UranMediaNode(Node):
         )
 
     def _start_webrtc_aiortc(self, channel_id: str, src: dict):
-        """通用 aiortc 模式：生成 SDP Offer 并上报。"""
+        """通用 aiortc 模式：创建通道，等待云端发来 SDP Offer。"""
         stun = self._cfg.get('webrtc', {}).get('stun_server', 'stun:stun.l.google.com:19302')
         channel = WebRTCChannel(
             channel_id=channel_id,
@@ -234,14 +234,14 @@ class UranMediaNode(Node):
         )
         self._webrtc_channels[channel_id] = channel
 
-        future = self._run_coro(channel.start())
-        future.add_done_callback(lambda f: self._on_offer_ready(channel_id, f))
-
         if src.get('source_type') == 'realsense_lifecycle':
             self._activate_realsense(channel_id, src)
 
         self._subscribe_topic(channel_id, src)
         self._update_state()
+        self.get_logger().info(
+            f'[aiortc] WebRTC channel ready: {channel_id}. Waiting for SDP offer from cloud.'
+        )
 
     def _on_offer_ready(self, channel_id: str, future):
         try:
@@ -289,7 +289,9 @@ class UranMediaNode(Node):
             return
 
         sig_type = signal.get('type', '')
-        if sig_type == 'answer':
+        if sig_type == 'offer':
+            self._run_coro(channel.handle_offer(signal_json))
+        elif sig_type == 'answer':
             self._run_coro(channel.set_answer(signal_json))
         elif sig_type == 'candidate':
             self._run_coro(channel.add_ice_candidate(signal_json))
