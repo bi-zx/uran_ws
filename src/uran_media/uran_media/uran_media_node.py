@@ -231,6 +231,7 @@ class UranMediaNode(Node):
             channel_id=channel_id,
             stun_server=stun,
             on_signal_cb=self._on_webrtc_signal,
+            on_closed_cb=self._on_webrtc_closed,
         )
         self._webrtc_channels[channel_id] = channel
 
@@ -260,6 +261,13 @@ class UranMediaNode(Node):
             data_type='media_signal',
             payload={'channel_id': channel_id, 'signal': signal},
         )
+
+    def _on_webrtc_closed(self, channel_id: str):
+        """aiortc 对端断开回调 → 清理通道资源。"""
+        if channel_id not in self._webrtc_channels:
+            return
+        self.get_logger().info(f'[aiortc] Peer disconnected, cleaning up channel: {channel_id}')
+        self._stop_channel(channel_id)
 
     # ================================================================== 信令处理
     def _handle_signal(self, channel_id: str, signal_json: str):
@@ -319,8 +327,8 @@ class UranMediaNode(Node):
             )
         elif sig_type == 'closed':
             self.get_logger().info(f'[bridge] image_transmission closed channel: {uid}')
-            self._bridge_channels.discard(uid)
-            self._update_state()
+            self._bridge_channels.discard(uid)  # discard first so _stop_channel skips re-sending stop
+            self._stop_channel(uid)
         elif sig_type == 'error':
             self.get_logger().error(
                 f'[bridge] image_transmission error for {uid}: {signal.get("error")}'

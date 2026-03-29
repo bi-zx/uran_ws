@@ -56,10 +56,12 @@ class _RosVideoTrack:
 class WebRTCChannel:
     """单路 WebRTC 通道，封装 aiortc PeerConnection。"""
 
-    def __init__(self, channel_id: str, stun_server: str, on_signal_cb: Callable):
+    def __init__(self, channel_id: str, stun_server: str, on_signal_cb: Callable,
+                 on_closed_cb: Optional[Callable] = None):
         self._channel_id = channel_id
         self._stun_server = stun_server
         self._on_signal_cb = on_signal_cb
+        self._on_closed_cb = on_closed_cb
         self._pc: Optional[object] = None
         self._frame_queue: queue.Queue = queue.Queue(maxsize=10)
         self._track = None
@@ -80,6 +82,13 @@ class WebRTCChannel:
 
         self._track = _RosVideoTrack._Track(self._frame_queue)
         self._pc.addTrack(self._track)
+
+        # 连接状态变化回调（对端断开时触发清理）
+        @self._pc.on('connectionstatechange')
+        async def on_state_change():
+            state = self._pc.connectionState if self._pc else None
+            if state in ('failed', 'closed', 'disconnected') and self._on_closed_cb:
+                self._on_closed_cb(self._channel_id)
 
         # ICE candidate 收集回调
         @self._pc.on('icecandidate')
