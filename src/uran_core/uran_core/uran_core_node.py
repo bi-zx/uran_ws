@@ -1,7 +1,6 @@
 """uran_core_node — T1.1~T1.5 主节点"""
 import json
 import os
-import queue
 import threading
 import time
 from typing import Any, Dict
@@ -62,9 +61,6 @@ class UranCoreNode(Node):
             list(self._change_fields), self._on_state_change
         )
 
-        # ── MQTT 消息队列（MQTT 线程 → ROS 线程）────────────────────────
-        self._mqtt_queue: queue.Queue = queue.Queue()
-
         # ── MQTT 客户端 ───────────────────────────────────────────────────
         self._mqtt: MqttClient = MqttClient(self._net_cfg, self._on_mqtt_downlink)
         self._mqtt_enabled = self._net_cfg.get('mqtt', {}).get('enabled', True)
@@ -105,7 +101,6 @@ class UranCoreNode(Node):
         self.create_timer(1.0, self._timer_report_check)  # T1.6: 每秒检查是否到上报周期
         self.create_timer(self._hb_ms / 1000.0, self._timer_heartbeat)
         self.create_timer(1.0, self._timer_uptime)
-        self.create_timer(0.05, self._timer_mqtt_queue)  # 处理 MQTT 消息队列
 
         # ── 启动 MQTT ─────────────────────────────────────────────────────
         if self._mqtt_enabled:
@@ -152,16 +147,8 @@ class UranCoreNode(Node):
 
     # ================================================================== MQTT 下行回调（MQTT 线程）
     def _on_mqtt_downlink(self, payload: dict):
-        self._mqtt_queue.put(payload)
-
-    # ================================================================== MQTT 队列处理（ROS 定时器）
-    def _timer_mqtt_queue(self):
-        try:
-            while True:
-                payload = self._mqtt_queue.get_nowait()
-                self._handle_downlink(payload)
-        except queue.Empty:
-            pass
+        # 从 paho 后台线程直接调度到 ROS executor 线程，避免队列轮询延时
+        self.executor.create_task(lambda: self._handle_downlink(payload))
 
     def _handle_downlink(self, payload: dict):
         msg_type = payload.get('msg_type', '')

@@ -18,8 +18,8 @@ import rclpy.executors
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
 
-from uran_msgs.msg import UnifiedMoveCmd, ModeSwitchCmd, HeartbeatStatus, UplinkPayload, StateField
-from uran_srvs.srv import GetStateField, SwitchMovePlugin
+from uran_msgs.msg import UnifiedMoveCmd, ModeSwitchCmd, HeartbeatStatus, UplinkPayload, StateField, StateSnapshot
+from uran_srvs.srv import SwitchMovePlugin
 
 
 class UranMoveNode(Node):
@@ -39,6 +39,10 @@ class UranMoveNode(Node):
         self._failsafe_cfg = {}          # 从 plugins.yaml 加载
         self._link_lost_since = None     # 链路首次中断时间（monotonic）
         self._link_recovered_since = None  # 链路首次恢复时间（monotonic）
+
+        # 限速缓存（由 StateSnapshot 广播更新，避免每条指令同步查服务）
+        self._linear_vel_limit = 1.0
+        self._angular_vel_limit = 1.0
 
         # 插件相关
         self._plugin = None
@@ -71,6 +75,12 @@ class UranMoveNode(Node):
             self._cb_heartbeat,
             10,
         )
+        self.create_subscription(
+            StateSnapshot,
+            '/uran/core/state/broadcast',
+            self._cb_state_snapshot,
+            10,
+        )
 
         # ---------- 发布 ----------
         self._uplink_pub = self.create_publisher(UplinkPayload, '/uran/core/uplink/data', 10)
@@ -78,9 +88,6 @@ class UranMoveNode(Node):
 
         # ---------- 服务 ----------
         self.create_service(SwitchMovePlugin, '/uran/move/switch_plugin', self._srv_switch_plugin)
-
-        # ---------- 状态空间 client ----------
-        self._state_get_cli = self.create_client(GetStateField, '/uran/core/state/get')
 
         self.get_logger().info(
             f'uran_move_node ready, active_plugin={self._active_plugin_id}'
@@ -166,6 +173,17 @@ class UranMoveNode(Node):
             if self._link_recovered_since is None and self._link_lost_since is not None:
                 self._link_recovered_since = now
             self._link_lost_since = None
+
+    def _cb_state_snapshot(self, msg: StateSnapshot):
+        """缓存状态快照中的限速参数，供 _precheck_cmd 使用。"""
+        try:
+            fields = json.loads(msg.fields_json)
+            if 'linear_vel_limit' in fields:
+                self._linear_vel_limit = float(fields['linear_vel_limit'])
+            if 'angular_vel_limit' in fields:
+                self._angular_vel_limit = float(fields['angular_vel_limit'])
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     #  失控保护（T2.5）                                                    #
@@ -310,25 +328,9 @@ class UranMoveNode(Node):
     # ------------------------------------------------------------------ #
 
     def _precheck_cmd(self, cmd: UnifiedMoveCmd) -> UnifiedMoveCmd:
-        """从状态空间读取速度限制并截断指令速度。"""
-        linear_limit = 1.0
-        angular_limit = 1.0
-
-        if self._state_get_cli.service_is_ready():
-            req = GetStateField.Request()
-            req.field_names = ['linear_vel_limit', 'angular_vel_limit']
-            future = self._state_get_cli.call_async(req)
-            # 轮询等待（不能用 spin_until_future_complete，node 已在 MultiThreadedExecutor 中）
-            deadline = time.time() + 0.1
-            while not future.done() and time.time() < deadline:
-                time.sleep(0.005)
-            if future.done() and future.result() and future.result().success:
-                try:
-                    fields = json.loads(future.result().fields_json)
-                    linear_limit = float(fields.get('linear_vel_limit', linear_limit))
-                    angular_limit = float(fields.get('angular_vel_limit', angular_limit))
-                except Exception:
-                    pass
+        """用缓存的速度限制截断指令速度（限速参数由 StateSnapshot 广播更新）。"""
+        linear_limit = self._linear_vel_limit
+        angular_limit = self._angular_vel_limit
 
         clamped = False
         vx, vy, vz = cmd.linear_vel_x, cmd.linear_vel_y, cmd.linear_vel_z
