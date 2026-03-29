@@ -100,45 +100,6 @@ class WebRTCChannel:
             'sdp': self._pc.localDescription.sdp,
         })
 
-    async def handle_offer(self, offer_json: str):
-        """接收云端 SDP Offer，生成并返回 SDP Answer，通过 on_signal_cb 上报。"""
-        if not self._available:
-            return
-        try:
-            data = json.loads(offer_json)
-            offer = RTCSessionDescription(sdp=data['sdp'], type=data['type'])
-
-            if self._pc is not None:
-                await self._pc.close()
-            self._pc = RTCPeerConnection()
-
-            self._track = _RosVideoTrack._Track(self._frame_queue)
-            self._pc.addTrack(self._track)
-
-            @self._pc.on('icecandidate')
-            def on_ice(candidate):
-                if candidate:
-                    self._on_signal_cb(self._channel_id, {
-                        'type': 'candidate',
-                        'candidate': candidate.to_sdp(),
-                        'sdpMid': candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                    })
-
-            await self._pc.setRemoteDescription(offer)
-            answer = await self._pc.createAnswer()
-            await self._pc.setLocalDescription(answer)
-
-            self._on_signal_cb(self._channel_id, {
-                'type': self._pc.localDescription.type,
-                'sdp': self._pc.localDescription.sdp,
-            })
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(
-                f'[WebRTC:{self._channel_id}] handle_offer error: {e}'
-            )
-
     async def set_answer(self, answer_json: str):
         """设置远端 SDP Answer。"""
         if not self._available or self._pc is None:
