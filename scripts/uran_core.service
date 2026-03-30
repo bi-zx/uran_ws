@@ -8,7 +8,7 @@ RequiresMountsFor=/SDCARD
 Type=simple
 User=mi
 WorkingDirectory=/SDCARD/uran_ws
-ExecStart=/SDCARD/uran_ws/scripts/start_uran_core.sh
+ExecStart=/bin/bash -c /SDCARD/uran_ws/scripts/start_uran_core.sh
 Restart=always
 RestartSec=2
 
