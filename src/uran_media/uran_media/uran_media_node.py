@@ -45,6 +45,7 @@ class UranMediaNode:
         rospy.Subscriber('/uran/core/downlink/media_ctrl', MediaCtrlCmd, self._cb_media_ctrl, queue_size=10)
         rospy.Subscriber('/uran/core/switch/media', MediaSwitchCmd, self._cb_media_switch, queue_size=10)
 
+        self._write_camera_list()
         rospy.loginfo('uran_media_node started')
 
     def _find_share_dir(self):
@@ -337,6 +338,17 @@ class UranMediaNode:
             self._publish_uplink('media_upload', {'channel_id': channel_id, 'status': 'ready'})
         except Exception as exc:
             rospy.logerr('Error stopping recorder for %s: %s', channel_id, exc)
+
+    def _write_camera_list(self):
+        camera_list = []
+        for cid, src in self._sources.items():
+            camera_list.append({
+                'channel_id': cid,
+                'source_type': src.get('source_type', ''),
+                'ros_topic': src.get('ros_topic', ''),
+                'fps': src.get('fps', 30),
+            })
+        self._write_state('media_camera_list', camera_list)
 
     def _update_state(self):
         active_webrtc = len(self._webrtc_channels)
