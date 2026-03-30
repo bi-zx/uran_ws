@@ -45,6 +45,10 @@ class UranMediaNode:
         rospy.Subscriber('/uran/core/downlink/media_ctrl', MediaCtrlCmd, self._cb_media_ctrl, queue_size=10)
         rospy.Subscriber('/uran/core/switch/media', MediaSwitchCmd, self._cb_media_switch, queue_size=10)
 
+        # Wait for state_manager to subscribe before publishing initial state
+        deadline = time.time() + 5.0
+        while self._state_pub.get_num_connections() == 0 and time.time() < deadline:
+            time.sleep(0.05)
         self._write_camera_list()
         rospy.loginfo('uran_media_node started')
 
