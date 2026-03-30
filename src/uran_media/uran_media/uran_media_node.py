@@ -99,7 +99,9 @@ class UranMediaNode(Node):
             f'out={ns + "/img_trans_signal_out" if ns else "img_trans_signal_out"}'
         )
 
-        self._write_camera_list()
+        # 延迟写入：等 executor 开始 spin 后 topic 才可投递
+        self._startup_timer = self.create_timer(1.0, self._on_startup_timer)
+        self.create_timer(5.0, self._update_state)
         self.get_logger().info('uran_media_node started')
 
     # ================================================================== 配置加载
@@ -571,6 +573,11 @@ class UranMediaNode(Node):
             self.get_logger().error(f'Error stopping recorder for {channel_id}: {e}')
 
     # ================================================================== 状态写入
+    def _on_startup_timer(self):
+        self._update_state()
+        # 一次性定时器：取消自身
+        self.destroy_timer(self._startup_timer)
+
     def _write_camera_list(self):
         camera_list = [
             {
@@ -599,6 +606,7 @@ class UranMediaNode(Node):
 
         self._write_state('media_active_protocol', protocol)
         self._write_state('media_channel_count', total)
+        self._write_camera_list()
 
     # ================================================================== helpers
     def _publish_uplink(self, data_type: str, payload: dict, urgent: bool = False):
