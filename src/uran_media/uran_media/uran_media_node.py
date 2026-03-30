@@ -99,6 +99,7 @@ class UranMediaNode(Node):
             f'out={ns + "/img_trans_signal_out" if ns else "img_trans_signal_out"}'
         )
 
+        self._write_camera_list()
         self.get_logger().info('uran_media_node started')
 
     # ================================================================== 配置加载
@@ -570,6 +571,19 @@ class UranMediaNode(Node):
             self.get_logger().error(f'Error stopping recorder for {channel_id}: {e}')
 
     # ================================================================== 状态写入
+    def _write_camera_list(self):
+        camera_list = [
+            {
+                'channel_id': src.get('channel_id'),
+                'source_type': src.get('source_type'),
+                'ros_topic': src.get('ros_topic', ''),
+                'fps': src.get('fps', 0),
+            }
+            for src in self._cfg.get('video_sources', [])
+            if src.get('channel_id')
+        ]
+        self._write_state('media_camera_list', camera_list)
+
     def _update_state(self):
         active_bridge = len(self._bridge_channels)
         active_aiortc = len(self._webrtc_channels)

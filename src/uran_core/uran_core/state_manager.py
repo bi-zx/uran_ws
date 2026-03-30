@@ -30,6 +30,9 @@ DEFAULT_STATE: Dict[str, Any] = {
     'task_id': '',
     'task_stage': '',
     'uptime_seconds': 0,
+    'media_camera_list': [],
+    'media_active_protocol': 'none',
+    'media_channel_count': 0,
 }
 
 
