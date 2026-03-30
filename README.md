@@ -60,7 +60,7 @@ sudo apt install python3-catkin-tools python3-rospkg python3-yaml python3-pip
 
 ```bash
 cd ~/uran_ws
-catkin_make
+catkin_make -DROS_EDITION=ROS1
 ```
 
 ### 2. 加载环境
