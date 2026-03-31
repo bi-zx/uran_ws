@@ -23,6 +23,7 @@ URAN（Unified Robotics Access Node）是 OIVS 系统在无人装备侧的统一
   - [MQTT 控制说明](#mqtt-控制说明)
   - [配置文件](#配置文件)
   - [ROS 接口](#ros-接口)
+- [uran_move 使用说明](#uran_move-使用说明)
 - [uran_media 使用说明](#uran_media-使用说明)
   - [依赖安装](#依赖安装)
   - [摄像头配置](#摄像头配置)
@@ -92,6 +93,7 @@ rosrun uran_media uran_media_node
 uran_ws/
 ├── src/
 │   ├── uran_core/     # ROS1 核心接入节点
+│   ├── uran_move/     # ROS1 运动控制节点（px4ctrl 桥接）
 │   ├── uran_media/    # ROS1 媒体节点（aiortc + RTSP）
 │   ├── uran_msgs/     # 自定义消息定义
 │   └── uran_srvs/     # 自定义服务定义
@@ -432,6 +434,119 @@ ls /tmp/uran_media_record
 | `media_signal` | WebRTC SDP / ICE 信令 |
 | `media_rtsp_url` | RTSP 通道地址 |
 | `media_upload` | 录制完成通知 |
+
+---
+
+## uran_move 使用说明
+
+`uran_move` 是 URAN 的运动控制桥接节点，将 URAN-core 下发的统一运控指令（`UnifiedMoveCmd`）转换为 px4ctrl 所需的接口调用。
+
+### 启动
+
+```bash
+roslaunch uran_move uran_move.launch
+# 或
+rosrun uran_move uran_move_node
+```
+
+### ROS 接口
+
+| 方向 | Topic | 消息类型 | 说明 |
+|------|-------|----------|------|
+| 订阅 | `/uran/core/downlink/move_cmd` | `uran_msgs/UnifiedMoveCmd` | 来自 URAN-core 的统一运控指令 |
+| 订阅 | `/mavros/rc/in` | `mavros_msgs/RCIn` | RC 遥控输入，起飞前安全检查 |
+| 发布 | `position_cmd` | `quadrotor_msgs/PositionCommand` | 速度/悬停指令（20 Hz 保活） |
+| 发布 | `takeoff_land` | `quadrotor_msgs/TakeoffLand` | 起降指令 |
+
+> `position_cmd` 和 `takeoff_land` 为相对话题名，实际全路径取决于 px4ctrl 节点命名空间。
+
+### action 字段映射
+
+| `UnifiedMoveCmd.action` | px4ctrl 行为 |
+|---|---|
+| `takeoff` | 发布 `TakeoffLand(TAKEOFF)`（须通过起飞前 RC 检查） |
+| `land` | 发布 `TakeoffLand(LAND)` |
+| `return_home` | 发布 `TakeoffLand(LAND)`（px4ctrl 无 RTL 接口，记录警告） |
+| `emergency_stop` | 发布 `TakeoffLand(LAND)`（尽力而为） |
+| `stop` 或全零速度 | 发布零速 `PositionCommand`（原地悬停） |
+| 空串（速度指令） | 发布带速度字段的 `PositionCommand` |
+
+### 起飞前 RC 安全检查
+
+发布起飞指令前，节点会检查 `/mavros/rc/in` 的以下通道（PWM 值）：
+
+| 通道 | 索引 | 要求 | 说明 |
+|------|------|------|------|
+| CH3（油门） | 2 | 1400–1600 | 油门须处于中位 |
+| CH5 | 4 | 1900–2100 | 须处于高位 |
+| CH6 | 5 | 1900–2100 | 须处于高位 |
+
+任一条件不满足时，指令被拒绝并输出 `WARN` 日志，不发送起飞指令。
+
+### MQTT 运控指令格式
+
+URAD-core 将 MQTT 下行消息路由为 `UnifiedMoveCmd` 后发布到 `/uran/core/downlink/move_cmd`。
+
+**MQTT 下行 Topic：**
+```
+/oivs/{tenant_id}/{device_id}/down
+```
+
+**消息体示例（起飞）：**
+```json
+{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "<device_id>",
+  "timestamp_ns": 1741564800000000000,
+  "controller": "cloud",
+  "action": "takeoff",
+  "linear_vel_x": 0.0,
+  "linear_vel_y": 0.0,
+  "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0,
+  "target_yaw": null
+}
+```
+
+**消息体示例（速度控制，前进 1 m/s）：**
+```json
+{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "<device_id>",
+  "timestamp_ns": 1741564800000000000,
+  "controller": "cloud",
+  "action": "",
+  "linear_vel_x": 1.0,
+  "linear_vel_y": 0.0,
+  "linear_vel_z": 0.0,
+  "angular_vel_z": 0.0,
+  "target_yaw": null
+}
+```
+
+**消息体示例（降落）：**
+```json
+{
+  "msg_type": "move_cmd",
+  "msg_version": "1.0",
+  "device_id": "<device_id>",
+  "timestamp_ns": 1741564800000000000,
+  "controller": "cloud",
+  "action": "land"
+}
+```
+
+**坐标系约定（ROS REP-103 ENU 体坐标系）：**
+
+| 字段 | 正方向 |
+|------|--------|
+| `linear_vel_x` | 前进 |
+| `linear_vel_y` | 左移 |
+| `linear_vel_z` | 上升 |
+| `angular_vel_z` | 左转（逆时针，俯视） |
+| `target_yaw` | ENU 世界系，0 = 正东，逆时针为正，NaN = 不指定 |
 
 ---
 
