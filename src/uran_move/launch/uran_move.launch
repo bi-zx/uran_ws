@@ -1,0 +1,8 @@
+<launch>
+  <!-- uran_move_node: bridges UnifiedMoveCmd to px4ctrl -->
+  <node pkg="uran_move" type="uran_move_node" name="uran_move_node" output="screen">
+    <!-- Speed limits (m/s and rad/s). Match values in px4ctrl ctrl_param_fpv.yaml -->
+    <param name="linear_vel_limit"  value="3.0"/>
+    <param name="angular_vel_limit" value="1.0"/>
+  </node>
+</launch>
