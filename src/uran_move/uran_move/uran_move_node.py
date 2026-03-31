@@ -17,6 +17,7 @@ import time
 import rospy
 from uran_msgs.msg import UnifiedMoveCmd
 from quadrotor_msgs.msg import PositionCommand, TakeoffLand
+from mavros_msgs.msg import RCIn
 
 # px4ctrl topics (from px4ctrl_node.cpp)
 _TOPIC_CMD       = 'position_cmd'   # quadrotor_msgs/PositionCommand
@@ -24,6 +25,15 @@ _TOPIC_TKL       = 'takeoff_land'   # quadrotor_msgs/TakeoffLand
 
 # URAN downlink topic
 _TOPIC_MOVE_CMD  = '/uran/core/downlink/move_cmd'
+
+# RC pre-takeoff checks
+_CH_THROTTLE     = 2   # CH3 (0-indexed)
+_CH5             = 4
+_CH6             = 5
+_THROTTLE_LO     = 1400
+_THROTTLE_HI     = 1600
+_HIGH_LO         = 1900
+_HIGH_HI         = 2100
 
 # Keep-alive: PX4 OFFBOARD requires setpoints at >=2 Hz.
 _KEEPALIVE_HZ    = 20
@@ -38,6 +48,10 @@ class UranMoveNode:
 
         self._pub_cmd = rospy.Publisher(_TOPIC_CMD, PositionCommand, queue_size=10)
         self._pub_tkl = rospy.Publisher(_TOPIC_TKL, TakeoffLand, queue_size=5)
+
+        self._rc_lock = threading.Lock()
+        self._last_rc: RCIn | None = None
+        rospy.Subscriber('/mavros/rc/in', RCIn, self._on_rc_in, queue_size=5)
 
         rospy.Subscriber(_TOPIC_MOVE_CMD, UnifiedMoveCmd, self._on_move_cmd,
                          queue_size=10, tcp_nodelay=True)
@@ -57,6 +71,8 @@ class UranMoveNode:
         action = msg.action.strip().lower()
 
         if action in ('takeoff',):
+            if not self._rc_preflight_ok():
+                return
             self._send_takeoff_land(TakeoffLand.TAKEOFF)
             return
 
@@ -81,6 +97,37 @@ class UranMoveNode:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _on_rc_in(self, msg: RCIn):
+        with self._rc_lock:
+            self._last_rc = msg
+
+    def _rc_preflight_ok(self) -> bool:
+        with self._rc_lock:
+            rc = self._last_rc
+        if rc is None:
+            rospy.logwarn('[uran_move] takeoff blocked: no RC data received')
+            return False
+        ch = rc.channels
+        if len(ch) <= max(_CH_THROTTLE, _CH5, _CH6):
+            rospy.logwarn('[uran_move] takeoff blocked: RC channel count %d too low', len(ch))
+            return False
+        thr = ch[_CH_THROTTLE]
+        ch5 = ch[_CH5]
+        ch6 = ch[_CH6]
+        if not (_THROTTLE_LO <= thr <= _THROTTLE_HI):
+            rospy.logwarn('[uran_move] takeoff blocked: CH3 throttle=%d not in [%d,%d]',
+                          thr, _THROTTLE_LO, _THROTTLE_HI)
+            return False
+        if not (_HIGH_LO <= ch5 <= _HIGH_HI):
+            rospy.logwarn('[uran_move] takeoff blocked: CH5=%d not in [%d,%d]',
+                          ch5, _HIGH_LO, _HIGH_HI)
+            return False
+        if not (_HIGH_LO <= ch6 <= _HIGH_HI):
+            rospy.logwarn('[uran_move] takeoff blocked: CH6=%d not in [%d,%d]',
+                          ch6, _HIGH_LO, _HIGH_HI)
+            return False
+        return True
+
     def _send_takeoff_land(self, cmd_type: int):
         msg = TakeoffLand()
         msg.takeoff_land_cmd = cmd_type
