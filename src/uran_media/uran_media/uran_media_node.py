@@ -230,9 +230,11 @@ class UranMediaNode(Node):
     def _start_webrtc_aiortc(self, channel_id: str, src: dict):
         """通用 aiortc 模式：生成 SDP Offer 并上报。"""
         stun = self._cfg.get('webrtc', {}).get('stun_server', 'stun:stun.l.google.com:19302')
+        turns = self._cfg.get('webrtc', {}).get('turn_servers', [])
         channel = WebRTCChannel(
             channel_id=channel_id,
             stun_server=stun,
+            turn_servers=turns,
             on_signal_cb=self._on_webrtc_signal,
             on_closed_cb=self._on_webrtc_closed,
         )

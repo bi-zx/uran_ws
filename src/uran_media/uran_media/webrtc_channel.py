@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 try:
     import av
-    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
     from aiortc.contrib.media import MediaStreamTrack
     _AIORTC_AVAILABLE = True
 except ImportError:
@@ -57,9 +57,11 @@ class WebRTCChannel:
     """单路 WebRTC 通道，封装 aiortc PeerConnection。"""
 
     def __init__(self, channel_id: str, stun_server: str, on_signal_cb: Callable,
-                 on_closed_cb: Optional[Callable] = None):
+                 on_closed_cb: Optional[Callable] = None,
+                 turn_servers: Optional[list] = None):
         self._channel_id = channel_id
         self._stun_server = stun_server
+        self._turn_servers = turn_servers or []
         self._on_signal_cb = on_signal_cb
         self._on_closed_cb = on_closed_cb
         self._pc: Optional[object] = None
@@ -78,7 +80,14 @@ class WebRTCChannel:
         if not self._available:
             return json.dumps({'type': 'offer', 'sdp': '', 'stub': True})
 
-        self._pc = RTCPeerConnection()
+        ice_servers = [RTCIceServer(urls=self._stun_server)]
+        for t in self._turn_servers:
+            ice_servers.append(RTCIceServer(
+                urls=t['url'],
+                username=t.get('username'),
+                credential=t.get('credential'),
+            ))
+        self._pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
 
         self._track = _RosVideoTrack._Track(self._frame_queue)
         self._pc.addTrack(self._track)

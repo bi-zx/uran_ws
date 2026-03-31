@@ -70,6 +70,16 @@ uran_media:
   default_protocol: "webrtc"
   webrtc:
     stun_server: "stun:stun.l.google.com:19302"
+    # TURN 服务器列表（用于 NAT 穿透失败时的中继）
+    # 若不需要 TURN 可删除或留空列表
+    turn_servers:
+      - url: "turn:your-turn-server.example.com:3478"
+        username: "your_username"
+        credential: "your_password"
+      # 可选：TLS TURN
+      # - url: "turns:your-turn-server.example.com:5349"
+      #   username: "your_username"
+      #   credential: "your_password"
     max_reconnect_attempts: 3
   local_record:
     enabled: false
