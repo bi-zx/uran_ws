@@ -1,0 +1,14 @@
+[Unit]
+Description=Uran ROS2 Media Node (User Service)
+After=uran_core.service
+Wants=uran_core.service
+
+[Service]
+Type=simple
+WorkingDirectory=/SDCARD/uran_ws
+ExecStart=/SDCARD/uran_ws/scripts/start_uran_media.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
