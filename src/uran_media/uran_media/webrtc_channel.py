@@ -66,6 +66,11 @@ class WebRTCChannel:
         if self._stun_server:
             ice_servers.append(RTCIceServer(urls=[self._stun_server]))
         for server in self._turn_servers:
+            if isinstance(server, str):
+                ice_servers.append(RTCIceServer(urls=[server]))
+                continue
+            if not isinstance(server, dict):
+                continue
             ice_servers.append(RTCIceServer(
                 urls=server.get('urls') or [server.get('url')],
                 username=server.get('username'),
