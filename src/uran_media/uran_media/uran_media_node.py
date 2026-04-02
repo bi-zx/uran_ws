@@ -205,9 +205,29 @@ class UranMediaNode:
             rospy.logwarn('No active WebRTC channel for %s', channel_id)
             return
         if sig_type == 'answer':
-            self._run_coro(channel.set_answer(signal_json))
+            future = self._run_coro(channel.set_answer(signal_json))
+            def _on_answer_done(f):
+                try:
+                    ok = f.result()
+                    if ok:
+                        rospy.loginfo('Remote answer set for %s', channel_id)
+                    else:
+                        rospy.logwarn('Failed to set remote answer for %s', channel_id)
+                except Exception as e:
+                    rospy.logerr('Set answer exception for %s: %s', channel_id, e)
+            future.add_done_callback(_on_answer_done)
         elif sig_type == 'candidate':
-            self._run_coro(channel.add_ice_candidate(signal_json))
+            future = self._run_coro(channel.add_ice_candidate(signal_json))
+            def _on_candidate_done(f):
+                try:
+                    ok = f.result()
+                    if ok:
+                        rospy.loginfo('ICE candidate added for %s', channel_id)
+                    else:
+                        rospy.logwarn('Failed to add ICE candidate for %s', channel_id)
+                except Exception as e:
+                    rospy.logerr('ICE candidate exception for %s: %s', channel_id, e)
+            future.add_done_callback(_on_candidate_done)
         else:
             rospy.logwarn('Unknown signal type: %s', sig_type)
 

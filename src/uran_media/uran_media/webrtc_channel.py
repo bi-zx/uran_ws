@@ -123,23 +123,59 @@ class WebRTCChannel:
             'sdp': pc.localDescription.sdp,
         })
 
-    async def set_answer(self, answer_json: str):
+    async def set_answer(self, answer_json: str) -> bool:
         if not self._available or self._pc is None:
-            return
-        data = json.loads(answer_json)
-        answer = RTCSessionDescription(sdp=data['sdp'], type=data['type'])
-        await self._pc.setRemoteDescription(answer)
+            return False
+        try:
+            data = json.loads(answer_json)
+            answer = RTCSessionDescription(sdp=data['sdp'], type=data['type'])
+            await self._pc.setRemoteDescription(answer)
+            return True
+        except Exception as e:
+            print(f"Failed to set answer: {e}")
+            return False
 
-    async def add_ice_candidate(self, candidate_json: str):
+    async def add_ice_candidate(self, candidate_json: str) -> bool:
         if not self._available or self._pc is None:
-            return
-        data = json.loads(candidate_json)
-        candidate = RTCIceCandidate(
-            sdp=data.get('candidate', ''),
-            sdpMid=data.get('sdpMid'),
-            sdpMLineIndex=data.get('sdpMLineIndex'),
-        )
-        await self._pc.addIceCandidate(candidate)
+            return False
+        try:
+            data = json.loads(candidate_json)
+            candidate_str = data.get('candidate', '')
+            # Parse ICE candidate string: candidate:<foundation> <component> <protocol> <priority> <ip> <port> typ <type> ...
+            # Example: "candidate:3792445058 1 udp 2113937151 46b41216-...local 52235 typ host ..."
+            if not candidate_str.startswith('candidate:'):
+                print(f"Invalid candidate format (missing 'candidate:'): {candidate_str}")
+                return False
+            # Remove "candidate:" prefix and split
+            candidate_content = candidate_str[10:]  # len("candidate:") == 10
+            parts = candidate_content.split()
+            if len(parts) < 8:
+                print(f"Invalid candidate format (too few parts): {candidate_str}")
+                return False
+            foundation = parts[0]
+            component = int(parts[1])
+            protocol = parts[2]
+            priority = int(parts[3])
+            ip = parts[4]
+            port = int(parts[5])
+            typ_index = parts.index('typ') + 1 if 'typ' in parts else 7
+            typ = parts[typ_index] if typ_index < len(parts) else 'host'
+            candidate = RTCIceCandidate(
+                component=component,
+                foundation=foundation,
+                ip=ip,
+                port=port,
+                priority=priority,
+                protocol=protocol,
+                type=typ,
+                sdpMid=data.get('sdpMid'),
+                sdpMLineIndex=data.get('sdpMLineIndex'),
+            )
+            await self._pc.addIceCandidate(candidate)
+            return True
+        except Exception as e:
+            print(f"Failed to add ICE candidate: {e}")
+            return False
 
     def push_frame(self, numpy_frame):
         try:
