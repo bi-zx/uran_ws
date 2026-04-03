@@ -1,20 +1,23 @@
 """uran_move_node — bridges UnifiedMoveCmd to px4ctrl interfaces.
 
-Supported action mappings (px4_mavros plugin, drone only):
-  action="takeoff"         → publishes TakeoffLand(TAKEOFF) to px4ctrl
-  action="land"            → publishes TakeoffLand(LAND) to px4ctrl
-  action="emergency_stop"  → publishes TakeoffLand(LAND) to px4ctrl (best-effort)
-  action="stop" / all-zero → publishes zero PositionCommand (hover in place)
-  velocity command         → publishes PositionCommand with velocity fields
+Supported action mappings (px4ctrl, drone only):
+  action="takeoff"         -> publishes TakeoffLand(TAKEOFF) to px4ctrl
+  action="land"            -> publishes TakeoffLand(LAND) to px4ctrl
+  action="emergency_stop"  -> publishes TakeoffLand(LAND) to px4ctrl
+  action="stop" / all-zero -> holds current setpoint in CMD_CTRL
+  velocity command         -> integrates a world-frame PositionCommand setpoint
 
-Coordinate convention: REP-103 ENU body frame throughout.
-px4ctrl PositionCommand uses the same ENU convention — no transform needed.
+UnifiedMoveCmd linear velocities are body-frame commands (x forward / y left /
+z up). px4ctrl, however, consumes a full world-frame position + velocity target.
+This node therefore rotates body-frame commands into the world frame using the
+latest odom yaw and integrates them into a continuous setpoint stream.
 """
 import math
 import threading
 import time
 
 import rospy
+from nav_msgs.msg import Odometry
 from uran_msgs.msg import UnifiedMoveCmd
 from quadrotor_msgs.msg import PositionCommand, TakeoffLand
 from geometry_msgs.msg import PoseStamped
@@ -23,6 +26,7 @@ from mavros_msgs.msg import RCIn
 # px4ctrl topics (from px4ctrl_node.cpp)
 _TOPIC_CMD       = '/position_cmd'   # quadrotor_msgs/PositionCommand
 _TOPIC_TKL       = '/px4ctrl/takeoff_land'   # quadrotor_msgs/TakeoffLand
+_DEFAULT_ODOM_TOPIC = '/robot/dlio/odom_node/odom'
 
 # URAN downlink topic
 _TOPIC_MOVE_CMD  = '/uran/core/downlink/move_cmd'
@@ -45,8 +49,15 @@ _CMD_TIMEOUT_S   = 0.5  # seconds before keep-alive reverts to hover
 class UranMoveNode:
     def __init__(self):
         self._lock = threading.Lock()
-        self._last_pos_cmd: PositionCommand | None = None
+        self._sp_pos: list[float] | None = None
+        self._sp_yaw: float = 0.0
+        self._sp_vel = (0.0, 0.0, 0.0)
+        self._sp_yaw_rate: float = 0.0
+        self._setpoint_time: float | None = None
+        self._last_motion_req = self._zero_motion_req()
         self._last_cmd_time: float = 0.0
+        self._odom_pos: list[float] | None = None
+        self._odom_yaw: float | None = None
 
         # px4ctrl readiness tracking
         self._px4ctrl_ready = False  # True after receiving traj_start_trigger
@@ -58,6 +69,9 @@ class UranMoveNode:
         self._rc_lock = threading.Lock()
         self._last_rc: RCIn | None = None
         rospy.Subscriber('/mavros/rc/in', RCIn, self._on_rc_in, queue_size=5)
+        odom_topic = rospy.get_param('~odom_topic', _DEFAULT_ODOM_TOPIC)
+        rospy.Subscriber(odom_topic, Odometry, self._on_odom,
+                         queue_size=20, tcp_nodelay=True)
 
         # Subscribe to traj_start_trigger — px4ctrl publishes when entering CMD_CTRL
         rospy.Subscriber('/traj_start_trigger', PoseStamped, self._on_traj_trigger, queue_size=5)
@@ -71,7 +85,8 @@ class UranMoveNode:
             rospy.Duration(1.0 / _KEEPALIVE_HZ), self._keepalive_cb
         )
 
-        rospy.loginfo('[uran_move] node started, listening on %s', _TOPIC_MOVE_CMD)
+        rospy.loginfo('[uran_move] node started, listening on %s, odom=%s',
+                      _TOPIC_MOVE_CMD, odom_topic)
 
     # ------------------------------------------------------------------
     # Subscriber callback
@@ -84,18 +99,24 @@ class UranMoveNode:
                 return
             self._px4ctrl_ready = False  # reset until traj_start_trigger received
             self._takeoff_pending = True
+            with self._lock:
+                self._reset_motion_state_locked()
             self._send_takeoff_land(TakeoffLand.TAKEOFF)
             rospy.loginfo('[uran_move] takeoff command sent, waiting for traj_start_trigger...')
             return
 
         if action in ('land', 'return_home'):
             self._px4ctrl_ready = False
+            with self._lock:
+                self._reset_motion_state_locked()
             self._send_takeoff_land(TakeoffLand.LAND)
             return
 
         if action == 'emergency_stop':
             rospy.logwarn('[uran_move] emergency_stop → triggering LAND')
             self._px4ctrl_ready = False
+            with self._lock:
+                self._reset_motion_state_locked()
             self._send_takeoff_land(TakeoffLand.LAND)
             return
 
@@ -104,12 +125,16 @@ class UranMoveNode:
             rospy.logwarn('[uran_move] velocity cmd blocked: px4ctrl not ready (send takeoff first)')
             return
 
-        # For "stop", empty action, or pure velocity commands build a
-        # PositionCommand and publish it (also updates keep-alive buffer).
-        cmd = self._build_position_cmd(msg)
         with self._lock:
-            self._last_pos_cmd = cmd
-            self._last_cmd_time = time.monotonic()
+            now = time.monotonic()
+            if not self._ensure_setpoint_locked(now):
+                rospy.logwarn_throttle(1.0, '[uran_move] velocity cmd blocked: setpoint not initialized yet')
+                return
+            self._advance_setpoint_locked(now)
+            self._last_motion_req = self._motion_req_from_msg(msg, action)
+            self._last_cmd_time = now
+            self._advance_setpoint_locked(now)
+            cmd = self._build_position_cmd_locked()
         self._pub_cmd.publish(cmd)
 
     # ------------------------------------------------------------------
@@ -119,12 +144,37 @@ class UranMoveNode:
         with self._rc_lock:
             self._last_rc = msg
 
+    def _on_odom(self, msg: Odometry):
+        yaw = self._yaw_from_quaternion(msg.pose.pose.orientation)
+        with self._lock:
+            self._odom_pos = [
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+            ]
+            self._odom_yaw = yaw
+
     def _on_traj_trigger(self, msg: PoseStamped):
         """px4ctrl publishes this when entering CMD_CTRL (ready for commands)."""
+        yaw = self._yaw_from_quaternion(msg.pose.orientation)
+        with self._lock:
+            self._sp_pos = [
+                msg.pose.position.x,
+                msg.pose.position.y,
+                msg.pose.position.z,
+            ]
+            self._sp_yaw = yaw
+            self._sp_vel = (0.0, 0.0, 0.0)
+            self._sp_yaw_rate = 0.0
+            self._setpoint_time = time.monotonic()
+            self._last_motion_req = self._zero_motion_req()
+            self._last_cmd_time = 0.0
+            cmd = self._build_position_cmd_locked()
         if self._takeoff_pending:
             rospy.loginfo('[uran_move] traj_start_trigger received, px4ctrl ready for velocity commands')
             self._takeoff_pending = False
         self._px4ctrl_ready = True
+        self._pub_cmd.publish(cmd)
 
     def _rc_preflight_ok(self) -> bool:
         with self._rc_lock:
@@ -160,24 +210,14 @@ class UranMoveNode:
         label = 'TAKEOFF' if cmd_type == TakeoffLand.TAKEOFF else 'LAND'
         rospy.loginfo('[uran_move] published %s to px4ctrl', label)
 
-    def _build_position_cmd(self, msg: UnifiedMoveCmd) -> PositionCommand:
-        """Convert UnifiedMoveCmd velocity fields to PositionCommand.
-
-        px4ctrl CMD_CTRL mode uses the velocity fields of PositionCommand;
-        position/acceleration/jerk are zeroed (not commanded).
-        Coordinate mapping (REP-103 ENU body == px4ctrl convention):
-          linear_vel_x  → velocity.x  (forward, no transform)
-          linear_vel_y  → velocity.y  (left,    no transform)
-          linear_vel_z  → velocity.z  (up,      no transform)
-          angular_vel_z → yaw_dot     (CCW positive, no transform)
-          target_yaw    → yaw         (ENU world absolute, NaN → 0.0)
-        """
+    def _motion_req_from_msg(self, msg: UnifiedMoveCmd, action: str) -> dict:
+        """Normalize a UnifiedMoveCmd into the internal motion request format."""
         vx = msg.linear_vel_x
         vy = msg.linear_vel_y
         vz = msg.linear_vel_z
 
         # Proportional clamp on combined speed
-        speed = math.sqrt(vx*vx + vy*vy + vz*vz)
+        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
         v_limit = rospy.get_param('~linear_vel_limit', 3.0)
         if speed > v_limit:
             scale = v_limit / speed
@@ -189,68 +229,161 @@ class UranMoveNode:
         ang_limit = rospy.get_param('~angular_vel_limit', 1.0)
         yaw_rate = max(-ang_limit, min(ang_limit, yaw_rate))
 
-        # target_yaw: NaN means "keep current" — pass 0.0 and rely on
-        # yaw_dot for turning; only override yaw when explicitly set.
         target_yaw = msg.target_yaw
-        if math.isnan(target_yaw):
-            target_yaw = 0.0
-            # When yaw is unspecified, zero kx[2]/kv[2] gains so px4ctrl
-            # does not drive yaw to 0; heading is controlled via yaw_dot.
-            yaw_kp = 0.0
+        if not math.isnan(target_yaw):
+            target_yaw = self._normalize_angle(target_yaw)
+
+        if action == 'stop':
+            return self._zero_motion_req()
+
+        return {
+            'body_vx': vx,
+            'body_vy': vy,
+            'vz': vz,
+            'yaw_rate': yaw_rate,
+            'target_yaw': target_yaw,
+        }
+
+    def _zero_motion_req(self) -> dict:
+        return {
+            'body_vx': 0.0,
+            'body_vy': 0.0,
+            'vz': 0.0,
+            'yaw_rate': 0.0,
+            'target_yaw': math.nan,
+        }
+
+    def _reset_motion_state_locked(self):
+        self._sp_pos = None
+        self._sp_yaw = 0.0
+        self._sp_vel = (0.0, 0.0, 0.0)
+        self._sp_yaw_rate = 0.0
+        self._setpoint_time = None
+        self._last_motion_req = self._zero_motion_req()
+        self._last_cmd_time = 0.0
+
+    def _ensure_setpoint_locked(self, now: float) -> bool:
+        if self._sp_pos is not None:
+            return True
+        if self._odom_pos is None:
+            return False
+        self._sp_pos = list(self._odom_pos)
+        self._sp_yaw = self._odom_yaw if self._odom_yaw is not None else 0.0
+        self._sp_vel = (0.0, 0.0, 0.0)
+        self._sp_yaw_rate = 0.0
+        self._setpoint_time = now
+        return True
+
+    def _advance_setpoint_locked(self, now: float):
+        if self._sp_pos is None:
+            return
+
+        if self._setpoint_time is None:
+            self._setpoint_time = now
+
+        req = self._last_motion_req
+        dt = max(0.0, now - self._setpoint_time)
+
+        heading = self._odom_yaw if self._odom_yaw is not None else self._sp_yaw
+        cos_yaw = math.cos(heading)
+        sin_yaw = math.sin(heading)
+        vx_world = cos_yaw * req['body_vx'] - sin_yaw * req['body_vy']
+        vy_world = sin_yaw * req['body_vx'] + cos_yaw * req['body_vy']
+        vz_world = req['vz']
+
+        self._sp_pos[0] += vx_world * dt
+        self._sp_pos[1] += vy_world * dt
+        self._sp_pos[2] += vz_world * dt
+
+        if math.isfinite(req['target_yaw']):
+            self._sp_yaw = req['target_yaw']
+            self._sp_yaw_rate = 0.0
         else:
-            yaw_kp = 1.0  # let px4ctrl use its default yaw gain
+            self._sp_yaw = self._normalize_angle(self._sp_yaw + req['yaw_rate'] * dt)
+            self._sp_yaw_rate = req['yaw_rate']
+
+        self._sp_vel = (vx_world, vy_world, vz_world)
+        self._setpoint_time = now
+
+    def _build_position_cmd_locked(self) -> PositionCommand:
+        if self._sp_pos is None:
+            raise RuntimeError('setpoint not initialized')
 
         cmd = PositionCommand()
         cmd.header.stamp = rospy.Time.now()
         cmd.header.frame_id = 'world'
 
-        # velocity fields
-        cmd.velocity.x = vx
-        cmd.velocity.y = vy
-        cmd.velocity.z = vz
+        cmd.position.x = self._sp_pos[0]
+        cmd.position.y = self._sp_pos[1]
+        cmd.position.z = self._sp_pos[2]
 
-        # yaw
-        cmd.yaw      = target_yaw
-        cmd.yaw_dot  = yaw_rate
+        cmd.velocity.x = self._sp_vel[0]
+        cmd.velocity.y = self._sp_vel[1]
+        cmd.velocity.z = self._sp_vel[2]
 
-        # position/accel/jerk left at zero → px4ctrl treats as velocity-only
-        # kx/kv: pass zeros to disable position hold, non-zero only for yaw
+        cmd.acceleration.x = 0.0
+        cmd.acceleration.y = 0.0
+        cmd.acceleration.z = 0.0
+        cmd.jerk.x = 0.0
+        cmd.jerk.y = 0.0
+        cmd.jerk.z = 0.0
+
+        cmd.yaw = self._sp_yaw
+        cmd.yaw_dot = self._sp_yaw_rate
+
         cmd.kx = [0.0, 0.0, 0.0]
         cmd.kv = [0.0, 0.0, 0.0]
-
         cmd.trajectory_flag = PositionCommand.TRAJECTORY_STATUS_READY
 
         return cmd
+
+    @staticmethod
+    def _yaw_from_quaternion(q) -> float:
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     # ------------------------------------------------------------------
     # Keep-alive
     # ------------------------------------------------------------------
     def _keepalive_cb(self, _event):
-        """Re-publish the last velocity setpoint so PX4 stays in OFFBOARD.
-
-        If no command has been received recently, publish a zero-velocity
-        hover command instead. Skip publishing if px4ctrl is not ready.
-        """
+        """Re-publish the current setpoint so PX4 stays in OFFBOARD."""
         # Only publish keepalive when px4ctrl is ready for commands
         if not self._px4ctrl_ready:
             return
 
         with self._lock:
-            cmd = self._last_pos_cmd
-            age = time.monotonic() - self._last_cmd_time
+            now = time.monotonic()
+            if not self._ensure_setpoint_locked(now):
+                rospy.logwarn_throttle(1.0, '[uran_move] keepalive skipped: no odom/setpoint available')
+                return
 
-        if cmd is None or age > _CMD_TIMEOUT_S:
-            # Hover: zero velocity, keep current yaw
-            hover = PositionCommand()
-            hover.header.stamp = rospy.Time.now()
-            hover.header.frame_id = 'world'
-            hover.trajectory_flag = PositionCommand.TRAJECTORY_STATUS_READY
-            hover.kx = [0.0, 0.0, 0.0]
-            hover.kv = [0.0, 0.0, 0.0]
-            self._pub_cmd.publish(hover)
-        else:
-            cmd.header.stamp = rospy.Time.now()
-            self._pub_cmd.publish(cmd)
+            if (self._last_cmd_time > 0.0 and
+                    now - self._last_cmd_time > _CMD_TIMEOUT_S and
+                    not self._is_zero_motion_locked()):
+                cutoff = self._last_cmd_time + _CMD_TIMEOUT_S
+                if self._setpoint_time is None or cutoff > self._setpoint_time:
+                    self._advance_setpoint_locked(cutoff)
+                self._last_motion_req = self._zero_motion_req()
+
+            self._advance_setpoint_locked(now)
+            cmd = self._build_position_cmd_locked()
+
+        self._pub_cmd.publish(cmd)
+
+    def _is_zero_motion_locked(self) -> bool:
+        req = self._last_motion_req
+        return (
+            abs(req['body_vx']) < 1e-6 and
+            abs(req['body_vy']) < 1e-6 and
+            abs(req['vz']) < 1e-6 and
+            abs(req['yaw_rate']) < 1e-6 and
+            not math.isfinite(req['target_yaw'])
+        )
 
 
 def main():
