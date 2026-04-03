@@ -17,11 +17,12 @@ import time
 import rospy
 from uran_msgs.msg import UnifiedMoveCmd
 from quadrotor_msgs.msg import PositionCommand, TakeoffLand
+from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import RCIn
 
 # px4ctrl topics (from px4ctrl_node.cpp)
-_TOPIC_CMD       = 'position_cmd'   # quadrotor_msgs/PositionCommand
-_TOPIC_TKL       = 'takeoff_land'   # quadrotor_msgs/TakeoffLand
+_TOPIC_CMD       = '/position_cmd'   # quadrotor_msgs/PositionCommand
+_TOPIC_TKL       = '/px4ctrl/takeoff_land'   # quadrotor_msgs/TakeoffLand
 
 # URAN downlink topic
 _TOPIC_MOVE_CMD  = '/uran/core/downlink/move_cmd'
@@ -36,6 +37,7 @@ _HIGH_LO         = 1900
 _HIGH_HI         = 2100
 
 # Keep-alive: PX4 OFFBOARD requires setpoints at >=2 Hz.
+# Keep-alive: PX4 OFFBOARD requires setpoints at >=2 Hz.
 _KEEPALIVE_HZ    = 20
 _CMD_TIMEOUT_S   = 0.5  # seconds before keep-alive reverts to hover
 
@@ -46,12 +48,19 @@ class UranMoveNode:
         self._last_pos_cmd: PositionCommand | None = None
         self._last_cmd_time: float = 0.0
 
+        # px4ctrl readiness tracking
+        self._px4ctrl_ready = False  # True after receiving traj_start_trigger
+        self._takeoff_pending = False
+
         self._pub_cmd = rospy.Publisher(_TOPIC_CMD, PositionCommand, queue_size=10)
         self._pub_tkl = rospy.Publisher(_TOPIC_TKL, TakeoffLand, queue_size=5)
 
         self._rc_lock = threading.Lock()
         self._last_rc: RCIn | None = None
         rospy.Subscriber('/mavros/rc/in', RCIn, self._on_rc_in, queue_size=5)
+
+        # Subscribe to traj_start_trigger — px4ctrl publishes when entering CMD_CTRL
+        rospy.Subscriber('/traj_start_trigger', PoseStamped, self._on_traj_trigger, queue_size=5)
 
         rospy.Subscriber(_TOPIC_MOVE_CMD, UnifiedMoveCmd, self._on_move_cmd,
                          queue_size=10, tcp_nodelay=True)
@@ -73,17 +82,26 @@ class UranMoveNode:
         if action in ('takeoff',):
             if not self._rc_preflight_ok():
                 return
+            self._px4ctrl_ready = False  # reset until traj_start_trigger received
+            self._takeoff_pending = True
             self._send_takeoff_land(TakeoffLand.TAKEOFF)
+            rospy.loginfo('[uran_move] takeoff command sent, waiting for traj_start_trigger...')
             return
 
         if action in ('land', 'return_home'):
+            self._px4ctrl_ready = False
             self._send_takeoff_land(TakeoffLand.LAND)
             return
 
         if action == 'emergency_stop':
-            # Best-effort: command land immediately.
             rospy.logwarn('[uran_move] emergency_stop → triggering LAND')
+            self._px4ctrl_ready = False
             self._send_takeoff_land(TakeoffLand.LAND)
+            return
+
+        # Block velocity commands until px4ctrl is ready (after takeoff)
+        if not self._px4ctrl_ready:
+            rospy.logwarn('[uran_move] velocity cmd blocked: px4ctrl not ready (send takeoff first)')
             return
 
         # For "stop", empty action, or pure velocity commands build a
@@ -100,6 +118,13 @@ class UranMoveNode:
     def _on_rc_in(self, msg: RCIn):
         with self._rc_lock:
             self._last_rc = msg
+
+    def _on_traj_trigger(self, msg: PoseStamped):
+        """px4ctrl publishes this when entering CMD_CTRL (ready for commands)."""
+        if self._takeoff_pending:
+            rospy.loginfo('[uran_move] traj_start_trigger received, px4ctrl ready for velocity commands')
+            self._takeoff_pending = False
+        self._px4ctrl_ready = True
 
     def _rc_preflight_ok(self) -> bool:
         with self._rc_lock:
@@ -204,8 +229,12 @@ class UranMoveNode:
         """Re-publish the last velocity setpoint so PX4 stays in OFFBOARD.
 
         If no command has been received recently, publish a zero-velocity
-        hover command instead.
+        hover command instead. Skip publishing if px4ctrl is not ready.
         """
+        # Only publish keepalive when px4ctrl is ready for commands
+        if not self._px4ctrl_ready:
+            return
+
         with self._lock:
             cmd = self._last_pos_cmd
             age = time.monotonic() - self._last_cmd_time
