@@ -9,6 +9,7 @@ from typing import Any
 import rospy
 import rospkg
 import yaml
+from sensor_msgs.msg import BatteryState
 
 from uran_msgs.msg import (
     StateField, StateSnapshot, HeartbeatStatus,
@@ -74,6 +75,7 @@ class UranCoreNode:
 
         rospy.Subscriber('/uran/core/state/write', StateField, self._cb_state_write, queue_size=10)
         rospy.Subscriber('/uran/core/uplink/data', UplinkPayload, self._cb_uplink, queue_size=10)
+        rospy.Subscriber('/mavros/battery', BatteryState, self._cb_battery, queue_size=1)
 
         rospy.Service('/uran/core/state/get', GetStateField, self._srv_state_get)
         rospy.Service('/uran/core/state/set', SetStateField, self._srv_state_set)
@@ -300,6 +302,9 @@ class UranCoreNode:
         if msg.urgent:
             rospy.logdebug('urgent StateField %s → immediate report', msg.field_name)
             self._do_state_report(trigger='change')
+
+    def _cb_battery(self, msg: BatteryState):
+        self._state.set('battery_level', round(msg.percentage * 100))
 
     def _on_state_change(self, _field_name: str, _new_value: Any):
         if self._report_on_change:
