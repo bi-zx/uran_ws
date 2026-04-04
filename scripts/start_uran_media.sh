@@ -1,9 +1,8 @@
 #!/bin/bash
-set -euo pipefail
-
-SCRIPT_DIR="$(builtin cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/load_ros_env.sh"
-
-cd "${URAN_WORKSPACE_DIR}"
-exec ros2 run uran_media uran_media_node
+set -e
+cd /SDCARD/uran_ws
+export ROS_DOMAIN_ID=42
+source /home/mi/.bashrc
+source /opt/ros2/galactic/setup.bash
+source /SDCARD/uran_ws/install/setup.bash
+ros2 run uran_media uran_media_node
