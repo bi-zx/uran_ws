@@ -44,6 +44,7 @@ class UranCoreNode(Node):
 
         self._net_cfg: dict = net_cfg_raw.get('network', {})
         self._core_cfg: dict = core_cfg_raw.get('uran_core', {})
+        mqtt_cfg = self._net_cfg.get('mqtt', {})
 
         db_path = self._core_cfg.get('db_path', '/tmp/uran_core_state.db')
         self._broadcast_ms = int(self._core_cfg.get('state_broadcast_interval_ms', 1000))
@@ -51,6 +52,9 @@ class UranCoreNode(Node):
         self._hb_ms = int(self._net_cfg.get('heartbeat_interval_ms', 5000))
         self._report_on_change = bool(self._core_cfg.get('state_report_on_change', True))
         self._change_fields = set(self._core_cfg.get('state_report_change_fields', []))
+        self._mqtt_retry_interval_s = max(float(mqtt_cfg.get('reconnect_interval_s', 5.0)), 1.0)
+        self._mqtt_connecting = False
+        self._mqtt_connect_lock = threading.Lock()
 
         # ── 状态空间 ──────────────────────────────────────────────────────
         self._state = StateManager(db_path)
@@ -101,10 +105,11 @@ class UranCoreNode(Node):
         self.create_timer(1.0, self._timer_report_check)  # T1.6: 每秒检查是否到上报周期
         self.create_timer(self._hb_ms / 1000.0, self._timer_heartbeat)
         self.create_timer(1.0, self._timer_uptime)
+        self.create_timer(self._mqtt_retry_interval_s, self._timer_mqtt_reconnect)
 
         # ── 启动 MQTT ─────────────────────────────────────────────────────
         if self._mqtt_enabled:
-            threading.Thread(target=self._mqtt_connect_thread, daemon=True).start()
+            self._start_mqtt_connect_thread()
 
         self.get_logger().info('uran_core_node started')
 
@@ -122,18 +127,50 @@ class UranCoreNode(Node):
 
     # ================================================================== MQTT 连接线程
     def _mqtt_connect_thread(self):
-        ok = self._mqtt.connect()
-        if not ok:
-            self.get_logger().error('MQTT connect failed')
+        try:
+            ok = self._mqtt.connect()
+            if not ok:
+                self._state.set('online_status', False)
+                self._update_protocol_table()
+                self.get_logger().warning(
+                    f'MQTT connect failed; will retry in {self._mqtt_retry_interval_s:.1f}s'
+                )
+                return
+
+            self.get_logger().info('MQTT connected, sending registration...')
+            result = self._mqtt.register(timeout_s=10.0)
+            self.get_logger().info(f'Registration result: {result}')
+
+            if result in ('registered', 'auto_registered'):
+                self._state.set('online_status', True)
+                self._update_protocol_table()
+                return
+
+            self._state.set('online_status', False)
+            self._update_protocol_table()
+
+            if result == 'rejected':
+                self.get_logger().error(
+                    'Registration rejected; MQTT transport stays connected but cloud link is unavailable'
+                )
+                return
+
+            self.get_logger().warning(
+                f'Registration result {result}; disconnecting and retrying in {self._mqtt_retry_interval_s:.1f}s'
+            )
+            self._mqtt.disconnect()
+        finally:
+            with self._mqtt_connect_lock:
+                self._mqtt_connecting = False
+
+    def _start_mqtt_connect_thread(self):
+        if not self._mqtt_enabled or self._mqtt.is_connected():
             return
-        self.get_logger().info('MQTT connected, sending registration...')
-        result = self._mqtt.register(timeout_s=10.0)
-        self.get_logger().info(f'Registration result: {result}')
-        if result == 'rejected':
-            self.get_logger().error('Registration rejected — node will continue without cloud link')
-            return
-        self._state.set('online_status', True)
-        self._update_protocol_table()
+        with self._mqtt_connect_lock:
+            if self._mqtt_connecting:
+                return
+            self._mqtt_connecting = True
+        threading.Thread(target=self._mqtt_connect_thread, daemon=True).start()
 
     def _update_protocol_table(self):
         table = {
@@ -377,6 +414,14 @@ class UranCoreNode(Node):
     def _timer_uptime(self):
         self._state.set('uptime_seconds', int(time.time() - self._start_ts))
 
+    def _timer_mqtt_reconnect(self):
+        if not self._mqtt_enabled:
+            return
+        if self._mqtt.is_connected():
+            return
+        self._state.set('online_status', False)
+        self._start_mqtt_connect_thread()
+
     def _do_state_report(self, trigger: str = 'periodic'):
         """构建 state_snapshot 并通过 MQTT 上报。"""
         fields = self._state.get_all()
@@ -412,7 +457,7 @@ class UranCoreNode(Node):
         if req.protocol == 'mqtt':
             if req.action == 'connect':
                 if not self._mqtt.is_connected():
-                    threading.Thread(target=self._mqtt_connect_thread, daemon=True).start()
+                    self._start_mqtt_connect_thread()
                 res.success = True
                 res.message = 'connecting'
             elif req.action == 'disconnect':
@@ -468,4 +513,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

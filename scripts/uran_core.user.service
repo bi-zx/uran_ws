@@ -1,11 +1,12 @@
 [Unit]
 Description=Uran ROS2 Core Node (User Service)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/SDCARD/uran_ws
-ExecStart=/SDCARD/uran_ws/scripts/start_uran_core.sh
+ExecStart=/bin/bash /SDCARD/uran_ws/scripts/start_uran_core.sh
 Restart=always
 RestartSec=2
 

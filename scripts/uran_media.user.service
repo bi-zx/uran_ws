@@ -6,7 +6,7 @@ Wants=uran_core.service
 [Service]
 Type=simple
 WorkingDirectory=/SDCARD/uran_ws
-ExecStart=/SDCARD/uran_ws/scripts/start_uran_media.sh
+ExecStart=/bin/bash /SDCARD/uran_ws/scripts/start_uran_media.sh
 Restart=always
 RestartSec=2
 
