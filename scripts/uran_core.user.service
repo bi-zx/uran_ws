@@ -5,6 +5,8 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/SDCARD/uran_ws
+TimeoutStartSec=150
+ExecStartPre=/bin/sleep 120
 ExecStart=/SDCARD/uran_ws/scripts/start_uran_core.sh
 Restart=always
 RestartSec=2
