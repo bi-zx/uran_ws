@@ -4,6 +4,7 @@
     <!-- Speed limits (m/s and rad/s). Match values in px4ctrl ctrl_param_fpv.yaml -->
     <param name="linear_vel_limit"  value="3.0"/>
     <param name="angular_vel_limit" value="1.0"/>
+    <param name="land_retry_delay_s" value="0.6"/>
     <param name="odom_topic" value="/robot/dlio/odom_node/odom"/>
   </node>
 </launch>

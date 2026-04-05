@@ -2,8 +2,8 @@
 
 Supported action mappings (px4ctrl, drone only):
   action="takeoff"         -> publishes TakeoffLand(TAKEOFF) to px4ctrl
-  action="land"            -> publishes TakeoffLand(LAND) to px4ctrl
-  action="emergency_stop"  -> publishes TakeoffLand(LAND) to px4ctrl
+  action="land"            -> pauses PositionCommand, then publishes TakeoffLand(LAND)
+  action="emergency_stop"  -> pauses PositionCommand, then publishes TakeoffLand(LAND)
   action="stop" / all-zero -> holds current setpoint in CMD_CTRL
   velocity command         -> integrates a world-frame PositionCommand setpoint
 
@@ -44,6 +44,7 @@ _HIGH_HI         = 2100
 # Keep-alive: PX4 OFFBOARD requires setpoints at >=2 Hz.
 _KEEPALIVE_HZ    = 20
 _CMD_TIMEOUT_S   = 0.5  # seconds before keep-alive reverts to hover
+_LAND_RETRY_DELAY_S = 0.6
 
 
 class UranMoveNode:
@@ -62,6 +63,9 @@ class UranMoveNode:
         # px4ctrl readiness tracking
         self._px4ctrl_ready = False  # True after receiving traj_start_trigger
         self._takeoff_pending = False
+        self._land_retry_delay = rospy.get_param('~land_retry_delay_s', _LAND_RETRY_DELAY_S)
+        self._land_retry_seq = 0
+        self._land_retry_timer: rospy.Timer | None = None
 
         self._pub_cmd = rospy.Publisher(_TOPIC_CMD, PositionCommand, queue_size=10)
         self._pub_tkl = rospy.Publisher(_TOPIC_TKL, TakeoffLand, queue_size=5)
@@ -95,6 +99,7 @@ class UranMoveNode:
         action = msg.action.strip().lower()
 
         if action in ('takeoff',):
+            self._cancel_pending_land()
             if not self._rc_preflight_ok():
                 return
             self._px4ctrl_ready = False  # reset until traj_start_trigger received
@@ -106,18 +111,12 @@ class UranMoveNode:
             return
 
         if action in ('land', 'return_home'):
-            self._px4ctrl_ready = False
-            with self._lock:
-                self._reset_motion_state_locked()
-            self._send_takeoff_land(TakeoffLand.LAND)
+            self._begin_delayed_land(action)
             return
 
         if action == 'emergency_stop':
             rospy.logwarn('[uran_move] emergency_stop → triggering LAND')
-            self._px4ctrl_ready = False
-            with self._lock:
-                self._reset_motion_state_locked()
-            self._send_takeoff_land(TakeoffLand.LAND)
+            self._begin_delayed_land(action)
             return
 
         # Block velocity commands until px4ctrl is ready (after takeoff)
@@ -209,6 +208,50 @@ class UranMoveNode:
         self._pub_tkl.publish(msg)
         label = 'TAKEOFF' if cmd_type == TakeoffLand.TAKEOFF else 'LAND'
         rospy.loginfo('[uran_move] published %s to px4ctrl', label)
+
+    def _begin_delayed_land(self, action: str):
+        self._px4ctrl_ready = False
+        self._takeoff_pending = False
+        timer_to_cancel = None
+        with self._lock:
+            self._reset_motion_state_locked()
+            self._land_retry_seq += 1
+            seq = self._land_retry_seq
+            timer_to_cancel = self._land_retry_timer
+            self._land_retry_timer = rospy.Timer(
+                rospy.Duration(self._land_retry_delay),
+                lambda event, seq=seq: self._delayed_land_cb(event, seq),
+                oneshot=True,
+            )
+        if timer_to_cancel is not None:
+            timer_to_cancel.shutdown()
+        rospy.loginfo(
+            '[uran_move] %s requested, pausing PositionCommand for %.2fs before LAND',
+            action,
+            self._land_retry_delay,
+        )
+
+    def _delayed_land_cb(self, _event, seq: int):
+        with self._lock:
+            if seq != self._land_retry_seq:
+                return
+            self._land_retry_timer = None
+        self._send_takeoff_land(TakeoffLand.LAND)
+        rospy.loginfo(
+            '[uran_move] delayed LAND sent after %.2fs PositionCommand quiet period',
+            self._land_retry_delay,
+        )
+
+    def _cancel_pending_land(self):
+        timer_to_cancel = None
+        with self._lock:
+            if self._land_retry_timer is None:
+                return
+            self._land_retry_seq += 1
+            timer_to_cancel = self._land_retry_timer
+            self._land_retry_timer = None
+        timer_to_cancel.shutdown()
+        rospy.loginfo('[uran_move] canceled pending delayed LAND')
 
     def _motion_req_from_msg(self, msg: UnifiedMoveCmd, action: str) -> dict:
         """Normalize a UnifiedMoveCmd into the internal motion request format."""

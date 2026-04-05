@@ -465,9 +465,9 @@ rosrun uran_move uran_move_node
 | `UnifiedMoveCmd.action` | px4ctrl 行为 |
 |---|---|
 | `takeoff` | 发布 `TakeoffLand(TAKEOFF)`（须通过起飞前 RC 检查） |
-| `land` | 发布 `TakeoffLand(LAND)` |
-| `return_home` | 发布 `TakeoffLand(LAND)`（px4ctrl 无 RTL 接口，记录警告） |
-| `emergency_stop` | 发布 `TakeoffLand(LAND)`（尽力而为） |
+| `land` | 先停止 `PositionCommand` 保活约 `0.6s`，再发布 `TakeoffLand(LAND)` |
+| `return_home` | 先停止 `PositionCommand` 保活约 `0.6s`，再发布 `TakeoffLand(LAND)`（px4ctrl 无 RTL 接口） |
+| `emergency_stop` | 先停止 `PositionCommand` 保活约 `0.6s`，再发布 `TakeoffLand(LAND)`（尽力而为） |
 | `stop` 或全零速度 | 发布零速 `PositionCommand`（原地悬停） |
 | 空串（速度指令） | 发布带速度字段的 `PositionCommand` |
 
