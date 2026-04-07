@@ -89,6 +89,8 @@ class MqttClient:
             'token': self._token,
             'timestamp_ms': int(time.time() * 1000),
         }
+        with self._lock:
+            self._registered = False
         self._reg_event.clear()
         self._reg_result = 'timeout'
         self.publish_raw(payload)
@@ -116,6 +118,10 @@ class MqttClient:
         with self._lock:
             return self._connected
 
+    def is_registered(self) -> bool:
+        with self._lock:
+            return self._registered
+
     def get_protocol_entry(self) -> dict:
         return {
             'available': self.is_connected(),
@@ -128,6 +134,7 @@ class MqttClient:
         if rc == 0:
             with self._lock:
                 self._connected = True
+                self._registered = False
             self._last_check_ts = int(time.time())
             client.subscribe(self._downlink_topic, qos=1)
             logger.info(f'MQTT connected → subscribed {self._downlink_topic}')
@@ -137,6 +144,7 @@ class MqttClient:
     def _on_disconnect(self, client, userdata, rc):
         with self._lock:
             self._connected = False
+            self._registered = False
         self._last_check_ts = int(time.time())
         logger.warning(f'MQTT disconnected rc={rc}')
 
@@ -152,6 +160,8 @@ class MqttClient:
         # 处理注册响应
         if msg_type == 'register_response':
             self._reg_result = payload.get('result', 'rejected')
+            with self._lock:
+                self._registered = self._reg_result in ('registered', 'auto_registered')
             self._reg_event.set()
             return
 

@@ -120,6 +120,79 @@ class UranCoreNode(Node):
     def _now_ns(self) -> int:
         return self.get_clock().now().nanoseconds
 
+    def _as_text(self, value: Any, default: str = '') -> str:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    def _payload_str(self, payload: Dict[str, Any], key: str, default: str = '') -> str:
+        return self._as_text(payload.get(key, default), default=default)
+
+    def _payload_int(self, payload: Dict[str, Any], key: str, default: int = 0) -> int:
+        value = payload.get(key, default)
+        if value in (None, ''):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                self.get_logger().warning(
+                    f'Invalid integer field {key}={value!r} in {self._payload_str(payload, "msg_type", "unknown")}; using {default}'
+                )
+                return default
+
+    def _payload_float(self, payload: Dict[str, Any], key: str, default: float = 0.0) -> float:
+        value = payload.get(key, default)
+        if value in (None, ''):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            self.get_logger().warning(
+                f'Invalid float field {key}={value!r} in {self._payload_str(payload, "msg_type", "unknown")}; using {default}'
+            )
+            return default
+
+    def _payload_json_str(self, payload: Dict[str, Any], key: str, default: str = '{}') -> str:
+        value = payload.get(key, default)
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value)
+        except (TypeError, ValueError):
+            self.get_logger().warning(
+                f'Invalid JSON field {key}={value!r} in {self._payload_str(payload, "msg_type", "unknown")}; using {default}'
+            )
+            return default
+
+    def _payload_dict(self, payload: Dict[str, Any], key: str) -> Dict[str, Any]:
+        value = payload.get(key)
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        self.get_logger().warning(
+            f'Invalid object field {key}={value!r} in {self._payload_str(payload, "msg_type", "unknown")}; ignoring'
+        )
+        return {}
+
+    def _payload_list(self, payload: Dict[str, Any], key: str) -> list:
+        value = payload.get(key)
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        self.get_logger().warning(
+            f'Invalid list field {key}={value!r} in {self._payload_str(payload, "msg_type", "unknown")}; ignoring'
+        )
+        return []
+
     # ================================================================== MQTT 连接线程
     def _mqtt_connect_thread(self):
         ok = self._mqtt.connect()
@@ -129,11 +202,17 @@ class UranCoreNode(Node):
         self.get_logger().info('MQTT connected, sending registration...')
         result = self._mqtt.register(timeout_s=10.0)
         self.get_logger().info(f'Registration result: {result}')
-        if result == 'rejected':
-            self.get_logger().error('Registration rejected — node will continue without cloud link')
-            return
-        self._state.set('online_status', True)
+        registered = result in ('registered', 'auto_registered')
+        self._state.set('online_status', registered)
         self._update_protocol_table()
+        if not registered:
+            if result == 'rejected':
+                self.get_logger().error('Registration rejected — node will continue without cloud link')
+            else:
+                self.get_logger().warning(
+                    f'Registration did not complete ({result}) — waiting for a valid register_response'
+                )
+            return
 
     def _update_protocol_table(self):
         table = {
@@ -151,42 +230,53 @@ class UranCoreNode(Node):
         self.executor.create_task(lambda: self._handle_downlink(payload))
 
     def _handle_downlink(self, payload: dict):
-        msg_type = payload.get('msg_type', '')
-        if msg_type == 'control_switch':
-            self._handle_control_switch(payload)
-        elif msg_type == 'move_cmd':
-            self._route_move_cmd(payload)
-        elif msg_type == 'task_ctrl':
-            self._route_task_ctrl(payload)
-        elif msg_type == 'media_ctrl':
-            self._route_media_ctrl(payload)
-        elif msg_type == 'frpc_ctrl':
-            self._route_frpc_ctrl(payload)
-        elif msg_type == 'param_update':
-            self._route_param_update(payload)
-        elif msg_type == 'state_query':
-            self._handle_state_query(payload)
-        else:
-            self.get_logger().debug(f'Unknown downlink msg_type: {msg_type}')
+        if not isinstance(payload, dict):
+            self.get_logger().warning(f'Ignoring non-dict downlink payload: {payload!r}')
+            return
+
+        msg_type = self._payload_str(payload, 'msg_type', '')
+        try:
+            if msg_type == 'control_switch':
+                self._handle_control_switch(payload)
+            elif msg_type == 'move_cmd':
+                self._route_move_cmd(payload)
+            elif msg_type == 'task_ctrl':
+                self._route_task_ctrl(payload)
+            elif msg_type == 'media_ctrl':
+                self._route_media_ctrl(payload)
+            elif msg_type == 'frpc_ctrl':
+                self._route_frpc_ctrl(payload)
+            elif msg_type == 'param_update':
+                self._route_param_update(payload)
+            elif msg_type == 'state_query':
+                self._handle_state_query(payload)
+            else:
+                self.get_logger().debug(f'Unknown downlink msg_type: {msg_type}')
+        except Exception as exc:
+            self.get_logger().error(f'Failed to handle downlink msg_type={msg_type}: {exc}')
 
     # ================================================================== T1.4 控制切换
     def _handle_control_switch(self, payload: dict):
-        sw = payload.get('switch', {})
+        sw = self._payload_dict(payload, 'switch')
         changed_mode = False
         changed_proto = False
 
         control_mode = sw.get('control_mode')
         controller = sw.get('controller')
         uplink_proto = sw.get('primary_uplink_protocol')
-        media = sw.get('media', {})
+        media = sw.get('media') or {}
+        if not isinstance(media, dict):
+            self.get_logger().warning(f'Invalid media switch payload: {media!r}; ignoring')
+            media = {}
 
         if control_mode:
-            self._state.set('control_mode', control_mode)
+            self._state.set('control_mode', self._as_text(control_mode))
             changed_mode = True
         if controller:
-            self._state.set('current_controller', controller)
+            self._state.set('current_controller', self._as_text(controller))
             changed_mode = True
         if uplink_proto:
+            uplink_proto = self._as_text(uplink_proto)
             self._state.set('primary_uplink_protocol', uplink_proto)
             changed_proto = True
 
@@ -199,8 +289,8 @@ class UranCoreNode(Node):
 
         if media.get('action'):
             msg = MediaSwitchCmd()
-            msg.action = media.get('action', '')
-            msg.protocol = media.get('protocol', '')
+            msg.action = self._as_text(media.get('action'))
+            msg.protocol = self._as_text(media.get('protocol'))
             msg.timestamp_ns = self._now_ns()
             self._pub_media.publish(msg)
 
@@ -216,56 +306,56 @@ class UranCoreNode(Node):
     # ================================================================== T1.5 下行路由
     def _route_move_cmd(self, payload: dict):
         msg = UnifiedMoveCmd()
-        msg.msg_version = payload.get('msg_version', '1.0')
-        msg.device_id = payload.get('device_id', '')
-        msg.timestamp_ns = int(payload.get('timestamp_ms', 0)) * 1_000_000
-        msg.controller = payload.get('controller', '')
-        msg.linear_vel_x = float(payload.get('linear_vel_x', 0.0))
-        msg.linear_vel_y = float(payload.get('linear_vel_y', 0.0))
-        msg.linear_vel_z = float(payload.get('linear_vel_z', 0.0))
-        msg.angular_vel_z = float(payload.get('angular_vel_z', 0.0))
-        msg.target_roll = float(payload.get('target_roll', 0.0))
-        msg.target_pitch = float(payload.get('target_pitch', 0.0))
-        msg.target_yaw = float(payload.get('target_yaw', 0.0))
-        msg.action = payload.get('action', '')
-        msg.extra_json = payload.get('extra_json', '{}')
+        msg.msg_version = self._payload_str(payload, 'msg_version', '1.0')
+        msg.device_id = self._payload_str(payload, 'device_id', '')
+        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
+        msg.controller = self._payload_str(payload, 'controller', '')
+        msg.linear_vel_x = self._payload_float(payload, 'linear_vel_x', 0.0)
+        msg.linear_vel_y = self._payload_float(payload, 'linear_vel_y', 0.0)
+        msg.linear_vel_z = self._payload_float(payload, 'linear_vel_z', 0.0)
+        msg.angular_vel_z = self._payload_float(payload, 'angular_vel_z', 0.0)
+        msg.target_roll = self._payload_float(payload, 'target_roll', 0.0)
+        msg.target_pitch = self._payload_float(payload, 'target_pitch', 0.0)
+        msg.target_yaw = self._payload_float(payload, 'target_yaw', 0.0)
+        msg.action = self._payload_str(payload, 'action', '')
+        msg.extra_json = self._payload_json_str(payload, 'extra_json', '{}')
         self._pub_move.publish(msg)
 
     def _route_task_ctrl(self, payload: dict):
         msg = TaskCtrlCmd()
-        msg.msg_version = payload.get('msg_version', '1.0')
-        msg.task_id = payload.get('task_id', '')
-        msg.action = payload.get('action', '')
-        msg.task_type = payload.get('task_type', '')
-        msg.task_params_json = payload.get('task_params_json', '{}')
-        msg.timestamp_ns = int(payload.get('timestamp_ms', 0)) * 1_000_000
+        msg.msg_version = self._payload_str(payload, 'msg_version', '1.0')
+        msg.task_id = self._payload_str(payload, 'task_id', '')
+        msg.action = self._payload_str(payload, 'action', '')
+        msg.task_type = self._payload_str(payload, 'task_type', '')
+        msg.task_params_json = self._payload_json_str(payload, 'task_params_json', '{}')
+        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
         self._pub_task.publish(msg)
 
     def _route_media_ctrl(self, payload: dict):
         msg = MediaCtrlCmd()
-        msg.action = payload.get('action', '')
-        msg.protocol = payload.get('protocol', '')
-        msg.channel_id = payload.get('channel_id', '')
-        msg.signal_json = payload.get('signal_json', '{}')
-        msg.timestamp_ns = int(payload.get('timestamp_ms', 0)) * 1_000_000
+        msg.action = self._payload_str(payload, 'action', '')
+        msg.protocol = self._payload_str(payload, 'protocol', '')
+        msg.channel_id = self._payload_str(payload, 'channel_id', '')
+        msg.signal_json = self._payload_json_str(payload, 'signal_json', '{}')
+        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
         self._pub_media_ctrl.publish(msg)
 
     def _route_frpc_ctrl(self, payload: dict):
         msg = FrpcCtrlCmd()
-        msg.action = payload.get('action', '')
-        msg.frps_host = payload.get('frps_host', '')
-        msg.frps_port = int(payload.get('frps_port', 0))
-        msg.service_name = payload.get('service_name', '')
-        msg.local_port = int(payload.get('local_port', 0))
-        msg.remote_port = int(payload.get('remote_port', 0))
-        msg.auth_token = payload.get('auth_token', '')
-        msg.timestamp_ns = int(payload.get('timestamp_ms', 0)) * 1_000_000
+        msg.action = self._payload_str(payload, 'action', '')
+        msg.frps_host = self._payload_str(payload, 'frps_host', '')
+        msg.frps_port = self._payload_int(payload, 'frps_port', 0)
+        msg.service_name = self._payload_str(payload, 'service_name', '')
+        msg.local_port = self._payload_int(payload, 'local_port', 0)
+        msg.remote_port = self._payload_int(payload, 'remote_port', 0)
+        msg.auth_token = self._payload_str(payload, 'auth_token', '')
+        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
         self._pub_frpc.publish(msg)
 
     def _route_param_update(self, payload: dict):
         msg = ParamUpdateCmd()
-        msg.params_json = payload.get('params_json', '{}')
-        msg.timestamp_ns = int(payload.get('timestamp_ms', 0)) * 1_000_000
+        msg.params_json = self._payload_json_str(payload, 'params_json', '{}')
+        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
         self._pub_param.publish(msg)
         # 同时更新本地状态空间
         try:
@@ -276,7 +366,7 @@ class UranCoreNode(Node):
             pass
 
     def _handle_state_query(self, payload: dict):
-        field_names = payload.get('field_names', [])
+        field_names = self._payload_list(payload, 'field_names')
         if field_names:
             fields = self._state.get_fields(field_names)
         else:
@@ -347,12 +437,14 @@ class UranCoreNode(Node):
         """发送心跳包并发布 HeartbeatStatus。"""
         self._update_protocol_table()
         connected = self._mqtt.is_connected()
+        registered = self._mqtt.is_registered()
+        self._state.set('online_status', registered)
         hb = {
             'msg_type': 'heartbeat',
             'msg_version': '1.0',
             'device_id': self._state.get('device_id'),
             'timestamp_ms': int(time.time() * 1000),
-            'online': connected,
+            'online': registered,
             'uptime_seconds': int(self._state.get('uptime_seconds') or 0),
             'battery_level': self._state.get('battery_level') or 0.0,
             'control_mode': self._state.get('control_mode') or 'manual',
@@ -468,4 +560,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
