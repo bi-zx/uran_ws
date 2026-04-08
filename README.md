@@ -85,6 +85,74 @@ roslaunch uran_core uran_core.launch
 rosrun uran_media uran_media_node
 ```
 
+## 开机自启
+
+如果要在设备开机后自动拉起以下节点：
+
+```bash
+roslaunch realsense2_camera rs_camera.launch
+roslaunch mavros px4_THS1.launch
+roslaunch livox_ros_driver2 msg_MID360.launch
+roslaunch direct_lidar_inertial_odometry dlio.launch
+roslaunch uran_core uran_core.launch
+rosrun uran_media uran_media_node
+rosrun uran_move uran_move_node
+```
+
+推荐做法是：
+
+1. 用一个总 launch 文件统一收口启动项。
+2. 用一个 shell 脚本统一加载 ROS 环境和 overlay 工作区。
+3. 用 `systemd` 在开机时启动这个脚本。
+
+仓库中已提供：
+
+- 总 launch: `src/uran_core/launch/uran_autostart.launch`
+- 启动脚本: `scripts/start_uran_autostart.sh`
+- `systemd` 模板: `systemd/uran-autostart.service`
+
+### 1. 先手动验证
+
+```bash
+cd ~/uran_ws
+chmod +x scripts/start_uran_autostart.sh
+./scripts/start_uran_autostart.sh
+```
+
+说明：
+
+- 脚本会自动 `source /opt/ros/noetic/setup.bash`
+- 脚本会优先额外 `source /home/jetson/catkin_pkg/devel/setup.bash`
+- 最后再 `source ~/uran_ws/devel/setup.bash`
+
+如果你的 `realsense2_camera` 或其他外部包不在 `~/catkin_pkg`，请修改环境变量 `EXTRA_SETUP_FILES`，或直接修改 `scripts/start_uran_autostart.sh` / `systemd/uran-autostart.service` 中的路径。
+
+### 2. 安装为 systemd 服务
+
+```bash
+sudo chmod +x ~/uran_ws/scripts/start_uran_autostart.sh
+sudo cp ~/uran_ws/systemd/uran-autostart.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable uran-autostart.service
+sudo systemctl start uran-autostart.service
+```
+
+### 3. 查看状态和日志
+
+```bash
+systemctl status uran-autostart.service
+journalctl -u uran-autostart.service -f
+```
+
+### 4. 修改启动用户或工作区路径
+
+如果不是 `jetson` 用户，或工作区不在 `~/uran_ws`，请先修改：
+
+- `systemd/uran-autostart.service` 中的 `User=`
+- `systemd/uran-autostart.service` 中的 `WorkingDirectory=`
+- `systemd/uran-autostart.service` 中的 `WORKSPACE_DIR=`
+- `systemd/uran-autostart.service` 中的 `EXTRA_SETUP_FILES=`
+
 ---
 
 ## 软件包结构

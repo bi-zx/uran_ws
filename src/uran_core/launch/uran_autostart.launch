@@ -1,0 +1,32 @@
+<launch>
+  <arg name="start_realsense" default="true" />
+  <arg name="start_mavros" default="true" />
+  <arg name="start_livox" default="true" />
+  <arg name="start_dlio" default="true" />
+  <arg name="start_uran_core" default="true" />
+  <arg name="start_uran_media" default="true" />
+  <arg name="start_uran_move" default="true" />
+
+  <include if="$(arg start_realsense)"
+           file="$(find realsense2_camera)/launch/rs_camera.launch" />
+
+  <include if="$(arg start_mavros)"
+           file="$(find mavros)/launch/px4_THS1.launch">
+    <arg name="respawn_mavros" value="true" />
+  </include>
+
+  <include if="$(arg start_livox)"
+           file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+
+  <include if="$(arg start_dlio)"
+           file="$(find direct_lidar_inertial_odometry)/launch/dlio.launch" />
+
+  <include if="$(arg start_uran_core)"
+           file="$(find uran_core)/launch/uran_core.launch" />
+
+  <include if="$(arg start_uran_media)"
+           file="$(find uran_media)/launch/uran_media.launch" />
+
+  <include if="$(arg start_uran_move)"
+           file="$(find uran_move)/launch/uran_move.launch" />
+</launch>

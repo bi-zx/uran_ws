@@ -1,0 +1,23 @@
+[Unit]
+Description=URAN ROS autostart stack
+After=network-online.target time-sync.target systemd-udev-settle.service
+Wants=network-online.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=jetson
+SupplementaryGroups=dialout tty
+WorkingDirectory=/home/jetson/uran_ws
+Environment=WORKSPACE_DIR=/home/jetson/uran_ws
+Environment=ROS_DISTRO=noetic
+Environment=EXTRA_SETUP_FILES=/home/jetson/catkin_pkg/devel/setup.bash
+Environment=ROS_HOME=/tmp/ros_home
+Environment=ROS_LOG_DIR=/tmp/ros_home/log
+ExecStart=/home/jetson/uran_ws/scripts/start_uran_autostart.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
