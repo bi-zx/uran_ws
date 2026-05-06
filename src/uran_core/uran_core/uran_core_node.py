@@ -145,6 +145,16 @@ class UranCoreNode(Node):
                 )
                 return default
 
+    def _payload_timestamp_ns(self, payload: Dict[str, Any], *, default: int = 0) -> int:
+        """Read timestamp_ns first and fall back to legacy timestamp_ms."""
+        timestamp_ns = self._payload_int(payload, 'timestamp_ns', 0)
+        if timestamp_ns > 0:
+            return timestamp_ns
+        timestamp_ms = self._payload_int(payload, 'timestamp_ms', 0)
+        if timestamp_ms > 0:
+            return timestamp_ms * 1_000_000
+        return int(default)
+
     def _payload_float(self, payload: Dict[str, Any], key: str, default: float = 0.0) -> float:
         value = payload.get(key, default)
         if value in (None, ''):
@@ -192,6 +202,16 @@ class UranCoreNode(Node):
             f'Invalid list field {key}={value!r} in {self._payload_str(payload, "msg_type", "unknown")}; ignoring'
         )
         return []
+
+    def _json_value_from_str(self, raw: str) -> Any:
+        if raw in (None, ''):
+            return {}
+        if not isinstance(raw, str):
+            return raw
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
 
     # ================================================================== MQTT 连接线程
     def _mqtt_connect_thread(self):
@@ -308,7 +328,7 @@ class UranCoreNode(Node):
         msg = UnifiedMoveCmd()
         msg.msg_version = self._payload_str(payload, 'msg_version', '1.0')
         msg.device_id = self._payload_str(payload, 'device_id', '')
-        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
+        msg.timestamp_ns = self._payload_timestamp_ns(payload)
         msg.controller = self._payload_str(payload, 'controller', '')
         msg.linear_vel_x = self._payload_float(payload, 'linear_vel_x', 0.0)
         msg.linear_vel_y = self._payload_float(payload, 'linear_vel_y', 0.0)
@@ -328,7 +348,7 @@ class UranCoreNode(Node):
         msg.action = self._payload_str(payload, 'action', '')
         msg.task_type = self._payload_str(payload, 'task_type', '')
         msg.task_params_json = self._payload_json_str(payload, 'task_params_json', '{}')
-        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
+        msg.timestamp_ns = self._payload_timestamp_ns(payload)
         self._pub_task.publish(msg)
 
     def _route_media_ctrl(self, payload: dict):
@@ -337,7 +357,7 @@ class UranCoreNode(Node):
         msg.protocol = self._payload_str(payload, 'protocol', '')
         msg.channel_id = self._payload_str(payload, 'channel_id', '')
         msg.signal_json = self._payload_json_str(payload, 'signal_json', '{}')
-        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
+        msg.timestamp_ns = self._payload_timestamp_ns(payload)
         self._pub_media_ctrl.publish(msg)
 
     def _route_frpc_ctrl(self, payload: dict):
@@ -349,13 +369,13 @@ class UranCoreNode(Node):
         msg.local_port = self._payload_int(payload, 'local_port', 0)
         msg.remote_port = self._payload_int(payload, 'remote_port', 0)
         msg.auth_token = self._payload_str(payload, 'auth_token', '')
-        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
+        msg.timestamp_ns = self._payload_timestamp_ns(payload)
         self._pub_frpc.publish(msg)
 
     def _route_param_update(self, payload: dict):
         msg = ParamUpdateCmd()
         msg.params_json = self._payload_json_str(payload, 'params_json', '{}')
-        msg.timestamp_ns = self._payload_int(payload, 'timestamp_ms', 0) * 1_000_000
+        msg.timestamp_ns = self._payload_timestamp_ns(payload)
         self._pub_param.publish(msg)
         # 同时更新本地状态空间
         try:
@@ -385,6 +405,7 @@ class UranCoreNode(Node):
         """功能包通过 /uran/core/uplink/data 上报数据，转发至 MQTT。"""
         preferred = msg.preferred_protocol or self._state.get('primary_uplink_protocol') or 'mqtt'
         # 当前仅实现 MQTT 通路；后续可按 preferred 选择协议
+        payload_value = self._json_value_from_str(msg.payload_json)
         payload = {
             'msg_type': 'uplink_data',
             'msg_version': '1.0',
@@ -392,8 +413,11 @@ class UranCoreNode(Node):
             'source_pkg': msg.source_pkg,
             'data_type': msg.data_type,
             'timestamp_ns': msg.timestamp_ns,
-            'payload': msg.payload_json,
+            'payload': payload_value,
+            'payload_json': msg.payload_json,
         }
+        if preferred:
+            payload['preferred_protocol'] = preferred
         ok = self._mqtt.publish_uplink(payload)
         if not ok and msg.urgent:
             # urgent 数据：枚举所有可用通路重试（当前仅 MQTT）

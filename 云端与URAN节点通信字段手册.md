@@ -222,6 +222,9 @@
 | `task_params_json` | string | 任务参数 JSON |
 | `timestamp_ns` | uint64 | 纳秒时间戳 |
 
+兼容说明：URAN-core 优先读取 `timestamp_ns`。如果旧总后台只发送
+`timestamp_ms`，URAN-core 会自动换算为纳秒后再发布到 ROS 端。
+
 **航点任务参数示例（task_type="waypoint"）**：
 
 ```json
@@ -258,6 +261,99 @@
 | `speed_mps` | float | 速度（m/s） |
 | `hover_time_s` | int | 悬停时间（秒） |
 | `actions` | string[] | 到达后执行的动作列表 |
+
+**室外规划任务参数示例（task_type="mission_planner_route"）**：
+
+`mission_planner` 发给总后台、总后台再下发给 URAN 端时，建议使用该结构。
+该结构同时包含地图相对坐标、经纬度和高度字段。地面设备可以只使用
+`map.x/map.y` 与 `geo.lat/geo.lon`，空中设备可以继续使用 `alt`。
+
+```json
+{
+  "schema_version": "1.1.0",
+  "task_type": "mission_planner_route",
+  "task_id": "mp_task_001",
+  "planner_result_id": "interactive_plan_xxx",
+  "scene_name": "campus_outdoor",
+  "robot": {
+    "planning_slot_id": "slot_01",
+    "hardware_id": "cyberdog2_01",
+    "display_name": "机器狗 1"
+  },
+  "coordinate_system": {
+    "local": {
+      "frame_id": "mission_planner_local_xz",
+      "projection_origin": {
+        "lat": 38.888235,
+        "lon": 115.508
+      }
+    },
+    "ros_map": {
+      "frame_id": "map",
+      "x_from": "local.x",
+      "y_from": "local.z"
+    }
+  },
+  "execution": {
+    "position_tolerance_m": 10.0,
+    "min_segment_m": 2.0,
+    "max_segment_m": 12.0,
+    "gps_jump_reject_m": 15.0,
+    "min_gps_fix_type": 2,
+    "calibrate_at_nav_points": true
+  },
+  "route": {
+    "route_nav_point_ids": ["NP_001"],
+    "route_nav_points": [],
+    "points": [
+      {
+        "seq": 0,
+        "point_id": "start_slot_01",
+        "kind": "start",
+        "source": {"type": "robot_start", "id": "start_slot_01"},
+        "local": {"x": 0.0, "z": 0.0},
+        "map": {"frame_id": "map", "x": 0.0, "y": 0.0, "z": 0.0},
+        "geo": {"lat": 38.888235, "lon": 115.508, "alt": 0.0},
+        "tolerance_m": 10.0
+      },
+      {
+        "seq": 1,
+        "point_id": "turn_001",
+        "kind": "transit",
+        "source": {"type": "route_graph_node", "id": "turn_001"},
+        "local": {"x": 8.0, "z": 3.0},
+        "map": {"frame_id": "map", "x": 8.0, "y": 3.0, "z": 0.0},
+        "geo": {"lat": 38.888250, "lon": 115.508050, "alt": 0.0},
+        "tolerance_m": 10.0
+      },
+      {
+        "seq": 2,
+        "point_id": "NP_001",
+        "kind": "calibration",
+        "source": {"type": "nav_point", "id": "NP_001"},
+        "local": {"x": 12.0, "z": 5.0},
+        "map": {"frame_id": "map", "x": 12.0, "y": 5.0, "z": 0.0},
+        "geo": {"lat": 38.888270, "lon": 115.508080, "alt": 0.0},
+        "tolerance_m": 10.0
+      }
+    ]
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `schema_version` | string | 任务包结构版本，当前建议 `"1.1.0"` |
+| `task_type` | string | 固定为 `"mission_planner_route"` |
+| `robot.hardware_id` | string | 真实设备 ID，用于多机器人任务中选择路线 |
+| `coordinate_system.local.projection_origin` | object | mission_planner 本地坐标投影原点 |
+| `coordinate_system.ros_map.frame_id` | string | ROS 导航目标 frame，机器狗当前使用 `"map"` |
+| `execution.position_tolerance_m` | float | 到点容差，室外机器狗第一版建议 10m |
+| `execution.max_segment_m` | float | 路线重采样最大段长，用于生成更细的导航点 |
+| `route.points[]` | array | 已排序的执行点序列 |
+| `route.points[].kind` | string | `"start"` / `"transit"` / `"calibration"` / `"inspection"` / `"home"` |
+| `route.points[].map` | object | ROS map 坐标，`x/y/z` 均为米 |
+| `route.points[].geo` | object | WGS84 经纬度和高度，`lat/lon/alt` |
 
 ---
 
@@ -350,6 +446,7 @@
 | `cyberdog2_motion_abnormal` | motion_status 异常时 | MQTT | CyberDog2 运动状态异常 |
 | `plugin_switch_event` | 运行时切换插件后 | MQTT | 插件切换事件 |
 | `failsafe_event` | 失控保护触发/恢复 | MQTT | 失控保护事件 |
+| `robot_pose` | 默认 1s/次 | MQTT | 机器人当前位置，供总后台实时渲染 |
 | `task_progress` | 任务执行中实时 | MQTT | 任务进度与事件 |
 | `media_signal` | 信令交互时 | WebSocket / MQTT | 流媒体信令 |
 | `media_upload` | 弱网恢复后 | HTTP / WebSocket | 本地录制文件切片上传 |
@@ -365,6 +462,26 @@ payload_json        # JSON 序列化的数据体（string）
 urgent              # 是否紧急（bool）
 timestamp_ns        # 纳秒时间戳（uint64）
 ```
+
+URAN-core 转发到 MQTT 时会封装为：
+
+```json
+{
+  "msg_type": "uplink_data",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "source_pkg": "uran_autotask",
+  "data_type": "robot_pose",
+  "timestamp_ns": 1741564800000000000,
+  "preferred_protocol": "mqtt",
+  "payload": {},
+  "payload_json": "{}"
+}
+```
+
+其中 `payload` 是 URAN-core 对 `payload_json` 解析后的 JSON 对象或数组。
+如果 `payload_json` 不是合法 JSON，`payload` 会保留为原字符串。
+`payload_json` 会同时保留，用于兼容旧总后台或排查问题。
 
 ---
 
@@ -619,7 +736,70 @@ timestamp_ns        # 纳秒时间戳（uint64）
 
 ---
 
-### 3.8 任务进度上报（task_progress）
+### 3.8 机器人位置上报（robot_pose）
+
+`uran_autotask` 默认每 1 秒上报一次。总后台前端实时渲染机器狗位置时，
+应消费 `data_type="robot_pose"` 的上行包。
+
+```json
+{
+  "schema_version": 1,
+  "robot_id": "cyberdog2_01",
+  "coordinate_system": "WGS84",
+  "position": {
+    "available": true,
+    "fusion_state": "raw_gps",
+    "lat": 38.888235,
+    "lon": 115.508,
+    "alt": 0.0,
+    "fix_type": 2,
+    "num_sv": 10,
+    "timestamp_ns": 1741564800000000000,
+    "map_pose": {},
+    "visual_pose": {},
+    "alignment": {}
+  },
+  "control_mode": "auto",
+  "controller": "cloud",
+  "battery_level": 80.0,
+  "task_id": "mp_task_001",
+  "task_stage": "executing",
+  "task_status": "normal",
+  "timestamp_ns": 1741564800000000000
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `schema_version` | int | 当前位置包版本，当前为 1 |
+| `robot_id` | string | 机器人 ID，可为空；总后台也可按 MQTT device_id 关联 |
+| `coordinate_system` | string | 当前固定为 `"WGS84"` |
+| `position.available` | bool | 是否有可用位置 |
+| `position.fusion_state` | string | `"aligned_map_pose"` / `"raw_gps"` / `"local_odom_dead_reckoning"` / `"unavailable"` |
+| `position.lat` | float | 纬度 |
+| `position.lon` | float | 经度 |
+| `position.alt` | float | 高度，当前保留接口，机器狗第一版可为 0 |
+| `position.fix_type` | int | GPS 定位质量，沿用 CyberDog GPS 消息 |
+| `position.num_sv` | int | 可用卫星数量，沿用 CyberDog GPS 消息 |
+| `position.map_pose` | object | 当前 map 坐标位姿，用于调试对齐 |
+| `position.visual_pose` | object | 当前本地里程计位姿。历史字段名叫 visual，实际可来自腿式里程计、视觉里程计、融合里程计或 TF |
+| `position.alignment` | object | GPS/map 稳定偏移估计 |
+| `task_id` | string | 当前任务 ID，空串表示无任务 |
+| `task_stage` | string | 当前任务阶段 |
+| `task_status` | string | 当前任务状态 |
+
+`fusion_state` 含义：
+
+| 值 | 说明 |
+|----|------|
+| `aligned_map_pose` | GPS-map 偏移稳定，使用 map 位姿加偏移后反投影为经纬度 |
+| `raw_gps` | 偏移尚不稳定，直接上报原始 GPS |
+| `local_odom_dead_reckoning` | GPS 短时过期，使用最后一次可靠 GPS 加本地里程计增量外推经纬度 |
+| `unavailable` | 当前没有可用定位源 |
+
+---
+
+### 3.9 任务进度上报（task_progress）
 
 **正常进度**：
 
@@ -677,7 +857,7 @@ timestamp_ns        # 纳秒时间戳（uint64）
 
 ---
 
-### 3.9 失控保护事件（failsafe_event）
+### 3.10 失控保护事件（failsafe_event）
 
 ```json
 {

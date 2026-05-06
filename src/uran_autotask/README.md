@@ -21,6 +21,10 @@ uran_autotask -> /uran/core/uplink/data -> uran_core -> 总后台
 
 总后台前端实时渲染机器狗位置时，应消费总后台收到的 `robot_pose` 上行包，而不是访问机器狗上的本地网页。
 
+`uran_autotask` 不直接集成 MQTT 客户端。MQTT 连接、注册、下行路由和上行转发
+统一由 `uran_core` 负责。`uran_autotask` 只使用下面列出的 ROS 话题与
+`uran_core` 通信。
+
 ## 主要 Topic
 
 下行任务：
@@ -43,6 +47,47 @@ uran_msgs/msg/UplinkPayload
 /uran/autotask/status
 uran_srvs/srv/GetTaskStatus
 ```
+
+## 总后台 MQTT 包边界
+
+总后台下发任务时，仍然发给 `uran_core` 的 MQTT 下行 topic。顶层
+`msg_type` 必须是 `task_ctrl`：
+
+```json
+{
+  "msg_type": "task_ctrl",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "task_id": "mp_task_001",
+  "action": "start",
+  "task_type": "mission_planner_route",
+  "task_params_json": "{\"schema_version\":\"1.1.0\",\"task_type\":\"mission_planner_route\",\"route\":{\"points\":[]}}",
+  "timestamp_ns": 1741564800000000000
+}
+```
+
+`uran_core` 会把该 MQTT 包转换为 `uran_msgs/msg/TaskCtrlCmd` 并发布到
+`/uran/core/downlink/task_ctrl`。`timestamp_ns` 是推荐字段；如果旧总后台只发
+`timestamp_ms`，`uran_core` 会兼容换算。
+
+`uran_autotask` 上报时发布 `uran_msgs/msg/UplinkPayload`。`uran_core` 转成
+MQTT 后，顶层包形如：
+
+```json
+{
+  "msg_type": "uplink_data",
+  "msg_version": "1.0",
+  "device_id": "device_001",
+  "source_pkg": "uran_autotask",
+  "data_type": "robot_pose",
+  "timestamp_ns": 1741564800000000000,
+  "preferred_protocol": "mqtt",
+  "payload": {},
+  "payload_json": "{}"
+}
+```
+
+总后台新逻辑应优先读取 `payload` 对象；`payload_json` 保留用于兼容和排查。
 
 ## robot_pose 上行包
 
