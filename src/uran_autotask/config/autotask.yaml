@@ -1,0 +1,141 @@
+uran_autotask:
+  loop_interval_s: 0.5
+  progress_report_interval_s: 2.0
+  require_auto_mode: true
+
+  # 经纬度任务点要先投影到 Nav2 的 map 坐标系。
+  # 这里先用单锚点方案，适合第一版落地。
+  geo_reference:
+    enabled: false
+    frame_id: "map"
+    reference_lat: 0.0
+    reference_lon: 0.0
+    map_origin_x: 0.0
+    map_origin_y: 0.0
+    # map x 轴相对 ENU-East 的逆时针角度。
+    map_yaw_deg: 0.0
+    scale: 1.0
+
+  mission_defaults:
+    map_name: ""
+    outdoor: false
+    localization_source: "laser"
+    loop_closure_source: "gps"
+    heading_mode: "true_north_deg"
+
+  outdoor_goal_resolver:
+    enabled: true
+    # 第一版没有直接读取室外代价地图，所以不假装判断“墙在哪里”。
+    # 它会按路线切线生成候选目标点；Nav2 失败后再逐个候选点重试。
+    strategy: "route_tangent_offsets"
+    max_attempts_per_point: 7
+    search_radii_m: [0.0, 2.0, 5.0, 10.0]
+    dedupe_epsilon_m: 0.1
+    skip_unreachable_transit: true
+    skip_unreachable_nav_points: false
+
+  outdoor_pose_aligner:
+    enabled: true
+    # 第一阶段只估计 GPS 投影点与 Nav2 map 位姿之间的稳定偏移。
+    # 暂不自动改目标点，避免未验证前把路径修偏。
+    window_size: 8
+    min_fix_type: 2
+    min_num_sv: 0
+    jump_reject_m: 15.0
+    visual_support_ratio: 0.5
+    min_stable_samples: 2
+    max_stable_std_m: 5.0
+    enable_goal_correction: true
+    max_goal_correction_m: 10.0
+
+  pose_report:
+    enabled: true
+    # ROS 端通过 /uran/core/uplink/data 周期上报当前位置，由 uran_core 转发总后台。
+    interval_s: 1.0
+    data_type: "robot_pose"
+    robot_id: ""
+    map_pose_topic: "dog_pose"
+    map_pose_message_type: "auto"
+    gps_stale_timeout_s: 3.0
+    max_visual_pose_age_s: 2.0
+    max_time_alignment_error_s: 0.3
+    dead_reckoning:
+      enabled: true
+      # GPS 短时丢失时，使用“最后一次可靠 GPS + 本地里程计增量”外推经纬度。
+      # 本地里程计可以是视觉里程计、腿式里程计、融合里程计或 TF。
+      # 这不是完整卡尔曼滤波，只是第一版保底定位。
+      max_age_s: 30.0
+      require_map_pose_anchor: true
+      allow_unrotated_visual_fallback: false
+      min_fix_type: 2
+      min_num_sv: 0
+    filter:
+      # 长期替换为卡尔曼滤波的配置入口。现在保持关闭，避免没有现场噪声数据时过度自信。
+      enabled: false
+      mode: "none"
+      process_noise_m2: 1.0
+      gps_noise_m2: 25.0
+      visual_odom_noise_m2: 4.0
+    altitude:
+      # CyberDog protocol/GpsPayload 当前只有经纬度，没有高度字段。
+      # 这里先保留接口，后续接入气压计、RTK 或三维地图高度后再启用。
+      enabled: false
+      source: "none"
+
+  cyberdog_backend:
+    enabled: true
+    # 参考 uran_move 的 namespace 配法。
+    # 可通过 `ros2 action list | grep start_algo_task` 查看完整路径。
+    namespace: "auto"
+    start_action_name: "start_algo_task"
+    stop_service_name: "stop_algo_task"
+    status_service_name: "algo_task_status"
+    ready_timeout_s: 5.0
+    status_poll_interval_s: 1.0
+
+  gps_monitor:
+    enabled: false
+    gps_topic: "gps_payload"
+    # 当前位姿上报保持走设备现有“当前机器人位姿”通道。
+    map_pose_topic: "dog_pose"
+    map_pose_message_type: "auto"
+    pose_enable_topic: "pose_enable"
+    auto_enable_map_pose_reporting: false
+    min_fix_type: 2
+    check_interval_s: 3.0
+    max_pose_error_m: 15.0
+    violation_count_threshold: 2
+    on_large_error: "pause"
+
+  visual_pose_monitor:
+    enabled: true
+    # 历史名称仍叫 visual_pose_monitor，但实际表示“本地里程计监督”。
+    # 它可以接视觉里程计、腿式里程计、融合里程计或 TF。
+    # 这里默认留空，运行时会优先尝试自动探测：
+    # odometry -> pose_filtered -> mivins 候选 -> odom_out。
+    # 如果现场系统有明确自定义话题，再手工填这里覆盖自动探测。
+    pose_topic: ""
+    pose_message_type: "auto"
+    tf_fallback:
+      enabled: true
+      target_frame: "map"
+      source_frame: "base_link"
+    check_interval_s: 1.5
+    max_pose_error_m: 1.5
+    max_yaw_error_deg: 20.0
+    violation_count_threshold: 2
+    on_large_error: "pause"
+
+  camera_capture:
+    enabled: true
+    namespace: ""
+    prefer_take_photo_service: false
+    take_photo_service_name: "take_photo"
+    camera_service_name: "camera_service"
+    ready_timeout_s: 5.0
+    width: 1280
+    height: 960
+    fps: 10
+
+  media_actions:
+    record_channel_id: "cyberdog_main"

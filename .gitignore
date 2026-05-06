@@ -40,6 +40,8 @@ CMakeLists.txt.user
 srv/_*.py
 *.pcd
 *.pyc
+__pycache__/
+.pytest_cache/
 qtcreator-*
 *.user
 
