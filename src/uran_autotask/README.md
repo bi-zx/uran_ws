@@ -162,8 +162,10 @@ ros2 topic info -v /<namespace>/gps_payload
 ros2 topic echo /<namespace>/gps_payload
 ros2 topic list | grep -Ei 'dog_pose|odom|mivins|vio|vins|visual'
 ros2 topic info -v /<namespace>/dog_pose
+ros2 topic info -v /<namespace>/pose_filtered
+ros2 topic info -v /<namespace>/odom_out
 ros2 topic hz /<namespace>/gps_payload
-ros2 topic hz /<namespace>/dog_pose
+ros2 topic hz /<namespace>/odom_out
 ```
 
 如果自动探测不到本地里程计，还需要对候选话题分别执行：
@@ -174,4 +176,13 @@ ros2 topic echo /<namespace>/<local_odom_topic>
 ros2 topic hz /<namespace>/<local_odom_topic>
 ```
 
-当前默认候选本地里程计话题为 `odometry`、`pose_filtered`、`odom_slam`、`mivins/odometry`、`mivins/imuodom_slam`、`mivins/reloc_odom`、`odom_out`。其中你已经在实机上确认 `/odom_out` 是腿式里程计，类型为 `nav_msgs/msg/Odometry`，频率约 43-45 Hz。最终以真机 `ros2 topic info -v` 的结果为准。
+当前默认候选本地里程计话题优先级为 `odom_out`、`odometry`、`pose_filtered`、`odom_slam`、`mivins/odometry`、`mivins/imuodom_slam`、`mivins/reloc_odom`。其中你已经在实机上确认 `/odom_out` 是腿式里程计，类型为 `nav_msgs/msg/Odometry`，频率约 43-45 Hz。
+
+当前实机结论：
+
+- `/dog_pose` 的类型是 `geometry_msgs/msg/PoseStamped`，但发布者数量为 0，所以不能作为默认全局位姿输入。
+- `/pose_filtered` 的类型是 `geometry_msgs/msg/PoseStamped`，发布端是 `BEST_EFFORT`。节点会按发布端服务质量策略兼容订阅，但如果 `ros2 topic echo` 没有输出，它仍然不能提供实际位姿。
+- `/odom_out` 的类型是 `nav_msgs/msg/Odometry`，当前可稳定输出腿式里程计，适合作为第一版本地连续运动输入。
+- `/gps_payload` 连通不等于 GPS 有效。`fix_type: 0`、`num_sv: 0`、`lat/lon: 0.0` 表示当前没有可用 GPS 定位，`uran_autotask` 不会把它上报为有效经纬度。
+
+全局 `map_pose` 默认先尝试真实位姿话题；如果没有可用发布者，会读取 TF 的 `map -> base_link` 作为回退。这个回退依赖机器狗系统实际发布 `/tf`。

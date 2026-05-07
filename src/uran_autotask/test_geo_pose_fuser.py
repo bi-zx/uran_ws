@@ -37,6 +37,28 @@ def test_fuser_reports_raw_gps_when_gps_is_fresh():
     assert result['lon'] == 116.0
 
 
+def test_fuser_rejects_invalid_fresh_gps():
+    registry = PoseRegistry()
+    registry.update_gps_payload(
+        lat=0.0,
+        lon=0.0,
+        fix_type=0,
+        num_sv=0,
+        timestamp_ns=1_000_000_000,
+    )
+    fuser = GeoPoseFuser({'gps_stale_timeout_s': 3.0})
+
+    result = fuser.fuse(
+        pose_registry=registry,
+        projector=_projector(),
+        alignment_state={},
+        timestamp_ns=2_000_000_000,
+    )
+
+    assert result['available'] is False
+    assert result['fusion_state'] == 'unavailable'
+
+
 def test_fuser_dead_reckons_from_map_pose_after_gps_is_stale():
     registry = PoseRegistry()
     registry.update_gps_payload(

@@ -9,6 +9,7 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -93,6 +94,17 @@ def _message_timestamp_ns(msg, fallback_ns: int = 0) -> int:
     return int(fallback_ns)
 
 
+_POSE_KIND_TO_TOPIC_TYPE = {
+    'pose_stamped': 'geometry_msgs/msg/PoseStamped',
+    'odometry': 'nav_msgs/msg/Odometry',
+    'se3_pose': 'motion_msgs/msg/SE3Pose',
+}
+
+_POSE_TOPIC_TYPE_TO_KIND = {
+    topic_type: kind for kind, topic_type in _POSE_KIND_TO_TOPIC_TYPE.items()
+}
+
+
 class UranAutotaskNode(Node):
     def __init__(self):
         super().__init__('uran_autotask_node')
@@ -130,9 +142,14 @@ class UranAutotaskNode(Node):
         self._geo_pose_fuser = GeoPoseFuser(self._pose_report_cfg)
         self._tf_buffer = None
         self._tf_listener = None
+        self._map_tf_fallback_cfg = dict(self._pose_report_cfg.get('map_tf_fallback') or {})
+        self._map_tf_fallback_enabled = bool(self._map_tf_fallback_cfg.get('enabled', False))
         self._visual_tf_fallback_cfg = dict(self._visual_pose_monitor_cfg.get('tf_fallback') or {})
         self._visual_tf_fallback_enabled = bool(self._visual_tf_fallback_cfg.get('enabled', False))
-        if self._visual_pose_monitor_enabled and self._visual_tf_fallback_enabled:
+        if (
+            self._map_tf_fallback_enabled or
+            (self._visual_pose_monitor_enabled and self._visual_tf_fallback_enabled)
+        ):
             self._tf_buffer = Buffer()
             self._tf_listener = TransformListener(self._tf_buffer, self)
         self._pose_subscriptions = []
@@ -226,6 +243,7 @@ class UranAutotaskNode(Node):
             controller_getter=lambda: self._controller,
             battery_level_getter=lambda: self._battery_level,
             now_ns_getter=self._now_ns,
+            position_getter=self._current_fused_position,
             stamp_getter=lambda: self.get_clock().now().to_msg(),
             publish_uplink=self._publish_uplink_message,
             write_state=self._write_state,
@@ -357,10 +375,10 @@ class UranAutotaskNode(Node):
             self._visual_pose_monitor_enabled
         )
         needs_gps = self._gps_monitor_enabled or self._pose_report_enabled
-        map_pose_relative = str(
-            self._pose_report_cfg.get('map_pose_topic') or
-            self._gps_monitor_cfg.get('map_pose_topic', 'dog_pose')
-        )
+        map_pose_value = self._pose_report_cfg.get('map_pose_topic', None)
+        if map_pose_value is None:
+            map_pose_value = self._gps_monitor_cfg.get('map_pose_topic', 'dog_pose')
+        map_pose_relative = str(map_pose_value or '').strip()
         map_pose_message_type = str(
             self._pose_report_cfg.get('map_pose_message_type') or
             self._gps_monitor_cfg.get('map_pose_message_type', 'auto')
@@ -377,7 +395,7 @@ class UranAutotaskNode(Node):
                 role='map',
                 relative_topic=map_pose_relative,
                 message_type=map_pose_message_type,
-                candidates=['dog_pose', 'odometry', 'pose_filtered', 'odom_out', 'odom_slam', 'mivins/odometry'],
+                candidates=['dog_pose'],
             )
 
         if self._gps_monitor_enabled:
@@ -398,13 +416,13 @@ class UranAutotaskNode(Node):
                 relative_topic=visual_pose_topic,
                 message_type=visual_pose_message_type,
                 candidates=[
+                    'odom_out',
                     'odometry',
                     'pose_filtered',
                     'odom_slam',
                     'mivins/odometry',
                     'mivins/imuodom_slam',
                     'mivins/reloc_odom',
-                    'odom_out',
                 ],
             )
 
@@ -425,6 +443,12 @@ class UranAutotaskNode(Node):
         source = 'configured'
         if relative_topic:
             chosen_topic = relative_topic
+            if not self._has_pose_publisher(chosen_topic, message_type):
+                state['selected_topic'] = self._resolve_name(chosen_topic)
+                state['selected_message_type'] = ''
+                state['source'] = 'awaiting_publisher'
+                state['bound'] = False
+                return
         else:
             chosen_topic = self._auto_detect_pose_topic(
                 candidates=candidates,
@@ -474,9 +498,28 @@ class UranAutotaskNode(Node):
         for candidate in candidates:
             resolved = self._resolve_name(candidate)
             topic_types = available_topics.get(resolved, [])
+            if not self._has_pose_publisher(candidate, preferred_message_type):
+                continue
             if self._topic_matches_message_type(topic_types, preferred_message_type):
                 return candidate
         return ''
+
+    def _has_pose_publisher(self, relative_topic: str, preferred_message_type: str) -> bool:
+        topic_name = self._resolve_name(relative_topic)
+        try:
+            publisher_infos = self.get_publishers_info_by_topic(topic_name)
+        except Exception:
+            return False
+
+        normalized = str(preferred_message_type or 'auto').strip().lower()
+        expected_type = _POSE_KIND_TO_TOPIC_TYPE.get(normalized)
+        for info in publisher_infos:
+            topic_type = str(getattr(info, 'topic_type', '') or '')
+            if normalized == 'auto' and topic_type in _POSE_TOPIC_TYPE_TO_KIND:
+                return True
+            if expected_type and topic_type == expected_type:
+                return True
+        return False
 
     def _topic_type_map(self) -> Dict[str, Any]:
         return {
@@ -489,18 +532,8 @@ class UranAutotaskNode(Node):
             return False
         normalized = str(preferred_message_type or 'auto').strip().lower()
         if normalized == 'auto':
-            return any(
-                item in topic_types for item in (
-                    'geometry_msgs/msg/PoseStamped',
-                    'nav_msgs/msg/Odometry',
-                    'motion_msgs/msg/SE3Pose',
-                )
-            )
-        expected = {
-            'pose_stamped': 'geometry_msgs/msg/PoseStamped',
-            'odometry': 'nav_msgs/msg/Odometry',
-            'se3_pose': 'motion_msgs/msg/SE3Pose',
-        }.get(normalized)
+            return any(item in topic_types for item in _POSE_TOPIC_TYPE_TO_KIND)
+        expected = _POSE_KIND_TO_TOPIC_TYPE.get(normalized)
         return bool(expected and expected in topic_types)
 
     def _resolve_message_kind_for_topic(self, *, relative_topic: str, preferred_message_type: str) -> str:
@@ -511,14 +544,11 @@ class UranAutotaskNode(Node):
             if normalized == 'auto':
                 return ''
             return normalized
-        if self._topic_matches_message_type(topic_types, preferred_message_type):
+        if normalized != 'auto' and self._topic_matches_message_type(topic_types, preferred_message_type):
             return normalized
-        if 'nav_msgs/msg/Odometry' in topic_types:
-            return 'odometry'
-        if 'geometry_msgs/msg/PoseStamped' in topic_types:
-            return 'pose_stamped'
-        if 'motion_msgs/msg/SE3Pose' in topic_types:
-            return 'se3_pose'
+        for topic_type, kind in _POSE_TOPIC_TYPE_TO_KIND.items():
+            if topic_type in topic_types:
+                return kind
         return ''
 
     def _create_pose_subscriptions(self, *, relative_topic: str, message_type: str, role: str):
@@ -549,7 +579,7 @@ class UranAutotaskNode(Node):
                     PoseStamped,
                     topic_name,
                     lambda msg, role=role: self._cb_pose_stamped(role, msg),
-                    10,
+                    self._pose_qos_for_topic(topic_name=topic_name, kind=kind),
                 )
             except Exception as exc:
                 self.get_logger().warning(
@@ -562,7 +592,7 @@ class UranAutotaskNode(Node):
                     Odometry,
                     topic_name,
                     lambda msg, role=role: self._cb_odometry(role, msg),
-                    10,
+                    self._pose_qos_for_topic(topic_name=topic_name, kind=kind),
                 )
             except Exception as exc:
                 self.get_logger().warning(
@@ -580,7 +610,7 @@ class UranAutotaskNode(Node):
                     self._SE3Pose,
                     topic_name,
                     lambda msg, role=role: self._cb_se3_pose(role, msg),
-                    10,
+                    self._pose_qos_for_topic(topic_name=topic_name, kind=kind),
                 )
             except Exception as exc:
                 self.get_logger().warning(
@@ -588,6 +618,33 @@ class UranAutotaskNode(Node):
                 )
                 return None
         return None
+
+    def _pose_qos_for_topic(self, *, topic_name: str, kind: str):
+        reliability = ReliabilityPolicy.RELIABLE
+        durability = DurabilityPolicy.VOLATILE
+        expected_topic_type = _POSE_KIND_TO_TOPIC_TYPE.get(kind, '')
+
+        try:
+            publisher_infos = self.get_publishers_info_by_topic(topic_name)
+        except Exception:
+            publisher_infos = []
+
+        for info in publisher_infos:
+            topic_type = str(getattr(info, 'topic_type', '') or '')
+            if expected_topic_type and topic_type != expected_topic_type:
+                continue
+            offered_reliability = getattr(info, 'qos_profile', None)
+            offered_reliability = getattr(offered_reliability, 'reliability', None)
+            if offered_reliability == ReliabilityPolicy.BEST_EFFORT:
+                reliability = ReliabilityPolicy.BEST_EFFORT
+                break
+
+        return QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=reliability,
+            durability=durability,
+        )
 
     def _cb_mode_switch(self, msg: ModeSwitchCmd):
         self._control_mode = msg.control_mode
@@ -690,17 +747,13 @@ class UranAutotaskNode(Node):
 
     def _cb_task_tick(self):
         self._retry_unbound_pose_channels()
+        self._update_map_pose_from_tf_fallback()
         self._update_visual_pose_from_tf_fallback()
         self._mission_manager.tick(monotonic_s=time.monotonic())
 
     def _cb_pose_report_tick(self):
         now_ns = self._now_ns()
-        position = self._geo_pose_fuser.fuse(
-            pose_registry=self._pose_registry,
-            projector=self._projector,
-            alignment_state=self._mission_manager.outdoor_pose_alignment_state(),
-            timestamp_ns=now_ns,
-        )
+        position = self._current_fused_position(timestamp_ns=now_ns)
         payload = {
             'schema_version': 1,
             'robot_id': str(self._pose_report_cfg.get('robot_id', '')),
@@ -720,13 +773,26 @@ class UranAutotaskNode(Node):
             urgent=False,
         )
 
+    def _current_fused_position(self, *, timestamp_ns: Optional[int] = None) -> Dict[str, Any]:
+        timestamp_ns = self._now_ns() if timestamp_ns is None else int(timestamp_ns)
+        alignment_state = (
+            self._mission_manager.outdoor_pose_alignment_state()
+            if hasattr(self, '_mission_manager') else {}
+        )
+        return self._geo_pose_fuser.fuse(
+            pose_registry=self._pose_registry,
+            projector=self._projector,
+            alignment_state=alignment_state,
+            timestamp_ns=timestamp_ns,
+        )
+
     def _retry_unbound_pose_channels(self):
         if not self._pose_channel_state['map'].get('bound', False):
             self._ensure_pose_subscription(
                 role='map',
                 relative_topic=str(self._pose_channel_state['map'].get('configured_topic', '')),
                 message_type=str(self._pose_channel_state['map'].get('configured_message_type', 'auto')),
-                candidates=['dog_pose', 'odometry', 'pose_filtered', 'odom_out', 'odom_slam', 'mivins/odometry'],
+                candidates=['dog_pose'],
             )
         if self._visual_pose_monitor_enabled and not self._pose_channel_state['visual'].get('bound', False):
             self._ensure_pose_subscription(
@@ -734,26 +800,20 @@ class UranAutotaskNode(Node):
                 relative_topic=str(self._pose_channel_state['visual'].get('configured_topic', '')),
                 message_type=str(self._pose_channel_state['visual'].get('configured_message_type', 'auto')),
                 candidates=[
+                    'odom_out',
                     'odometry',
                     'pose_filtered',
                     'odom_slam',
                     'mivins/odometry',
                     'mivins/imuodom_slam',
                     'mivins/reloc_odom',
-                    'odom_out',
                 ],
             )
 
-    def _update_visual_pose_from_tf_fallback(self):
-        if not self._visual_pose_monitor_enabled or not self._visual_tf_fallback_enabled:
-            return
-        if self._pose_channel_state['visual'].get('bound', False):
-            return
+    def _lookup_tf_pose(self, *, target_frame: str, source_frame: str) -> Optional[Dict[str, Any]]:
         if self._tf_buffer is None:
-            return
+            return None
 
-        target_frame = str(self._visual_tf_fallback_cfg.get('target_frame', 'map') or 'map')
-        source_frame = str(self._visual_tf_fallback_cfg.get('source_frame', 'base_link') or 'base_link')
         try:
             transform = self._tf_buffer.lookup_transform(
                 target_frame,
@@ -761,11 +821,11 @@ class UranAutotaskNode(Node):
                 rclpy.time.Time(),
             )
         except TransformException:
-            return
+            return None
 
         translation = transform.transform.translation
         rotation = transform.transform.rotation
-        payload = {
+        return {
             'frame_id': transform.header.frame_id,
             'stamp_sec': int(transform.header.stamp.sec),
             'stamp_nanosec': int(transform.header.stamp.nanosec),
@@ -777,6 +837,37 @@ class UranAutotaskNode(Node):
             'qz': float(rotation.z),
             'qw': float(rotation.w),
         }
+
+    def _update_map_pose_from_tf_fallback(self):
+        if not self._map_tf_fallback_enabled:
+            return
+        if self._pose_channel_state['map'].get('bound', False):
+            return
+
+        target_frame = str(self._map_tf_fallback_cfg.get('target_frame', 'map') or 'map')
+        source_frame = str(self._map_tf_fallback_cfg.get('source_frame', 'base_link') or 'base_link')
+        payload = self._lookup_tf_pose(target_frame=target_frame, source_frame=source_frame)
+        if payload is None:
+            return
+
+        self._pose_registry.update_map_pose(payload)
+        state = self._pose_channel_state['map']
+        state['selected_topic'] = f'tf:{target_frame}->{source_frame}'
+        state['selected_message_type'] = 'tf2_msgs/msg/TFMessage'
+        state['source'] = 'tf_fallback'
+
+    def _update_visual_pose_from_tf_fallback(self):
+        if not self._visual_pose_monitor_enabled or not self._visual_tf_fallback_enabled:
+            return
+        if self._pose_channel_state['visual'].get('bound', False):
+            return
+
+        target_frame = str(self._visual_tf_fallback_cfg.get('target_frame', 'map') or 'map')
+        source_frame = str(self._visual_tf_fallback_cfg.get('source_frame', 'base_link') or 'base_link')
+        payload = self._lookup_tf_pose(target_frame=target_frame, source_frame=source_frame)
+        if payload is None:
+            return
+
         self._pose_registry.update_visual_pose(payload)
         state = self._pose_channel_state['visual']
         state['selected_topic'] = f'tf:{target_frame}->{source_frame}'

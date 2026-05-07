@@ -54,8 +54,14 @@ uran_autotask:
     interval_s: 1.0
     data_type: "robot_pose"
     robot_id: ""
-    map_pose_topic: "dog_pose"
+    # 留空表示自动探测全局 map 位姿话题。
+    # 实机上 /dog_pose 可能只有订阅者、没有发布者，不能写死为默认输入。
+    map_pose_topic: ""
     map_pose_message_type: "auto"
+    map_tf_fallback:
+      enabled: true
+      target_frame: "map"
+      source_frame: "base_link"
     gps_stale_timeout_s: 3.0
     max_visual_pose_age_s: 2.0
     max_time_alignment_error_s: 0.3
@@ -112,7 +118,8 @@ uran_autotask:
     # 历史名称仍叫 visual_pose_monitor，但实际表示“本地里程计监督”。
     # 它可以接视觉里程计、腿式里程计、融合里程计或 TF。
     # 这里默认留空，运行时会优先尝试自动探测：
-    # odometry -> pose_filtered -> mivins 候选 -> odom_out。
+    # odom_out -> odometry -> pose_filtered -> mivins 候选。
+    # 实机已确认 /odom_out 是稳定腿式里程计，类型为 nav_msgs/msg/Odometry。
     # 如果现场系统有明确自定义话题，再手工填这里覆盖自动探测。
     pose_topic: ""
     pose_message_type: "auto"

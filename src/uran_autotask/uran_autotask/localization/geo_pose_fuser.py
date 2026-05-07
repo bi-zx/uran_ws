@@ -66,7 +66,7 @@ class GeoPoseFuser:
         if aligned_position is not None:
             return aligned_position
 
-        if self._gps_is_fresh(gps_position, timestamp_ns):
+        if self._gps_is_fresh(gps_position, timestamp_ns) and self._gps_quality_ok(gps_position):
             payload = dict(gps_position)
             payload.update({
                 'available': True,

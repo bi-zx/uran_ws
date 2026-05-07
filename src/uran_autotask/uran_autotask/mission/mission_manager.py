@@ -33,6 +33,7 @@ class MissionManager:
         controller_getter,
         battery_level_getter,
         now_ns_getter,
+        position_getter=None,
         stamp_getter,
         publish_uplink,
         write_state,
@@ -56,6 +57,7 @@ class MissionManager:
         self._controller_getter = controller_getter
         self._battery_level_getter = battery_level_getter
         self._now_ns_getter = now_ns_getter
+        self._position_getter = position_getter or self._pose_registry.effective_position
         self._publish_uplink = publish_uplink
         self._write_state = write_state
         self._publish_media_control = publish_media_control
@@ -80,7 +82,7 @@ class MissionManager:
             camera_capture=camera_capture,
             backend_snapshot_getter=self._dispatcher.backend_snapshot,
             battery_level_getter=self._battery_level_getter,
-            position_getter=self._pose_registry.effective_position,
+            position_getter=self._position_getter,
             gps_monitor_state_getter=self._closed_loop_manager.gps_state_snapshot,
             now_ns_getter=self._now_ns_getter,
             publish_event=self._publish_task_action_event,
@@ -180,7 +182,7 @@ class MissionManager:
     def build_status_payload(self) -> Dict[str, Any]:
         payload = self._runtime.to_status_dict(
             task=self._task,
-            position=self._pose_registry.effective_position(),
+            position=self._position_getter(),
             battery_level=self._battery_level_getter(),
             control_mode=self._control_mode_getter(),
             controller=self._controller_getter(),

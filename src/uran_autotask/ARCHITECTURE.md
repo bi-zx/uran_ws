@@ -180,9 +180,22 @@ Use these commands on the robot:
 ros2 topic info -v /<namespace>/gps_payload
 ros2 topic hz /<namespace>/gps_payload
 ros2 topic info -v /<namespace>/dog_pose
-ros2 topic hz /<namespace>/dog_pose
+ros2 topic info -v /<namespace>/pose_filtered
+ros2 topic info -v /<namespace>/odom_out
+ros2 topic hz /<namespace>/odom_out
 ros2 topic list | grep -Ei 'dog_pose|odom|mivins|vio|vins|visual'
 ```
+
+Observed CyberDog behavior on the current robot image:
+
+- `/dog_pose` may exist as `geometry_msgs/msg/PoseStamped` with no publisher.
+- `/pose_filtered` may be `BEST_EFFORT`; subscribers must match that reliability.
+- `/odom_out` is the stable leg odometry source seen so far.
+- `/gps_payload` with `fix_type=0`, `num_sv=0`, and zero latitude/longitude is not usable GPS.
+
+`uran_autotask` therefore treats `/odom_out` as local odometry, not as a global
+map pose. For global map pose it first uses a real pose topic, then falls back
+to TF `map -> base_link` when that transform is available.
 
 ## What Should Not Be Reintroduced
 
