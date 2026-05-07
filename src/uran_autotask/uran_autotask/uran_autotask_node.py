@@ -146,6 +146,10 @@ class UranAutotaskNode(Node):
         self._map_tf_fallback_enabled = bool(self._map_tf_fallback_cfg.get('enabled', False))
         self._visual_tf_fallback_cfg = dict(self._visual_pose_monitor_cfg.get('tf_fallback') or {})
         self._visual_tf_fallback_enabled = bool(self._visual_tf_fallback_cfg.get('enabled', False))
+        self._pose_sample_timeout_s = max(
+            1.0,
+            float(self._pose_report_cfg.get('pose_sample_timeout_s', 3.0)),
+        )
         if (
             self._map_tf_fallback_enabled or
             (self._visual_pose_monitor_enabled and self._visual_tf_fallback_enabled)
@@ -153,6 +157,7 @@ class UranAutotaskNode(Node):
             self._tf_buffer = Buffer()
             self._tf_listener = TransformListener(self._tf_buffer, self)
         self._pose_subscriptions = []
+        self._pose_subscription_keys = set()
         self._pose_channel_state: Dict[str, Dict[str, Any]] = {
             'map': {
                 'role': 'map',
@@ -161,8 +166,15 @@ class UranAutotaskNode(Node):
                 'selected_topic': '',
                 'selected_message_type': '',
                 'source': 'unbound',
+                'health': 'unbound',
                 'bound': False,
                 'attempts': 0,
+                'publisher_count': 0,
+                'sample_count': 0,
+                'bound_since_ns': 0,
+                'last_sample_timestamp_ns': 0,
+                'last_sample_age_s': None,
+                'last_sample_frame_id': '',
             },
             'visual': {
                 'role': 'local_odom',
@@ -171,8 +183,15 @@ class UranAutotaskNode(Node):
                 'selected_topic': '',
                 'selected_message_type': '',
                 'source': 'unbound',
+                'health': 'unbound',
                 'bound': False,
                 'attempts': 0,
+                'publisher_count': 0,
+                'sample_count': 0,
+                'bound_since_ns': 0,
+                'last_sample_timestamp_ns': 0,
+                'last_sample_age_s': None,
+                'last_sample_frame_id': '',
             },
         }
         self._projector = MapProjector(
@@ -438,15 +457,19 @@ class UranAutotaskNode(Node):
         if state.get('bound', False):
             return
 
+        self._reset_pose_channel_binding(role)
         state['attempts'] = int(state.get('attempts', 0)) + 1
         chosen_topic = ''
         source = 'configured'
         if relative_topic:
             chosen_topic = relative_topic
-            if not self._has_pose_publisher(chosen_topic, message_type):
+            publisher_count = self._pose_publisher_count(chosen_topic, message_type)
+            if publisher_count <= 0:
                 state['selected_topic'] = self._resolve_name(chosen_topic)
                 state['selected_message_type'] = ''
                 state['source'] = 'awaiting_publisher'
+                state['health'] = 'awaiting_publisher'
+                state['publisher_count'] = 0
                 state['bound'] = False
                 return
         else:
@@ -460,6 +483,7 @@ class UranAutotaskNode(Node):
             state['selected_topic'] = ''
             state['selected_message_type'] = ''
             state['source'] = source
+            state['health'] = source
             state['bound'] = False
             return
 
@@ -471,6 +495,7 @@ class UranAutotaskNode(Node):
             state['selected_topic'] = self._resolve_name(chosen_topic)
             state['selected_message_type'] = ''
             state['source'] = 'awaiting_type'
+            state['health'] = 'awaiting_type'
             state['bound'] = False
             return
         if not self._create_pose_subscriptions(
@@ -481,13 +506,17 @@ class UranAutotaskNode(Node):
             state['selected_topic'] = ''
             state['selected_message_type'] = ''
             state['source'] = 'unbound'
+            state['health'] = 'unbound'
             state['bound'] = False
             return
 
         state['selected_topic'] = self._resolve_name(chosen_topic)
         state['selected_message_type'] = actual_kind or str(message_type or 'auto')
         state['source'] = source
+        state['health'] = 'awaiting_sample'
         state['bound'] = True
+        state['publisher_count'] = self._pose_publisher_count(chosen_topic, actual_kind)
+        state['bound_since_ns'] = self._now_ns()
         self.get_logger().info(
             f'bound {role} pose channel: topic={state["selected_topic"]}, '
             f'type={state["selected_message_type"]}, source={state["source"]}'
@@ -498,28 +527,29 @@ class UranAutotaskNode(Node):
         for candidate in candidates:
             resolved = self._resolve_name(candidate)
             topic_types = available_topics.get(resolved, [])
-            if not self._has_pose_publisher(candidate, preferred_message_type):
+            if self._pose_publisher_count(candidate, preferred_message_type) <= 0:
                 continue
             if self._topic_matches_message_type(topic_types, preferred_message_type):
                 return candidate
         return ''
 
-    def _has_pose_publisher(self, relative_topic: str, preferred_message_type: str) -> bool:
+    def _pose_publisher_count(self, relative_topic: str, preferred_message_type: str) -> int:
         topic_name = self._resolve_name(relative_topic)
         try:
             publisher_infos = self.get_publishers_info_by_topic(topic_name)
         except Exception:
-            return False
+            return 0
 
         normalized = str(preferred_message_type or 'auto').strip().lower()
         expected_type = _POSE_KIND_TO_TOPIC_TYPE.get(normalized)
+        count = 0
         for info in publisher_infos:
             topic_type = str(getattr(info, 'topic_type', '') or '')
             if normalized == 'auto' and topic_type in _POSE_TOPIC_TYPE_TO_KIND:
-                return True
+                count += 1
             if expected_type and topic_type == expected_type:
-                return True
-        return False
+                count += 1
+        return count
 
     def _topic_type_map(self) -> Dict[str, Any]:
         return {
@@ -566,9 +596,14 @@ class UranAutotaskNode(Node):
 
         created = False
         for kind in requested:
+            subscription_key = (role, topic_name, kind)
+            if subscription_key in self._pose_subscription_keys:
+                created = True
+                continue
             subscription = self._create_pose_subscription(topic_name=topic_name, kind=kind, role=role)
             if subscription is not None:
                 self._pose_subscriptions.append(subscription)
+                self._pose_subscription_keys.add(subscription_key)
                 created = True
         return created
 
@@ -732,10 +767,24 @@ class UranAutotaskNode(Node):
         self._update_pose_by_role(role, payload)
 
     def _update_pose_by_role(self, role: str, payload: Dict[str, Any]):
+        self._mark_pose_sample(role, payload)
         if role == 'visual':
             self._pose_registry.update_visual_pose(payload)
             return
         self._pose_registry.update_map_pose(payload)
+
+    def _mark_pose_sample(self, role: str, payload: Dict[str, Any]):
+        state = self._pose_channel_state.get(role)
+        if state is None:
+            return
+        state['sample_count'] = int(state.get('sample_count', 0)) + 1
+        state['last_sample_timestamp_ns'] = int(payload.get('timestamp_ns', 0)) or (
+            int(payload.get('stamp_sec', 0)) * 1_000_000_000 +
+            int(payload.get('stamp_nanosec', 0))
+        )
+        state['last_sample_age_s'] = 0.0
+        state['last_sample_frame_id'] = str(payload.get('frame_id', ''))
+        state['health'] = 'receiving'
 
     def _cb_task_ctrl(self, msg: TaskCtrlCmd):
         self._mission_manager.handle_task_command(
@@ -746,6 +795,7 @@ class UranAutotaskNode(Node):
         )
 
     def _cb_task_tick(self):
+        self._refresh_pose_channel_health()
         self._retry_unbound_pose_channels()
         self._update_map_pose_from_tf_fallback()
         self._update_visual_pose_from_tf_fallback()
@@ -785,6 +835,49 @@ class UranAutotaskNode(Node):
             alignment_state=alignment_state,
             timestamp_ns=timestamp_ns,
         )
+
+    def _refresh_pose_channel_health(self):
+        now_ns = self._now_ns()
+        for role, state in self._pose_channel_state.items():
+            selected_topic = str(state.get('selected_topic', '') or '')
+            selected_type = str(state.get('selected_message_type', '') or '')
+            if not selected_topic or selected_topic.startswith('tf:'):
+                continue
+
+            publisher_count = self._pose_publisher_count(selected_topic, selected_type or 'auto')
+            state['publisher_count'] = publisher_count
+            last_sample_ns = int(state.get('last_sample_timestamp_ns', 0) or 0)
+            if last_sample_ns > 0:
+                state['last_sample_age_s'] = max(0.0, float(now_ns - last_sample_ns) / 1_000_000_000.0)
+
+            if publisher_count <= 0:
+                state['health'] = 'awaiting_publisher'
+                state['bound'] = False
+                continue
+
+            if int(state.get('sample_count', 0)) <= 0:
+                bound_since_ns = int(state.get('bound_since_ns', 0) or 0)
+                wait_s = max(0.0, float(now_ns - bound_since_ns) / 1_000_000_000.0) if bound_since_ns else 0.0
+                state['health'] = 'awaiting_sample'
+                if wait_s > self._pose_sample_timeout_s:
+                    state['bound'] = False
+                continue
+
+            state['health'] = 'receiving'
+
+    def _reset_pose_channel_binding(self, role: str):
+        state = self._pose_channel_state[role]
+        state['selected_topic'] = ''
+        state['selected_message_type'] = ''
+        state['source'] = 'unbound'
+        state['health'] = 'unbound'
+        state['bound'] = False
+        state['publisher_count'] = 0
+        state['sample_count'] = 0
+        state['bound_since_ns'] = 0
+        state['last_sample_timestamp_ns'] = 0
+        state['last_sample_age_s'] = None
+        state['last_sample_frame_id'] = ''
 
     def _retry_unbound_pose_channels(self):
         if not self._pose_channel_state['map'].get('bound', False):
@@ -855,6 +948,15 @@ class UranAutotaskNode(Node):
         state['selected_topic'] = f'tf:{target_frame}->{source_frame}'
         state['selected_message_type'] = 'tf2_msgs/msg/TFMessage'
         state['source'] = 'tf_fallback'
+        state['health'] = 'receiving'
+        state['publisher_count'] = 1
+        state['sample_count'] = int(state.get('sample_count', 0)) + 1
+        state['last_sample_timestamp_ns'] = int(payload.get('timestamp_ns', 0)) or (
+            int(payload.get('stamp_sec', 0)) * 1_000_000_000 +
+            int(payload.get('stamp_nanosec', 0))
+        )
+        state['last_sample_age_s'] = 0.0
+        state['last_sample_frame_id'] = str(payload.get('frame_id', ''))
 
     def _update_visual_pose_from_tf_fallback(self):
         if not self._visual_pose_monitor_enabled or not self._visual_tf_fallback_enabled:
@@ -873,6 +975,15 @@ class UranAutotaskNode(Node):
         state['selected_topic'] = f'tf:{target_frame}->{source_frame}'
         state['selected_message_type'] = 'tf2_msgs/msg/TFMessage'
         state['source'] = 'tf_fallback'
+        state['health'] = 'receiving'
+        state['publisher_count'] = 1
+        state['sample_count'] = int(state.get('sample_count', 0)) + 1
+        state['last_sample_timestamp_ns'] = int(payload.get('timestamp_ns', 0)) or (
+            int(payload.get('stamp_sec', 0)) * 1_000_000_000 +
+            int(payload.get('stamp_nanosec', 0))
+        )
+        state['last_sample_age_s'] = 0.0
+        state['last_sample_frame_id'] = str(payload.get('frame_id', ''))
 
     def _build_extra_status_payload(self) -> Dict[str, Any]:
         return {

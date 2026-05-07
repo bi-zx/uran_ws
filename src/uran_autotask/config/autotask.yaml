@@ -62,6 +62,7 @@ uran_autotask:
       enabled: true
       target_frame: "map"
       source_frame: "base_link"
+    pose_sample_timeout_s: 3.0
     gps_stale_timeout_s: 3.0
     max_visual_pose_age_s: 2.0
     max_time_alignment_error_s: 0.3
