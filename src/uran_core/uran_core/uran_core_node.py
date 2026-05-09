@@ -222,7 +222,7 @@ class UranCoreNode(Node):
         self.get_logger().info('MQTT connected, sending registration...')
         result = self._mqtt.register(timeout_s=10.0)
         self.get_logger().info(f'Registration result: {result}')
-        registered = result in ('registered', 'auto_registered')
+        registered = result in ('registered', 'auto_registered', 'legacy_connected')
         self._state.set('online_status', registered)
         self._update_protocol_table()
         if not registered:
@@ -232,6 +232,10 @@ class UranCoreNode(Node):
                 self.get_logger().warning(
                     f'Registration did not complete ({result}) — waiting for a valid register_response'
                 )
+        elif result == 'legacy_connected':
+            self.get_logger().warning(
+                'Registration response timed out; using legacy MQTT-connected online mode'
+            )
             return
 
     def _update_protocol_table(self):

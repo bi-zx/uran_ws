@@ -26,10 +26,12 @@ class MqttClient:
         self._connected = False
         self._registered = False
         self._reg_event = threading.Event()
+        self._reg_result = 'timeout'
 
         device_id = net_cfg.get('device_id', 'device_001')
         tenant_id = net_cfg.get('tenant_id', 'default')
         mqtt_cfg = net_cfg.get('mqtt', {})
+        registration_cfg = net_cfg.get('registration', {})
         prefix = mqtt_cfg.get('topic_prefix', '/oivs/{tenant_id}/{device_id}')
         prefix = prefix.replace('{tenant_id}', tenant_id).replace('{device_id}', device_id)
         prefix = prefix.replace('{tenant}', tenant_id)  # legacy placeholder
@@ -44,6 +46,10 @@ class MqttClient:
         self._keepalive = int(mqtt_cfg.get('keepalive', 60))
         self._uplink_topic = f'{prefix}/up'
         self._downlink_topic = f'{prefix}/down'
+        self._require_register_response = bool(registration_cfg.get('require_response', False))
+        self._legacy_online_on_timeout = bool(
+            registration_cfg.get('legacy_online_on_timeout', not self._require_register_response)
+        )
 
         # 通路状态
         self._latency_ms: int = -1
@@ -95,6 +101,16 @@ class MqttClient:
         self._reg_result = 'timeout'
         self.publish_raw(payload)
         self._reg_event.wait(timeout=timeout_s)
+        with self._lock:
+            connected = self._connected
+        if (
+            self._reg_result == 'timeout'
+            and connected
+            and self._legacy_online_on_timeout
+        ):
+            self._reg_result = 'legacy_connected'
+            with self._lock:
+                self._registered = True
         return self._reg_result
 
     # ------------------------------------------------------------------ publish
@@ -158,7 +174,7 @@ class MqttClient:
         msg_type = payload.get('msg_type', '')
 
         # 处理注册响应
-        if msg_type == 'register_response':
+        if self._is_register_response(payload, msg_type):
             self._reg_result = payload.get('result', 'rejected')
             with self._lock:
                 self._registered = self._reg_result in ('registered', 'auto_registered')
@@ -170,3 +186,18 @@ class MqttClient:
             self._downlink_cb(payload)
         except Exception as exc:
             logger.error(f'downlink callback error: {exc}')
+
+    def _is_register_response(self, payload: Dict, msg_type: str) -> bool:
+        """Accept both the current and legacy registration response shapes."""
+        if msg_type == 'register_response':
+            return True
+        if msg_type:
+            return False
+
+        result = payload.get('result')
+        if result not in ('registered', 'auto_registered', 'rejected'):
+            return False
+
+        device_id = payload.get('device_id')
+        template_id = payload.get('template_id')
+        return device_id == self._device_id or template_id == self._template_id
