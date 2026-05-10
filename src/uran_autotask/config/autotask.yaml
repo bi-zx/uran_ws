@@ -34,10 +34,22 @@ uran_autotask:
     skip_unreachable_transit: true
     skip_unreachable_nav_points: false
 
+  outdoor_start_alignment:
+    enabled: true
+    # 室外任务启动前，比较当前 map 位姿和规划起点。
+    # 已在起点附近时跳过显式 start 点；偏差较小时下发目标时临时加启动修正；偏差过大时拒绝任务。
+    aligned_tolerance_m: 1.0
+    skip_start_tolerance_m: 3.0
+    allow_start_correction: true
+    max_start_correction_m: 10.0
+    max_pose_age_s: 3.0
+    skip_explicit_start: true
+    start_kinds: ["start"]
+
   outdoor_pose_aligner:
     enabled: true
     # 第一阶段只估计 GPS 投影点与 Nav2 map 位姿之间的稳定偏移。
-    # 暂不自动改目标点，避免未验证前把路径修偏。
+    # 该逻辑发生在任务执行过程中，和启动前的起点对齐是两层保护。
     window_size: 8
     min_fix_type: 2
     min_num_sv: 0

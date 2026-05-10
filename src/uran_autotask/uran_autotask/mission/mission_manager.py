@@ -14,6 +14,7 @@ from ..outdoor import (
     GoalResolution,
     OutdoorMissionPlan,
     OutdoorGoalResolver,
+    OutdoorStartAligner,
     is_outdoor_task_payload,
     parse_outdoor_task_definition,
 )
@@ -44,6 +45,7 @@ class MissionManager:
         mission_defaults,
         outdoor_goal_resolver_cfg: Optional[Dict[str, Any]] = None,
         outdoor_pose_aligner_cfg: Optional[Dict[str, Any]] = None,
+        outdoor_start_alignment_cfg: Optional[Dict[str, Any]] = None,
         progress_report_interval_s: float,
         require_auto_mode: bool,
         media_actions_cfg: Optional[Dict[str, Any]] = None,
@@ -66,6 +68,7 @@ class MissionManager:
         self._extra_status_getter = extra_status_getter
         self._mission_defaults = dict(mission_defaults or {})
         self._outdoor_goal_resolver = OutdoorGoalResolver(outdoor_goal_resolver_cfg)
+        self._outdoor_start_aligner = OutdoorStartAligner(outdoor_start_alignment_cfg)
         self._outdoor_pose_aligner_cfg = dict(outdoor_pose_aligner_cfg or {})
         self._outdoor_pose_aligner = OutdoorPoseAligner(self._outdoor_pose_aligner_cfg)
         self._progress_report_interval_s = float(progress_report_interval_s)
@@ -102,6 +105,7 @@ class MissionManager:
         self._outdoor_calibration_records = []
         self._outdoor_goal_records = []
         self._outdoor_gps_vo_gate = GpsVoGate()
+        self._outdoor_start_alignment: Dict[str, Any] = {}
 
     @property
     def task(self) -> Optional[MissionTask]:
@@ -243,6 +247,8 @@ class MissionManager:
                 if self._active_outdoor_goal_resolution is not None else None
             ),
             'goal_resolver': self._outdoor_goal_resolver.config_snapshot(),
+            'start_alignment': dict(self._outdoor_start_alignment),
+            'start_aligner': self._outdoor_start_aligner.config_snapshot(),
             'goal_records': list(self._outdoor_goal_records[-20:]),
             'calibration_records': list(self._outdoor_calibration_records[-20:]),
             'gps_vo_gate': self._outdoor_gps_vo_gate.state_snapshot(),
@@ -461,6 +467,7 @@ class MissionManager:
         self._closed_loop_manager.reset()
         self._outdoor_calibration_records = []
         self._outdoor_goal_records = []
+        self._outdoor_start_alignment = {}
         self._outdoor_gps_vo_gate = GpsVoGate(
             stable_required_count=outdoor_mission.stable_offset_required_count
         )
@@ -473,6 +480,49 @@ class MissionManager:
                 suggested_action='switch_to_auto_mode',
             )
             return
+
+        self._outdoor_start_alignment = self._outdoor_start_aligner.evaluate_and_apply(
+            mission=outdoor_mission,
+            current_pose=self._pose_registry.map_pose_dict(),
+            now_ns=self._now_ns_getter(),
+        )
+        alignment_status = str(self._outdoor_start_alignment.get('status', ''))
+        alignment_action = str(self._outdoor_start_alignment.get('action', ''))
+        if alignment_action == 'reject':
+            self._abort_task(
+                code='E_OUTDOOR_START_MISMATCH',
+                description=self._outdoor_start_alignment.get(
+                    'message',
+                    'current pose does not match planned outdoor start',
+                ),
+                suggested_action='replan_from_current_pose',
+            )
+            return
+        if alignment_action == 'wait':
+            self._pause_with_error(
+                code='E_OUTDOOR_START_POSE_UNAVAILABLE',
+                description=self._outdoor_start_alignment.get(
+                    'message',
+                    'current map pose is unavailable',
+                ),
+                suggested_action='wait_for_localization_or_relocalize',
+            )
+            return
+        if 'next_current_waypoint_index' in self._outdoor_start_alignment:
+            self._runtime.current_waypoint_index = int(
+                self._outdoor_start_alignment.get('next_current_waypoint_index', -1)
+            )
+            self._runtime.current_waypoint_seq = (
+                outdoor_mission.execution_points[self._runtime.current_waypoint_index].seq
+                if 0 <= self._runtime.current_waypoint_index < len(outdoor_mission.execution_points)
+                else -1
+            )
+            self._runtime.progress_percent = (
+                100.0 * (self._runtime.current_waypoint_index + 1) /
+                max(1, len(outdoor_mission.execution_points))
+                if self._runtime.current_waypoint_index >= 0 else 0.0
+            )
+        self._runtime.event = alignment_status or 'outdoor_task_received'
 
         self._set_map_pose_reporting_enabled(True)
         self._publish_task_progress()
@@ -701,7 +751,17 @@ class MissionManager:
     def _current_outdoor_goal_correction(self) -> Dict[str, Any]:
         alignment_state = self._outdoor_pose_aligner.state_snapshot()
         correction = dict((alignment_state.get('last_result') or {}).get('goal_correction') or {})
+        startup_correction = dict(self._outdoor_start_alignment.get('goal_correction') or {})
         if not correction.get('enabled', False):
+            if startup_correction.get('applied', False):
+                return {
+                    'enabled': True,
+                    'applied': True,
+                    'dx': float(startup_correction.get('dx', 0.0)),
+                    'dy': float(startup_correction.get('dy', 0.0)),
+                    'reason': startup_correction.get('reason', 'startup map pose correction'),
+                    'source': 'startup',
+                }
             return {
                 'enabled': False,
                 'applied': False,
@@ -710,6 +770,15 @@ class MissionManager:
                 'reason': correction.get('reason', 'goal correction is disabled'),
             }
         if not correction.get('applied', False):
+            if startup_correction.get('applied', False):
+                return {
+                    'enabled': True,
+                    'applied': True,
+                    'dx': float(startup_correction.get('dx', 0.0)),
+                    'dy': float(startup_correction.get('dy', 0.0)),
+                    'reason': startup_correction.get('reason', 'startup map pose correction'),
+                    'source': 'startup',
+                }
             return {
                 'enabled': True,
                 'applied': False,
@@ -723,6 +792,7 @@ class MissionManager:
             'dx': float(correction.get('dx', 0.0)),
             'dy': float(correction.get('dy', 0.0)),
             'reason': correction.get('reason', 'stable gps/map offset correction'),
+            'source': 'gps_map_alignment',
         }
 
     def _handle_outdoor_backend_event(self, backend_event: Dict[str, Any]):

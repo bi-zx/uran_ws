@@ -117,6 +117,7 @@ class UranAutotaskNode(Node):
         self._require_auto_mode = bool(node_cfg.get('require_auto_mode', True))
         self._mission_defaults = dict(node_cfg.get('mission_defaults', {}))
         self._outdoor_goal_resolver_cfg = dict(node_cfg.get('outdoor_goal_resolver', {}))
+        self._outdoor_start_alignment_cfg = dict(node_cfg.get('outdoor_start_alignment', {}))
         self._outdoor_pose_aligner_cfg = dict(node_cfg.get('outdoor_pose_aligner', {}))
         self._pose_report_cfg = dict(node_cfg.get('pose_report', {}))
         self._pose_report_enabled = bool(self._pose_report_cfg.get('enabled', True))
@@ -273,6 +274,7 @@ class UranAutotaskNode(Node):
             mission_defaults=self._mission_defaults,
             outdoor_goal_resolver_cfg=self._outdoor_goal_resolver_cfg,
             outdoor_pose_aligner_cfg=self._outdoor_pose_aligner_cfg,
+            outdoor_start_alignment_cfg=self._outdoor_start_alignment_cfg,
             progress_report_interval_s=self._progress_report_interval_s,
             require_auto_mode=self._require_auto_mode,
             media_actions_cfg=self._media_actions_cfg,
