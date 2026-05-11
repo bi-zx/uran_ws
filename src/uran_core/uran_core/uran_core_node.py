@@ -434,6 +434,8 @@ class UranCoreNode(Node):
         except json.JSONDecodeError:
             value = msg.value_json
         self._state.set(msg.field_name, value, persistent=msg.persistent)
+        if msg.field_name == 'motion_control_lock':
+            self._publish_current_mode_switch()
         # T1.6: urgent StateField 触发即时上报
         if msg.urgent:
             self.get_logger().debug(f'urgent StateField {msg.field_name} → immediate report')
@@ -447,12 +449,36 @@ class UranCoreNode(Node):
     # ================================================================== 定时器
     def _timer_broadcast(self):
         """对内广播状态快照。"""
+        self._expire_motion_control_lock_if_needed()
         msg = StateSnapshot()
         msg.msg_version = '1.0'
         msg.timestamp_ns = self._now_ns()
         msg.device_id = self._state.get('device_id') or ''
         msg.fields_json = self._state.get_snapshot_json()
         self._pub_broadcast.publish(msg)
+
+    def _publish_current_mode_switch(self):
+        msg = ModeSwitchCmd()
+        msg.control_mode = self._state.get('control_mode') or ''
+        msg.controller = self._state.get('current_controller') or ''
+        msg.timestamp_ns = self._now_ns()
+        self._pub_mode.publish(msg)
+
+    def _expire_motion_control_lock_if_needed(self):
+        lock = self._state.get('motion_control_lock') or {}
+        if not isinstance(lock, dict) or not lock.get('active', False):
+            return
+        expires_at_ns = int(lock.get('expires_at_ns') or 0)
+        if expires_at_ns <= 0 or self._now_ns() <= expires_at_ns:
+            return
+        released = dict(lock)
+        released.update({
+            'active': False,
+            'reason': 'expired',
+            'timestamp_ns': self._now_ns(),
+        })
+        self._state.set('motion_control_lock', released)
+        self._publish_current_mode_switch()
 
     def _timer_report_check(self):
         """T1.6: 每秒检查，支持动态修改上报周期。"""

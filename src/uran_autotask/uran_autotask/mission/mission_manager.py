@@ -38,6 +38,7 @@ class MissionManager:
         stamp_getter,
         publish_uplink,
         write_state,
+        write_motion_control_lock,
         publish_media_control,
         set_map_pose_reporting_enabled,
         move_gateway=None,
@@ -62,6 +63,7 @@ class MissionManager:
         self._position_getter = position_getter or self._pose_registry.effective_position
         self._publish_uplink = publish_uplink
         self._write_state = write_state
+        self._write_motion_control_lock = write_motion_control_lock
         self._publish_media_control = publish_media_control
         self._set_map_pose_reporting_enabled = set_map_pose_reporting_enabled
         self._move_gateway = move_gateway
@@ -106,6 +108,7 @@ class MissionManager:
         self._outdoor_goal_records = []
         self._outdoor_gps_vo_gate = GpsVoGate()
         self._outdoor_start_alignment: Dict[str, Any] = {}
+        self._motion_control_locked = False
 
     @property
     def task(self) -> Optional[MissionTask]:
@@ -268,6 +271,7 @@ class MissionManager:
         return json.dumps(self.build_status_payload(), ensure_ascii=False)
 
     def destroy(self):
+        self._release_motion_control_lock(reason='autotask_destroyed')
         self._stop_recording_if_needed()
         self._set_map_pose_reporting_enabled(False)
 
@@ -398,6 +402,7 @@ class MissionManager:
         self._hover_until = None
         self._action_runner.reset()
         self._closed_loop_manager.reset()
+        self._acquire_motion_control_lock(task_id=task.task_id, reason='task_received')
 
         if self._require_auto_mode and self._control_mode_getter() != 'auto':
             self._pause_with_error(
@@ -472,6 +477,10 @@ class MissionManager:
             stable_required_count=outdoor_mission.stable_offset_required_count
         )
         self._outdoor_pose_aligner.reset()
+        self._acquire_motion_control_lock(
+            task_id=outdoor_mission.task_id,
+            reason='outdoor_task_received',
+        )
 
         if self._require_auto_mode and self._control_mode_getter() != 'auto':
             self._pause_with_error(
@@ -543,6 +552,7 @@ class MissionManager:
         self._runtime.stage = 'paused'
         self._runtime.status = 'paused'
         self._runtime.event = reason
+        self._release_motion_control_lock(reason=reason)
         self._publish_task_progress()
         self._write_state_fields()
 
@@ -558,6 +568,7 @@ class MissionManager:
                 suggested_action='switch_to_auto_mode',
             )
             return
+        self._acquire_motion_control_lock(task_id=self._runtime.task_id, reason='task_resumed')
         self._runtime.stage = 'executing'
         self._runtime.status = 'normal'
         self._runtime.event = 'task_resumed'
@@ -583,6 +594,7 @@ class MissionManager:
             suggested_action='restart_task',
             severity='info',
         )
+        self._release_motion_control_lock(reason=reason)
         self._stop_recording_if_needed()
         self._set_map_pose_reporting_enabled(False)
         self._publish_task_progress()
@@ -1138,6 +1150,7 @@ class MissionManager:
         self._runtime.event = 'task_completed'
         self._runtime.error = None
         self._action_runner.reset()
+        self._release_motion_control_lock(reason='task_completed')
         self._stop_recording_if_needed()
         self._set_map_pose_reporting_enabled(False)
         self._publish_task_progress()
@@ -1160,6 +1173,7 @@ class MissionManager:
             description=description,
             suggested_action=suggested_action,
         )
+        self._release_motion_control_lock(reason=code)
         self._stop_recording_if_needed()
         self._set_map_pose_reporting_enabled(False)
         self._publish_task_progress()
@@ -1182,6 +1196,7 @@ class MissionManager:
             description=description,
             suggested_action=suggested_action,
         )
+        self._release_motion_control_lock(reason=code)
         self._publish_task_progress()
         self._write_state_fields()
 
@@ -1269,3 +1284,21 @@ class MissionManager:
         task_id = self._runtime.task_id if self._runtime.task_id else ''
         self._write_state('task_id', task_id)
         self._write_state('task_stage', self._runtime.stage)
+
+    def _acquire_motion_control_lock(self, *, task_id: str, reason: str):
+        self._motion_control_locked = True
+        self._write_motion_control_lock(
+            active=True,
+            task_id=task_id,
+            reason=reason,
+        )
+
+    def _release_motion_control_lock(self, *, reason: str):
+        if not self._motion_control_locked:
+            return
+        self._motion_control_locked = False
+        self._write_motion_control_lock(
+            active=False,
+            task_id=self._runtime.task_id,
+            reason=reason,
+        )

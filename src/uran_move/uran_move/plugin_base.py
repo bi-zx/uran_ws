@@ -49,6 +49,14 @@ class MovePluginBase(ABC):
         """失控保护恢复时调用。"""
         pass
 
+    def on_control_suspended(self, *, owner: str = '', reason: str = ''):
+        """外部控制锁生效时调用，插件应停止保活或周期性运动输出。"""
+        pass
+
+    def on_control_resumed(self, *, owner: str = '', reason: str = ''):
+        """外部控制锁释放时调用。"""
+        pass
+
     def destroy(self):
         """节点关闭时调用，释放资源。"""
         pass

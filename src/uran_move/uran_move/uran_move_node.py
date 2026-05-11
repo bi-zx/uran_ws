@@ -43,6 +43,15 @@ class UranMoveNode(Node):
         # 限速缓存（由 StateSnapshot 广播更新，避免每条指令同步查服务）
         self._linear_vel_limit = 1.0
         self._angular_vel_limit = 1.0
+        self._motion_control_lock = {
+            'active': False,
+            'owner': '',
+            'task_id': '',
+            'reason': '',
+            'timestamp_ns': 0,
+            'expires_at_ns': 0,
+        }
+        self._control_suspended_by_lock = False
 
         # 插件相关
         self._plugin = None
@@ -175,13 +184,15 @@ class UranMoveNode(Node):
             self._link_lost_since = None
 
     def _cb_state_snapshot(self, msg: StateSnapshot):
-        """缓存状态快照中的限速参数，供 _precheck_cmd 使用。"""
+        """缓存状态快照中的限速和控制锁，供运控过滤使用。"""
         try:
             fields = json.loads(msg.fields_json)
             if 'linear_vel_limit' in fields:
                 self._linear_vel_limit = float(fields['linear_vel_limit'])
             if 'angular_vel_limit' in fields:
                 self._angular_vel_limit = float(fields['angular_vel_limit'])
+            if 'motion_control_lock' in fields:
+                self._update_motion_control_lock(fields.get('motion_control_lock') or {})
         except Exception:
             pass
 
@@ -307,6 +318,9 @@ class UranMoveNode(Node):
             )
             return
 
+        if not self._check_motion_control_lock(cmd):
+            return
+
         # 模式过滤
         if not self._check_mode(cmd):
             return
@@ -389,6 +403,114 @@ class UranMoveNode(Node):
             )
             return False
         return True
+
+    def _update_motion_control_lock(self, lock):
+        if not isinstance(lock, dict):
+            lock = {}
+        previous_active = bool(self._motion_control_lock.get('active', False))
+        previous_owner = str(self._motion_control_lock.get('owner') or '')
+
+        normalized = {
+            'active': bool(lock.get('active', False)),
+            'owner': str(lock.get('owner') or ''),
+            'task_id': str(lock.get('task_id') or ''),
+            'reason': str(lock.get('reason') or ''),
+            'timestamp_ns': int(lock.get('timestamp_ns') or 0),
+            'expires_at_ns': int(lock.get('expires_at_ns') or 0),
+        }
+        self._motion_control_lock = normalized
+
+        current_active = bool(normalized.get('active', False))
+        current_owner = str(normalized.get('owner') or '')
+        if current_active and (not previous_active or current_owner != previous_owner):
+            self._suspend_plugin_for_control_lock(normalized)
+            self._write_state('motion_control_blocked_by', current_owner, urgent=True)
+            self._publish_uplink(
+                data_type='move_control_lock_event',
+                payload={
+                    'event': 'acquired',
+                    'owner': current_owner,
+                    'task_id': normalized.get('task_id', ''),
+                    'reason': normalized.get('reason', ''),
+                    'timestamp_ns': self.get_clock().now().nanoseconds,
+                },
+                urgent=False,
+            )
+            return
+
+        if previous_active and not current_active:
+            self._resume_plugin_after_control_lock(previous_owner, normalized)
+            self._write_state('motion_control_blocked_by', '', urgent=True)
+            self._publish_uplink(
+                data_type='move_control_lock_event',
+                payload={
+                    'event': 'released',
+                    'owner': previous_owner,
+                    'reason': normalized.get('reason', ''),
+                    'timestamp_ns': self.get_clock().now().nanoseconds,
+                },
+                urgent=False,
+            )
+
+    def _suspend_plugin_for_control_lock(self, lock: dict):
+        if self._plugin is None or self._control_suspended_by_lock:
+            self._control_suspended_by_lock = True
+            return
+        try:
+            self._plugin.on_control_suspended(
+                owner=str(lock.get('owner') or ''),
+                reason=str(lock.get('reason') or ''),
+            )
+        except Exception as exc:
+            self.get_logger().error(f'Plugin suspend for control lock failed: {exc}')
+        self._control_suspended_by_lock = True
+
+    def _resume_plugin_after_control_lock(self, owner: str, lock: dict):
+        if self._plugin is None or not self._control_suspended_by_lock:
+            self._control_suspended_by_lock = False
+            return
+        try:
+            self._plugin.on_control_resumed(
+                owner=str(owner or ''),
+                reason=str(lock.get('reason') or ''),
+            )
+        except Exception as exc:
+            self.get_logger().error(f'Plugin resume after control lock failed: {exc}')
+        self._control_suspended_by_lock = False
+
+    def _check_motion_control_lock(self, cmd: UnifiedMoveCmd) -> bool:
+        lock = self._motion_control_lock
+        if not bool(lock.get('active', False)):
+            return True
+
+        owner = str(lock.get('owner') or '')
+        controller = str(cmd.controller or '')
+        source_pkg = self._cmd_source_pkg(cmd)
+        if owner and controller == 'auto' and source_pkg == owner:
+            return True
+
+        self._publish_uplink(
+            data_type='move_reject_event',
+            payload={
+                'reason': 'motion control locked',
+                'controller': controller,
+                'source_pkg': source_pkg,
+                'lock_owner': owner,
+                'lock_task_id': str(lock.get('task_id') or ''),
+                'control_mode': self._control_mode,
+            },
+            urgent=False,
+        )
+        return False
+
+    def _cmd_source_pkg(self, cmd: UnifiedMoveCmd) -> str:
+        try:
+            extra = json.loads(cmd.extra_json or '{}')
+        except Exception:
+            extra = {}
+        if isinstance(extra, dict):
+            return str(extra.get('source_pkg') or '')
+        return ''
 
     # ------------------------------------------------------------------ #
     #  上报                                                                #

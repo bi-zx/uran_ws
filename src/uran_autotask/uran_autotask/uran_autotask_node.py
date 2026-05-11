@@ -267,6 +267,7 @@ class UranAutotaskNode(Node):
             stamp_getter=lambda: self.get_clock().now().to_msg(),
             publish_uplink=self._publish_uplink_message,
             write_state=self._write_state,
+            write_motion_control_lock=self._write_motion_control_lock,
             publish_media_control=self._publish_media_control,
             set_map_pose_reporting_enabled=self._set_map_pose_reporting_enabled,
             move_gateway=self._move_gateway,
@@ -1042,6 +1043,26 @@ class UranAutotaskNode(Node):
         )
         msg.source_pkg = 'uran_autotask'
         msg.timestamp_ns = self._now_ns()
+        self._state_pub.publish(msg)
+
+    def _write_motion_control_lock(self, *, active: bool, task_id: str = '', reason: str = ''):
+        now_ns = self._now_ns()
+        payload = {
+            'active': bool(active),
+            'owner': 'uran_autotask' if active else '',
+            'task_id': str(task_id or ''),
+            'reason': str(reason or ''),
+            'timestamp_ns': now_ns,
+            # 兜底：节点异常退出时，core 会自动释放这个锁。
+            'expires_at_ns': now_ns + 24 * 60 * 60 * 1_000_000_000 if active else 0,
+        }
+        msg = StateField()
+        msg.field_name = 'motion_control_lock'
+        msg.value_json = json.dumps(payload, ensure_ascii=False)
+        msg.persistent = False
+        msg.urgent = True
+        msg.source_pkg = 'uran_autotask'
+        msg.timestamp_ns = now_ns
         self._state_pub.publish(msg)
 
     def _srv_get_task_status(self, request, response):

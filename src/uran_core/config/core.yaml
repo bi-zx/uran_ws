@@ -8,5 +8,6 @@ uran_core:
     - "error_code"
     - "control_mode"
     - "current_controller"
+    - "motion_control_lock"
     - "battery_level"
   db_path: "/tmp/uran_core_state.db"   # 持久化 SQLite 路径

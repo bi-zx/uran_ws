@@ -27,6 +27,7 @@ class UranMoveGateway:
         msg.controller = 'auto'
         msg.action = str(action)
         payload = dict(extra or {})
+        payload['source_pkg'] = 'uran_autotask'
         if reason:
             payload['reason'] = str(reason)
         msg.extra_json = json.dumps(payload, ensure_ascii=False)

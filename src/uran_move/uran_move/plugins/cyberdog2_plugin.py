@@ -246,6 +246,22 @@ class CyberDog2Plugin(MovePluginBase):
     def on_failsafe_recovered(self):
         self._node.get_logger().info('CyberDog2: failsafe recovered')
 
+    def on_control_suspended(self, *, owner: str = '', reason: str = ''):
+        """停止 uran_move 的周期保活，避免和任务导航链路抢底层运动控制。"""
+        self._last_execute_ts = 0.0
+        self._idle_zero_since = None
+        self._auto_stand_sent = False
+        self._auto_stand_retry_after = 0.0
+        self._auto_stand_in_progress = False
+        self._node.get_logger().info(
+            f'CyberDog2: control suspended by {owner or "unknown"}, reason={reason or ""}'
+        )
+
+    def on_control_resumed(self, *, owner: str = '', reason: str = ''):
+        self._node.get_logger().info(
+            f'CyberDog2: control resumed after {owner or "unknown"}, reason={reason or ""}'
+        )
+
     def destroy(self):
         if hasattr(self, '_keepalive_timer'):
             self._keepalive_timer.cancel()
