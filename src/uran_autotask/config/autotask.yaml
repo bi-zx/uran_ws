@@ -114,7 +114,9 @@ uran_autotask:
 
   gps_monitor:
     enabled: false
-    gps_topic: "gps_payload"
+    gps_topic: "/ubx/gps_payload"
+    status_topic: "/ubx/status"
+    status_stale_timeout_s: 5.0
     # 当前位姿上报保持走设备现有“当前机器人位姿”通道。
     map_pose_topic: "dog_pose"
     map_pose_message_type: "auto"

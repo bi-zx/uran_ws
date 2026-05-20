@@ -10,7 +10,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from uran_msgs.msg import MediaCtrlCmd, ModeSwitchCmd, StateField, StateSnapshot, TaskCtrlCmd, UplinkPayload
@@ -25,6 +25,7 @@ from .geo_utils import GeoReferenceConfig, MapProjector
 from .localization import (
     ClosedLoopManager,
     GeoPoseFuser,
+    GpsStatusTracker,
     GpsSupervisor,
     PoseRegistry,
     VisualPoseSupervisor,
@@ -141,6 +142,8 @@ class UranAutotaskNode(Node):
 
         self._pose_registry = PoseRegistry()
         self._geo_pose_fuser = GeoPoseFuser(self._pose_report_cfg)
+        self._gps_status_tracker = GpsStatusTracker(self._gps_monitor_cfg)
+        self._gps_status_topic = ''
         self._tf_buffer = None
         self._tf_listener = None
         self._map_tf_fallback_cfg = dict(self._pose_report_cfg.get('map_tf_fallback') or {})
@@ -411,6 +414,11 @@ class UranAutotaskNode(Node):
         if needs_gps and self._protocol_available:
             gps_topic = self._resolve_name(self._gps_monitor_cfg.get('gps_topic', 'gps_payload'))
             self.create_subscription(self._GpsPayload, gps_topic, self._cb_gps_payload, 10)
+        if needs_gps:
+            status_topic = self._resolve_name(self._gps_monitor_cfg.get('status_topic', '/ubx/status'))
+            if status_topic:
+                self._gps_status_topic = status_topic
+                self.create_subscription(String, status_topic, self._cb_gps_status, 10)
 
         if needs_map_pose:
             self._ensure_pose_subscription(
@@ -725,6 +733,12 @@ class UranAutotaskNode(Node):
         except Exception as exc:
             self.get_logger().warning(f'failed to parse gps payload: {exc}')
 
+    def _cb_gps_status(self, msg: String):
+        self._gps_status_tracker.update_from_json(
+            msg.data,
+            received_timestamp_ns=self._now_ns(),
+        )
+
     def _cb_pose_stamped(self, role: str, msg: PoseStamped):
         payload = pose_stamped_to_dict(msg)
         self._update_pose_by_role(role, payload)
@@ -807,11 +821,15 @@ class UranAutotaskNode(Node):
     def _cb_pose_report_tick(self):
         now_ns = self._now_ns()
         position = self._current_fused_position(timestamp_ns=now_ns)
+        gps_status = self._gps_status_tracker.snapshot(now_ns=now_ns)
+        position = dict(position)
+        position['gps_status'] = gps_status
         payload = {
             'schema_version': 1,
             'robot_id': str(self._pose_report_cfg.get('robot_id', '')),
             'coordinate_system': 'WGS84',
             'position': position,
+            'gps_status': gps_status,
             'control_mode': self._control_mode,
             'controller': self._controller,
             'battery_level': self._battery_level,
@@ -995,6 +1013,8 @@ class UranAutotaskNode(Node):
                 'visual': dict(self._pose_channel_state['visual']),
             },
             'geo_pose_fuser': self._geo_pose_fuser.state_snapshot(),
+            'gps_status': self._gps_status_tracker.snapshot(now_ns=self._now_ns()),
+            'gps_status_topic': self._gps_status_topic,
             'pose_history': self._pose_registry.history_summary(),
             'local_odometry_note': (
                 'The visual channel stores the selected local odometry source. '
