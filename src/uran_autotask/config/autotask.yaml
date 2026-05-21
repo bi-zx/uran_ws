@@ -60,11 +60,40 @@ uran_autotask:
     enable_goal_correction: true
     max_goal_correction_m: 10.0
 
+  straight_drive:
+    enabled: true
+    # 只用于“直线行驶一段距离/一段时间”的单步任务，不做全局导航。
+    # 相对名会自动加机器狗 namespace，例如 /mi_desktop_48_b0_2d_5f_b6_d0/scan。
+    scan_topic: "scan"
+    control_hz: 20.0
+    default_speed_mps: 0.18
+    max_speed_mps: 0.25
+    min_avoid_speed_mps: 0.06
+    max_angular_speed_radps: 0.7
+    heading_kp: 1.4
+    scan_timeout_s: 0.35
+    blocked_timeout_s: 4.0
+    distance_tolerance_m: 0.15
+    usable_fov_deg: 180.0
+    obstacle_consider_range_m: 3.0
+    robot_radius_m: 0.35
+    safety_margin_m: 0.20
+    min_stop_distance_m: 0.65
+    clear_path_distance_m: 1.4
+    min_gap_width_deg: 28.0
+    max_bubble_angle_deg: 35.0
+    front_sector_deg: 18.0
+    # 如果 /scan 的 theta=0 不是机器狗正前方，可在这里补偿角度。
+    angle_offset_deg: 0.0
+    median_window: 5
+
   pose_report:
     enabled: true
     # ROS 端通过 /uran/core/uplink/data 周期上报当前位置，由 uran_core 转发总后台。
     interval_s: 1.0
     data_type: "robot_pose"
+    packet_type: "robot_pose"
+    packet_label: "机器狗实时位置"
     robot_id: ""
     # 留空表示自动探测全局 map 位姿话题。
     # 实机上 /dog_pose 可能只有订阅者、没有发布者，不能写死为默认输入。

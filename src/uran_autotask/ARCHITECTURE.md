@@ -7,7 +7,10 @@ The package should stay narrow:
 
 - receive task packets from `/uran/core/downlink/task_ctrl`;
 - parse mission-planner route payloads;
-- dispatch navigation goals through the CyberDog algorithm manager;
+- run the local outdoor route-following and obstacle-avoidance loop inside
+  `uran_autotask`;
+- keep the CyberDog algorithm-manager adapter only for legacy or transitional
+  navigation paths;
 - supervise outdoor GPS / local odometry alignment;
 - publish task progress and robot pose through `/uran/core/uplink/data`;
 - avoid local debug frontend, local map preview pages, and duplicated UI logic.
@@ -45,6 +48,11 @@ uran_autotask/
 │   │   ├── cyberdog_algorithm_manager.py
 │   │   ├── cyberdog_camera_capture.py
 │   │   └── uran_move_gateway.py
+│   ├── navigation/
+│   │   ├── local_outdoor_backend.py
+│   │   ├── obstacle_avoidance.py
+│   │   ├── route_follower.py
+│   │   └── velocity_policy.py
 │   ├── localization/
 │   │   ├── closed_loop_manager.py
 │   │   ├── gps_supervisor.py
@@ -86,6 +94,9 @@ Payload JSON:
 ```json
 {
   "schema_version": 1,
+  "packet_type": "robot_pose",
+  "packet_label": "机器狗实时位置",
+  "data_type": "robot_pose",
   "robot_id": "",
   "coordinate_system": "WGS84",
   "position": {
@@ -109,6 +120,10 @@ Payload JSON:
   "timestamp_ns": 0
 }
 ```
+
+The MQTT envelope already carries `data_type=robot_pose`. The payload repeats
+`packet_type=robot_pose` so backend code can still identify the packet when it
+only parses the inner payload object.
 
 `fusion_state` values:
 
@@ -151,6 +166,42 @@ This is not a full Kalman filter. The current fusion rule is:
 After enough logs are collected, the internal estimator can be upgraded from a
 sliding window to a Kalman filter without changing the cloud protocol.
 
+## Planned Outdoor Motion Layer
+
+The outdoor motion layer stays inside `uran_autotask`. It is not a separate ROS
+package. The split is by responsibility:
+
+- `mission/` owns task state, task progress, pause/resume/stop, and uplink data;
+- `localization/` owns GPS, visual odometry, and pose alignment;
+- `navigation/` owns route following, obstacle avoidance, and velocity
+  generation;
+- `adapters/` owns ROS-facing bridges to `uran_core`, `uran_move`, and the
+  legacy CyberDog algorithm manager.
+
+The intended control flow for the new outdoor path is:
+
+1. `mission_manager` parses the outdoor route and keeps the task state machine;
+2. the local outdoor backend takes the next route point;
+3. the route follower uses the fused pose as the motion reference;
+4. the obstacle avoidance layer filters laser or point-cloud inputs and scores
+   safe velocities;
+5. the velocity policy picks a low-level command;
+6. the command goes through `/uran/core/downlink/move_cmd` and then
+   `uran_move`.
+
+This keeps the control logic close to the bottom layer, but still outside the
+mission state machine. `mission_manager` should not parse raw scan data, and the
+obstacle layer should not publish task progress or own task semantics.
+
+The first implementation should keep the motion source package as
+`uran_autotask`, so the existing `motion_control_lock` path in `uran_move` does
+not need a new ownership model.
+
+For the smaller `straight_drive` command, the navigation layer only keeps the
+starting heading and reacts to the current `LaserScan`. It does not build a map,
+does not run SLAM, and does not guarantee a route around complex obstacles.
+When no safe local gap exists, it must stop and report `blocked`.
+
 ## Configuration
 
 Important groups in [autotask.yaml](/home/techno/uran_ws/src/uran_autotask/config/autotask.yaml):
@@ -161,7 +212,8 @@ Important groups in [autotask.yaml](/home/techno/uran_ws/src/uran_autotask/confi
   thresholds. The selected source can be visual odometry, leg odometry, fused
   odometry, or TF.
 - `outdoor_pose_aligner`: sliding-window alignment parameters.
-- `cyberdog_backend`: CyberDog algorithm manager action/service names.
+- `cyberdog_backend`: CyberDog algorithm manager action/service names for
+  transitional or legacy paths.
 
 ## Field Data Needed Before High-Frequency Fusion
 
@@ -202,7 +254,9 @@ to TF `map -> base_link` when that transform is available.
 - local HTTP debug frontend;
 - local click-goal control page;
 - local map image preview assets;
-- a second local obstacle avoidance controller;
+- a second ROS package for the outdoor control loop;
+- a second task manager that also owns the mission state machine;
+- a low-level motion path that bypasses `uran_move`;
 - direct frontend access to ROS topics.
 
 The product frontend belongs to the cloud backend. `uran_autotask` should only

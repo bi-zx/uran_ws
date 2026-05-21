@@ -42,6 +42,7 @@ class MissionManager:
         publish_media_control,
         set_map_pose_reporting_enabled,
         move_gateway=None,
+        straight_drive_controller=None,
         extra_status_getter=None,
         mission_defaults,
         outdoor_goal_resolver_cfg: Optional[Dict[str, Any]] = None,
@@ -67,6 +68,7 @@ class MissionManager:
         self._publish_media_control = publish_media_control
         self._set_map_pose_reporting_enabled = set_map_pose_reporting_enabled
         self._move_gateway = move_gateway
+        self._straight_drive_controller = straight_drive_controller
         self._extra_status_getter = extra_status_getter
         self._mission_defaults = dict(mission_defaults or {})
         self._outdoor_goal_resolver = OutdoorGoalResolver(outdoor_goal_resolver_cfg)
@@ -109,6 +111,7 @@ class MissionManager:
         self._outdoor_gps_vo_gate = GpsVoGate()
         self._outdoor_start_alignment: Dict[str, Any] = {}
         self._motion_control_locked = False
+        self._straight_drive_task: Optional[Dict[str, Any]] = None
 
     @property
     def task(self) -> Optional[MissionTask]:
@@ -119,7 +122,7 @@ class MissionManager:
         return self._runtime
 
     def has_active_task(self) -> bool:
-        if self._task is None and self._outdoor_mission is None:
+        if self._task is None and self._outdoor_mission is None and self._straight_drive_task is None:
             return False
         return self._runtime.stage not in TERMINAL_TASK_STAGES
 
@@ -203,6 +206,7 @@ class MissionManager:
         payload['map_pose'] = self._pose_registry.map_pose_dict()
         payload['visual_pose'] = self._pose_registry.visual_pose_dict()
         payload['outdoor_navigation'] = self._outdoor_status_snapshot()
+        payload['straight_drive'] = self._straight_drive_status_snapshot()
         if self._extra_status_getter is not None:
             payload.update(dict(self._extra_status_getter() or {}))
         return payload
@@ -258,6 +262,14 @@ class MissionManager:
             'pose_alignment': self._outdoor_pose_aligner.state_snapshot(),
         }
 
+    def _straight_drive_status_snapshot(self) -> Dict[str, Any]:
+        if self._straight_drive_controller is None:
+            return {'active': False, 'available': False}
+        snapshot = dict(self._straight_drive_controller.snapshot())
+        snapshot['available'] = True
+        snapshot['task'] = dict(self._straight_drive_task or {})
+        return snapshot
+
     def status_json(self, *, task_id: str = '') -> str:
         if task_id and task_id != self._runtime.task_id:
             return json.dumps(
@@ -271,11 +283,16 @@ class MissionManager:
         return json.dumps(self.build_status_payload(), ensure_ascii=False)
 
     def destroy(self):
+        self._stop_straight_drive_if_needed(reason='autotask_destroyed')
         self._release_motion_control_lock(reason='autotask_destroyed')
         self._stop_recording_if_needed()
         self._set_map_pose_reporting_enabled(False)
 
     def _tick_task(self, *, monotonic_s: float, backend_event):
+        if self._straight_drive_task is not None:
+            self._tick_straight_drive_task(monotonic_s=monotonic_s)
+            return
+
         if self._outdoor_mission is not None:
             self._tick_outdoor_task(monotonic_s=monotonic_s, backend_event=backend_event)
             return
@@ -353,6 +370,14 @@ class MissionManager:
         self._publish_periodic_progress(monotonic_s=monotonic_s)
 
     def _handle_start(self, *, task_id: str, task_type: str, task_params_json: str):
+        if self._is_straight_drive_task(task_type=task_type, task_params_json=task_params_json):
+            self._handle_straight_drive_start(
+                task_id=task_id,
+                task_type=task_type,
+                task_params_json=task_params_json,
+            )
+            return
+
         if is_outdoor_task_payload(task_type=task_type, task_params_json=task_params_json):
             self._handle_outdoor_start(
                 task_id=task_id,
@@ -422,6 +447,141 @@ class MissionManager:
 
         self._set_map_pose_reporting_enabled(True)
         self._start_recording_if_needed()
+        self._publish_task_progress()
+        self._write_state_fields()
+
+    def _is_straight_drive_task(self, *, task_type: str, task_params_json: str) -> bool:
+        normalized_type = str(task_type or '').strip().lower()
+        if normalized_type in {'straight_drive', 'drive_straight', 'forward_drive'}:
+            return True
+        try:
+            payload = json.loads(task_params_json or '{}')
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        payload_type = str(payload.get('task_type') or payload.get('type') or '').strip().lower()
+        return payload_type in {'straight_drive', 'drive_straight', 'forward_drive'}
+
+    def _optional_float(self, value) -> Optional[float]:
+        if value in (None, ''):
+            return None
+        try:
+            return float(value)
+        except Exception as exc:
+            raise ValueError(f'{value!r} is not a number') from exc
+
+    def _handle_straight_drive_start(self, *, task_id: str, task_type: str, task_params_json: str):
+        if self._straight_drive_controller is None:
+            self._runtime = TaskRuntime(
+                task_id=task_id,
+                stage='aborted',
+                status='exception',
+                error=self._make_error(
+                    code='E_STRAIGHT_DRIVE_UNAVAILABLE',
+                    description='straight drive controller is unavailable',
+                    suggested_action='check_autotask_config',
+                ),
+            )
+            self._publish_task_progress()
+            self._write_state_fields()
+            return
+
+        try:
+            payload = json.loads(task_params_json or '{}')
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception as exc:
+            self._runtime = TaskRuntime(
+                task_id=task_id,
+                stage='aborted',
+                status='exception',
+                error=self._make_error(
+                    code='E_STRAIGHT_DRIVE_PARSE',
+                    description=f'failed to parse straight drive params: {exc}',
+                    suggested_action='fix_task_payload',
+                ),
+            )
+            self._publish_task_progress()
+            self._write_state_fields()
+            return
+
+        try:
+            distance_m = self._optional_float(payload.get('distance_m', payload.get('distance')))
+            duration_s = self._optional_float(payload.get('duration_s', payload.get('duration')))
+            speed_mps = self._optional_float(payload.get('speed_mps', payload.get('speed')))
+        except ValueError as exc:
+            self._runtime = TaskRuntime(
+                task_id=task_id,
+                stage='aborted',
+                status='exception',
+                error=self._make_error(
+                    code='E_STRAIGHT_DRIVE_PARSE',
+                    description=f'failed to parse straight drive numeric params: {exc}',
+                    suggested_action='fix_task_payload',
+                ),
+            )
+            self._task = None
+            self._outdoor_mission = None
+            self._straight_drive_task = None
+            self._publish_task_progress()
+            self._write_state_fields()
+            return
+        self._task = None
+        self._outdoor_mission = None
+        self._straight_drive_task = {
+            'task_id': str(task_id or ''),
+            'task_type': str(task_type or payload.get('task_type') or 'straight_drive'),
+            'distance_m': distance_m,
+            'duration_s': duration_s,
+            'speed_mps': speed_mps,
+            'params': payload,
+        }
+        self._runtime = TaskRuntime(
+            task_id=str(task_id or ''),
+            stage='preparing',
+            status='normal',
+            current_waypoint_index=0,
+            current_waypoint_seq=0,
+            total_waypoints=1,
+            progress_percent=0.0,
+            event='straight_drive_received',
+            error=None,
+        )
+        self._active_waypoint_index = None
+        self._active_outdoor_point_index = None
+        self._active_outdoor_goal_resolution = None
+        self._active_outdoor_candidate_index = None
+        self._hover_until = None
+        self._action_runner.reset()
+        self._closed_loop_manager.reset()
+        self._acquire_motion_control_lock(task_id=self._runtime.task_id, reason='straight_drive_received')
+
+        if self._require_auto_mode and self._control_mode_getter() != 'auto':
+            self._pause_with_error(
+                code='E_TASK_CONFLICT',
+                description='current control_mode is not auto; switch to auto before straight drive',
+                suggested_action='switch_to_auto_mode',
+            )
+            return
+
+        result = self._straight_drive_controller.start(
+            task_id=self._runtime.task_id,
+            distance_m=self._straight_drive_task.get('distance_m'),
+            duration_s=self._straight_drive_task.get('duration_s'),
+            speed_mps=self._straight_drive_task.get('speed_mps'),
+        )
+        if not result.get('accepted', False):
+            self._pause_with_error(
+                code=result.get('code', 'E_STRAIGHT_DRIVE_REJECTED'),
+                description=result.get('message', 'straight drive command was rejected'),
+                suggested_action='check_straight_drive_params',
+            )
+            return
+
+        self._runtime.stage = 'executing'
+        self._runtime.status = 'normal'
+        self._runtime.event = 'straight_drive_started'
         self._publish_task_progress()
         self._write_state_fields()
 
@@ -538,9 +698,14 @@ class MissionManager:
         self._write_state_fields()
 
     def _handle_pause(self, *, reason: str):
-        if (self._task is None and self._outdoor_mission is None) or self._runtime.stage in TERMINAL_TASK_STAGES:
+        if (
+            self._task is None and
+            self._outdoor_mission is None and
+            self._straight_drive_task is None
+        ) or self._runtime.stage in TERMINAL_TASK_STAGES:
             return
 
+        self._stop_straight_drive_if_needed(reason=reason)
         self._stop_backend_navigation_if_needed()
         self._publish_move_stop(reason=reason)
         self._active_waypoint_index = None
@@ -557,7 +722,7 @@ class MissionManager:
         self._write_state_fields()
 
     def _handle_resume(self):
-        if self._task is None and self._outdoor_mission is None:
+        if self._task is None and self._outdoor_mission is None and self._straight_drive_task is None:
             return
         if self._runtime.stage != 'paused':
             return
@@ -569,6 +734,20 @@ class MissionManager:
             )
             return
         self._acquire_motion_control_lock(task_id=self._runtime.task_id, reason='task_resumed')
+        if self._straight_drive_task is not None and self._straight_drive_controller is not None:
+            result = self._straight_drive_controller.start(
+                task_id=self._runtime.task_id,
+                distance_m=self._straight_drive_task.get('distance_m'),
+                duration_s=self._straight_drive_task.get('duration_s'),
+                speed_mps=self._straight_drive_task.get('speed_mps'),
+            )
+            if not result.get('accepted', False):
+                self._pause_with_error(
+                    code=result.get('code', 'E_STRAIGHT_DRIVE_REJECTED'),
+                    description=result.get('message', 'straight drive command was rejected'),
+                    suggested_action='check_straight_drive_params',
+                )
+                return
         self._runtime.stage = 'executing'
         self._runtime.status = 'normal'
         self._runtime.event = 'task_resumed'
@@ -577,12 +756,14 @@ class MissionManager:
         self._write_state_fields()
 
     def _handle_stop(self, *, reason: str):
+        self._stop_straight_drive_if_needed(reason=reason)
         self._stop_backend_navigation_if_needed()
         self._publish_move_stop(reason=reason)
         self._active_waypoint_index = None
         self._active_outdoor_point_index = None
         self._active_outdoor_goal_resolution = None
         self._active_outdoor_candidate_index = None
+        self._straight_drive_task = None
         self._hover_until = None
         self._action_runner.reset()
         self._runtime.stage = 'aborted'
@@ -599,6 +780,62 @@ class MissionManager:
         self._set_map_pose_reporting_enabled(False)
         self._publish_task_progress()
         self._write_state_fields()
+
+    def _tick_straight_drive_task(self, *, monotonic_s: float):
+        if self._straight_drive_task is None:
+            return
+
+        if self._require_auto_mode and self._control_mode_getter() != 'auto':
+            self._pause_with_error(
+                code='E_TASK_CONFLICT',
+                description='current control_mode is not auto',
+                suggested_action='switch_to_auto_mode',
+            )
+            return
+
+        if self._runtime.stage == 'paused':
+            self._publish_periodic_progress(monotonic_s=monotonic_s)
+            return
+
+        if self._straight_drive_controller is None:
+            self._pause_with_error(
+                code='E_STRAIGHT_DRIVE_UNAVAILABLE',
+                description='straight drive controller is unavailable',
+                suggested_action='check_autotask_config',
+            )
+            return
+
+        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+        state = str(result.get('state') or '')
+        if state == 'completed':
+            self._runtime.current_waypoint_index = 0
+            self._runtime.current_waypoint_seq = 0
+            self._runtime.progress_percent = 100.0
+            self._complete_task()
+            return
+
+        if result.get('terminal') and state == 'blocked':
+            self._pause_with_error(
+                code='E_STRAIGHT_DRIVE_BLOCKED',
+                description=str(result.get('reason') or 'straight drive is blocked'),
+                suggested_action='clear_obstacle_or_send_stop',
+            )
+            return
+
+        if not result.get('throttled', False):
+            self._runtime.stage = 'executing'
+            self._runtime.status = 'normal'
+            self._runtime.event = f'straight_drive_{state or "running"}'
+            if self._straight_drive_task.get('distance_m'):
+                traveled = float(result.get('distance_traveled_m', 0.0) or 0.0)
+                target = max(0.01, float(self._straight_drive_task.get('distance_m') or 0.01))
+                self._runtime.progress_percent = max(0.0, min(99.0, 100.0 * traveled / target))
+            elif self._straight_drive_task.get('duration_s'):
+                elapsed = float(result.get('elapsed_s', 0.0) or 0.0)
+                target = max(0.01, float(self._straight_drive_task.get('duration_s') or 0.01))
+                self._runtime.progress_percent = max(0.0, min(99.0, 100.0 * elapsed / target))
+
+        self._publish_periodic_progress(monotonic_s=monotonic_s)
 
     def _dispatch_next_waypoint_if_needed(self):
         if self._task is None:
@@ -1141,9 +1378,11 @@ class MissionManager:
         self._write_state_fields()
 
     def _complete_task(self):
+        self._stop_straight_drive_if_needed(reason='task_completed')
         self._active_outdoor_point_index = None
         self._active_outdoor_goal_resolution = None
         self._active_outdoor_candidate_index = None
+        self._straight_drive_task = None
         self._runtime.stage = 'completed'
         self._runtime.status = 'normal'
         self._runtime.progress_percent = 100.0
@@ -1157,12 +1396,14 @@ class MissionManager:
         self._write_state_fields()
 
     def _abort_task(self, *, code: str, description: str, suggested_action: str):
+        self._stop_straight_drive_if_needed(reason=code)
         self._stop_backend_navigation_if_needed()
         self._publish_move_stop(reason='task_aborted')
         self._active_waypoint_index = None
         self._active_outdoor_point_index = None
         self._active_outdoor_goal_resolution = None
         self._active_outdoor_candidate_index = None
+        self._straight_drive_task = None
         self._hover_until = None
         self._action_runner.reset()
         self._runtime.stage = 'aborted'
@@ -1180,6 +1421,7 @@ class MissionManager:
         self._write_state_fields()
 
     def _pause_with_error(self, *, code: str, description: str, suggested_action: str):
+        self._stop_straight_drive_if_needed(reason=code)
         self._stop_backend_navigation_if_needed()
         self._publish_move_stop(reason=code)
         self._active_waypoint_index = None
@@ -1207,6 +1449,16 @@ class MissionManager:
             return
         map_name = self._task.map_name if self._task is not None else self._outdoor_mission.map_name
         self._dispatcher.stop_all_tasks(map_name=map_name)
+
+    def _stop_straight_drive_if_needed(self, *, reason: str):
+        if self._straight_drive_controller is None:
+            return
+        if not self._straight_drive_controller.is_active():
+            return
+        try:
+            self._straight_drive_controller.stop(reason=reason)
+        except Exception as exc:
+            self._logger.warning(f'failed to stop straight drive controller: {exc}')
 
     def _publish_move_stop(self, *, reason: str):
         if self._move_gateway is None:

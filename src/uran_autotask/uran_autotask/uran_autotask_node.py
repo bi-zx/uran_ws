@@ -10,6 +10,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -32,6 +33,7 @@ from .localization import (
     pose_stamped_to_dict,
 )
 from .mission import MissionManager
+from .navigation import StraightDriveController
 from .task_models import TERMINAL_TASK_STAGES
 
 
@@ -133,6 +135,7 @@ class UranAutotaskNode(Node):
             self._visual_pose_monitor_cfg.get('enabled', False)
         )
         self._media_actions_cfg = dict(node_cfg.get('media_actions', {}))
+        self._straight_drive_cfg = dict(node_cfg.get('straight_drive', {}))
 
         self._control_mode = 'manual'
         self._controller = 'cloud'
@@ -252,8 +255,16 @@ class UranAutotaskNode(Node):
         self._media_ctrl_pub = self.create_publisher(MediaCtrlCmd, '/uran/core/downlink/media_ctrl', 10)
         self._pose_enable_pub = None
         self._move_gateway = UranMoveGateway(self)
+        self._straight_drive_controller = StraightDriveController(
+            config=self._straight_drive_cfg,
+            move_gateway=self._move_gateway,
+            pose_getter=self._pose_registry.latest_visual_pose,
+            now_ns_getter=self._now_ns,
+            logger=self.get_logger(),
+        )
 
         self._configure_pose_related_subscriptions()
+        self._configure_straight_drive_subscriptions()
 
         self._mission_manager = MissionManager(
             logger=self.get_logger(),
@@ -274,6 +285,7 @@ class UranAutotaskNode(Node):
             publish_media_control=self._publish_media_control,
             set_map_pose_reporting_enabled=self._set_map_pose_reporting_enabled,
             move_gateway=self._move_gateway,
+            straight_drive_controller=self._straight_drive_controller,
             extra_status_getter=self._build_extra_status_payload,
             mission_defaults=self._mission_defaults,
             outdoor_goal_resolver_cfg=self._outdoor_goal_resolver_cfg,
@@ -286,6 +298,9 @@ class UranAutotaskNode(Node):
 
         self.create_service(GetTaskStatus, '/uran/autotask/status', self._srv_get_task_status)
         self.create_timer(self._loop_interval_s, self._cb_task_tick)
+        if bool(self._straight_drive_cfg.get('enabled', True)):
+            control_hz = max(5.0, float(self._straight_drive_cfg.get('control_hz', 20.0)))
+            self.create_timer(1.0 / control_hz, self._cb_straight_drive_tick)
         if self._pose_report_enabled:
             self.create_timer(self._pose_report_interval_s, self._cb_pose_report_tick)
 
@@ -455,6 +470,21 @@ class UranAutotaskNode(Node):
                     'mivins/reloc_odom',
                 ],
             )
+
+    def _configure_straight_drive_subscriptions(self):
+        if not bool(self._straight_drive_cfg.get('enabled', True)):
+            return
+        scan_topic = self._resolve_name(str(self._straight_drive_cfg.get('scan_topic', '/scan')))
+        if not scan_topic:
+            return
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(LaserScan, scan_topic, self._cb_straight_drive_scan, qos)
+        self.get_logger().info(f'straight drive obstacle avoidance listening scan: {scan_topic}')
 
     def _ensure_pose_subscription(
         self,
@@ -739,6 +769,10 @@ class UranAutotaskNode(Node):
             received_timestamp_ns=self._now_ns(),
         )
 
+    def _cb_straight_drive_scan(self, msg: LaserScan):
+        if self._straight_drive_controller is not None:
+            self._straight_drive_controller.update_scan(msg)
+
     def _cb_pose_stamped(self, role: str, msg: PoseStamped):
         payload = pose_stamped_to_dict(msg)
         self._update_pose_by_role(role, payload)
@@ -818,14 +852,28 @@ class UranAutotaskNode(Node):
         self._update_visual_pose_from_tf_fallback()
         self._mission_manager.tick(monotonic_s=time.monotonic())
 
+    def _cb_straight_drive_tick(self):
+        if (
+            self._straight_drive_controller is not None and
+            self._straight_drive_controller.is_active()
+        ):
+            self._mission_manager.tick(monotonic_s=time.monotonic())
+
     def _cb_pose_report_tick(self):
         now_ns = self._now_ns()
         position = self._current_fused_position(timestamp_ns=now_ns)
         gps_status = self._gps_status_tracker.snapshot(now_ns=now_ns)
         position = dict(position)
         position['gps_status'] = gps_status
+        data_type = str(self._pose_report_cfg.get('data_type', 'robot_pose'))
+        packet_type = str(self._pose_report_cfg.get('packet_type') or data_type)
         payload = {
             'schema_version': 1,
+            'packet_type': packet_type,
+            'packet_label': str(
+                self._pose_report_cfg.get('packet_label', '机器狗实时位置')
+            ),
+            'data_type': data_type,
             'robot_id': str(self._pose_report_cfg.get('robot_id', '')),
             'coordinate_system': 'WGS84',
             'position': position,
@@ -839,7 +887,7 @@ class UranAutotaskNode(Node):
             'timestamp_ns': now_ns,
         }
         self._publish_uplink_message(
-            data_type=str(self._pose_report_cfg.get('data_type', 'robot_pose')),
+            data_type=data_type,
             payload=payload,
             urgent=False,
         )

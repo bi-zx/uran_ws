@@ -20,6 +20,34 @@ class UranMoveGateway:
     def stand(self, *, reason: str = ''):
         self._publish_action('stand', reason=reason)
 
+    def velocity(
+        self,
+        *,
+        linear_x: float,
+        angular_z: float,
+        source: str = '',
+        reason: str = '',
+        task_id: str = '',
+    ):
+        msg = UnifiedMoveCmd()
+        msg.msg_version = '1.0'
+        msg.timestamp_ns = self._node.get_clock().now().nanoseconds
+        msg.controller = 'auto'
+        msg.linear_vel_x = float(linear_x)
+        msg.linear_vel_y = 0.0
+        msg.linear_vel_z = 0.0
+        msg.angular_vel_z = float(angular_z)
+        payload = {
+            'source_pkg': 'uran_autotask',
+            'source': str(source or 'velocity'),
+        }
+        if reason:
+            payload['reason'] = str(reason)
+        if task_id:
+            payload['task_id'] = str(task_id)
+        msg.extra_json = json.dumps(payload, ensure_ascii=False)
+        self._publisher.publish(msg)
+
     def _publish_action(self, action: str, *, reason: str = '', extra: Dict[str, Any] = None):
         msg = UnifiedMoveCmd()
         msg.msg_version = '1.0'

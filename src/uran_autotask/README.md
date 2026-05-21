@@ -7,7 +7,9 @@
 - 接收 `uran_core` 转发的任务控制消息；
 - 解析 `mission_planner` 生成的室外路径任务包；
 - 将经纬度航点转换为 CyberDog/Nav2 可执行的 `map` 坐标目标；
-- 调用 CyberDog 现有 `algorithm_manager` 执行导航；
+- 在包内执行室外路线跟随和近场绕障控制；
+- 支持 `straight_drive` 单步直线行驶任务，使用 2D 激光雷达做轻量避障；
+- 兼容保留 CyberDog 现有 `algorithm_manager` 的过渡接口；
 - 在户外任务中做 GPS 与本地里程计的对齐监督；
 - 按固定频率通过 `/uran/core/uplink/data` 上报机器狗当前位置；
 - 通过 `/uran/core/uplink/data` 上报任务进度和异常。
@@ -89,6 +91,10 @@ MQTT 后，顶层包形如：
 
 总后台新逻辑应优先读取 `payload` 对象；`payload_json` 保留用于兼容和排查。
 
+后台判断位置包类型时，优先使用 MQTT 顶层 `data_type`。如果后台只消费
+`payload` 对象，也可以使用 `payload.packet_type`。这两个字段默认都是
+`robot_pose`。
+
 ## robot_pose 上行包
 
 `pose_report` 默认每 1 秒发布一次。
@@ -104,6 +110,9 @@ robot_pose
 ```json
 {
   "schema_version": 1,
+  "packet_type": "robot_pose",
+  "packet_label": "机器狗实时位置",
+  "data_type": "robot_pose",
   "robot_id": "",
   "coordinate_system": "WGS84",
   "position": {
@@ -127,6 +136,48 @@ robot_pose
   "timestamp_ns": 0
 }
 ```
+
+## straight_drive 单步任务
+
+`straight_drive` 只表示“向前直线走一段距离或一段时间”。它不是未知环境自主导航，
+不使用地图，不做 SLAM。遇到近场障碍时会根据机器狗 namespace 下的 `scan`
+临时绕行；绕不开或雷达超时会停车并把任务置为暂停异常。
+
+默认配置 `straight_drive.scan_topic: "scan"` 是相对名。节点会先自动探测机器狗
+namespace，所以实机上会订阅类似 `/mi_desktop_48_b0_2d_5f_b6_d0/scan` 的话题。
+如果你写成 `/scan` 这种绝对名，就不会自动加 namespace。
+
+第一版默认 `scan` 的角度 0 就是机器狗正前方。如果实机雷达坐标和 `base_link`
+不一致，需要在 `straight_drive.angle_offset_deg` 里补偿。
+
+下行任务示例：
+
+```json
+{
+  "action": "start",
+  "task_id": "straight_001",
+  "task_type": "straight_drive",
+  "task_params_json": "{\"task_type\":\"straight_drive\",\"distance_m\":3.0,\"speed_mps\":0.18}"
+}
+```
+
+也可以用持续时间：
+
+```json
+{
+  "task_type": "straight_drive",
+  "duration_s": 8.0,
+  "speed_mps": 0.18
+}
+```
+
+状态会出现在 `task_progress.payload.straight_drive` 里。重点看：
+
+- `state`：`clear`、`avoid`、`stop`、`blocked`、`completed`。
+- `scan_age_s`：最近一帧雷达数据的年龄。
+- `distance_traveled_m`：按本地里程计估算的已走距离。
+- `decision.front_clearance_m`：正前方最近障碍距离。
+- `decision.theta_target_deg`：当前避障选择的目标方向。
 
 `fusion_state` 含义：
 
