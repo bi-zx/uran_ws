@@ -39,6 +39,22 @@ def _planner_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _looks_like_route_payload(payload: Dict[str, Any]) -> bool:
+    if any(key in payload for key in ('planner_result', 'plan_result', 'mission_plan')):
+        return True
+    route = payload.get('route')
+    if isinstance(route, dict):
+        if isinstance(route.get('points'), list):
+            return True
+        if any(key in route for key in ('route_nav_points', 'display_route_local_m', 'legs')):
+            return True
+    if all(key in payload for key in ('projection_origin', 'home_pose', 'start_pose')):
+        return True
+    if any(key in payload for key in ('route_nav_points', 'display_route_local_m', 'legs')):
+        return True
+    return False
+
+
 def _select_robot_route(plan: Dict[str, Any], robot_id: str = '') -> Dict[str, Any]:
     route = plan.get('route')
     if isinstance(route, dict):
@@ -105,7 +121,7 @@ def is_outdoor_task_payload(*, task_type: str, task_params_json: str) -> bool:
     payload_type = str(payload.get('task_type') or '').strip()
     if payload_type in OUTDOOR_TASK_TYPES:
         return True
-    return any(key in payload for key in ('planner_result', 'plan_result', 'route'))
+    return _looks_like_route_payload(payload)
 
 
 def parse_outdoor_task_definition(

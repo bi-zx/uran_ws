@@ -5,6 +5,7 @@ from uran_autotask.outdoor import (
     GpsVoGate,
     OutdoorExecutionPoint,
     OutdoorGoalResolver,
+    is_outdoor_task_payload,
     parse_outdoor_task_definition,
 )
 
@@ -122,6 +123,42 @@ def test_parse_mission_planner_route_payload_v1_1_points():
     assert mission.execution_points[2].nav_point_id == 'NP_001'
     assert mission.execution_points[2].lat == 38.88826
     assert mission.raw_route_summary['hardware_id'] == 'cyberdog2_01'
+
+
+def test_default_task_with_mission_planner_payload_is_outdoor_task():
+    payload = {
+        'schema_version': '1.2.0',
+        'task_type': 'mission_planner_route',
+        'task_id': 'mp_demo_cyberdog2_01',
+        'projection_origin': {'lat': 38.888235, 'lon': 115.508, 'alt': 0.0},
+        'home_pose': {'lat': 38.888235, 'lon': 115.508, 'alt': 0.0},
+        'start_pose': {'lat': 38.888235, 'lon': 115.508, 'alt': 0.0},
+        'route': {
+            'points': [
+                {
+                    'seq': 1,
+                    'point_id': 'NP_001',
+                    'kind': 'inspection',
+                    'map': {'frame_id': 'map', 'x': 1.0, 'y': 2.0, 'z': 0.0},
+                    'geo': {'lat': 38.888236, 'lon': 115.508001, 'alt': 0.0},
+                },
+            ],
+        },
+    }
+
+    assert is_outdoor_task_payload(
+        task_type='default_task',
+        task_params_json=json.dumps(payload),
+    )
+
+    mission = parse_outdoor_task_definition(
+        task_id='fallback',
+        task_type='default_task',
+        task_params_json=json.dumps(payload),
+        defaults={'map_name': '', 'frame_id': 'map'},
+    )
+    assert mission.task_type == 'mission_planner_route'
+    assert len(mission.execution_points) == 1
 
 
 def test_gps_vo_gate_accepts_in_tolerance():

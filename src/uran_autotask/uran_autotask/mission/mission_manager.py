@@ -497,18 +497,23 @@ class MissionManager:
         self._publish_periodic_progress(monotonic_s=monotonic_s)
 
     def _handle_start(self, *, task_id: str, task_type: str, task_params_json: str):
-        if self._is_straight_drive_task(task_type=task_type, task_params_json=task_params_json):
+        effective_task_type = self._effective_task_type(
+            task_type=task_type,
+            task_params_json=task_params_json,
+        )
+
+        if self._is_straight_drive_task(task_type=effective_task_type, task_params_json=task_params_json):
             self._handle_straight_drive_start(
                 task_id=task_id,
-                task_type=task_type,
+                task_type=effective_task_type,
                 task_params_json=task_params_json,
             )
             return
 
-        if is_outdoor_task_payload(task_type=task_type, task_params_json=task_params_json):
+        if is_outdoor_task_payload(task_type=effective_task_type, task_params_json=task_params_json):
             self._handle_outdoor_start(
                 task_id=task_id,
-                task_type=task_type,
+                task_type=effective_task_type,
                 task_params_json=task_params_json,
             )
             return
@@ -516,7 +521,7 @@ class MissionManager:
         try:
             task = parse_task_definition(
                 task_id=task_id,
-                task_type=task_type,
+                task_type=effective_task_type,
                 task_params_json=task_params_json,
                 defaults=self._mission_defaults,
             )
@@ -576,6 +581,22 @@ class MissionManager:
         self._start_recording_if_needed()
         self._publish_task_progress()
         self._write_state_fields()
+
+    def _effective_task_type(self, *, task_type: str, task_params_json: str) -> str:
+        normalized_type = str(task_type or '').strip()
+        try:
+            payload = json.loads(task_params_json or '{}')
+        except Exception:
+            return normalized_type
+        if not isinstance(payload, dict):
+            return normalized_type
+
+        payload_type = str(payload.get('task_type') or payload.get('type') or '').strip()
+        if payload_type:
+            return payload_type
+        if is_outdoor_task_payload(task_type='', task_params_json=task_params_json):
+            return 'mission_planner_route'
+        return normalized_type
 
     def _is_straight_drive_task(self, *, task_type: str, task_params_json: str) -> bool:
         normalized_type = str(task_type or '').strip().lower()
