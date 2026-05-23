@@ -3,7 +3,7 @@
 <package format="3">
   <name>uran_autotask</name>
   <version>0.1.0</version>
-  <description>URAN-autotask: CyberDog2 georeferenced waypoint mission orchestration over algorithm_manager</description>
+  <description>URAN-autotask: georeferenced mission execution with local LiDAR velocity navigation</description>
   <maintainer email="dev@example.com">URAN Dev</maintainer>
   <license>Apache-2.0</license>
 

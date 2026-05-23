@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .mission_contract import OutdoorMissionPlan
 
@@ -23,58 +23,38 @@ def _as_float(value: Any, default: float) -> float:
     return float(value)
 
 
-def _as_kind_set(value: Any) -> Set[str]:
-    if isinstance(value, str):
-        items: Iterable[Any] = value.split(',')
-    elif isinstance(value, (list, tuple, set)):
-        items = value
-    else:
-        items = ('start',)
-    return {str(item).strip().lower() for item in items if str(item).strip()}
-
-
 class OutdoorStartAligner:
-    """Align or reject an outdoor route before the first goal is dispatched."""
+    """Gate an outdoor route before the first inspection target is dispatched."""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         config = dict(config or {})
         self._enabled = _as_bool(config.get('enabled'), True)
-        self._aligned_tolerance_m = max(
+        self._first_inspection_direct_distance_m = max(
             0.0,
-            _as_float(config.get('aligned_tolerance_m'), 1.0),
+            _as_float(config.get('first_inspection_direct_distance_m'), 5.0),
         )
-        self._skip_start_tolerance_m = max(
-            self._aligned_tolerance_m,
-            _as_float(config.get('skip_start_tolerance_m'), 3.0),
-        )
-        allow_start_correction = config.get('allow_start_correction')
-        if allow_start_correction is None:
-            allow_start_correction = config.get('allow_route_shift')
-        max_start_correction_m = config.get('max_start_correction_m')
-        if max_start_correction_m is None:
-            max_start_correction_m = config.get('max_route_shift_m')
-        self._allow_start_correction = _as_bool(allow_start_correction, True)
-        self._max_start_correction_m = max(
+        self._home_calibration_accept_distance_m = max(
             0.0,
-            _as_float(max_start_correction_m, 10.0),
+            _as_float(config.get('home_calibration_accept_distance_m'), 5.0),
         )
+        self._home_calibration_reject_distance_m = max(
+            0.0,
+            _as_float(config.get('home_calibration_reject_distance_m'), 10.0),
+        )
+        if self._home_calibration_reject_distance_m < self._home_calibration_accept_distance_m:
+            self._home_calibration_reject_distance_m = self._home_calibration_accept_distance_m
         self._max_pose_age_s = max(
             0.0,
             _as_float(config.get('max_pose_age_s'), 3.0),
         )
-        self._skip_explicit_start = _as_bool(config.get('skip_explicit_start'), True)
-        self._start_kinds = _as_kind_set(config.get('start_kinds'))
 
     def config_snapshot(self) -> Dict[str, Any]:
         return {
             'enabled': self._enabled,
-            'aligned_tolerance_m': self._aligned_tolerance_m,
-            'skip_start_tolerance_m': self._skip_start_tolerance_m,
-            'allow_start_correction': self._allow_start_correction,
-            'max_start_correction_m': self._max_start_correction_m,
+            'first_inspection_direct_distance_m': self._first_inspection_direct_distance_m,
+            'home_calibration_accept_distance_m': self._home_calibration_accept_distance_m,
+            'home_calibration_reject_distance_m': self._home_calibration_reject_distance_m,
             'max_pose_age_s': self._max_pose_age_s,
-            'skip_explicit_start': self._skip_explicit_start,
-            'start_kinds': sorted(self._start_kinds),
         }
 
     def evaluate_and_apply(
@@ -116,17 +96,19 @@ class OutdoorStartAligner:
                     pose_timestamp_ns=pose_timestamp_ns,
                 )
 
-        start_point = mission.execution_points[0]
         current_x = float(current_pose['x'])
         current_y = float(current_pose['y'])
-        dx = current_x - float(start_point.x)
-        dy = current_y - float(start_point.y)
-        distance_m = math.hypot(dx, dy)
-        is_explicit_start = str(start_point.kind or '').strip().lower() in self._start_kinds
+        first_index, first_point = self._first_inspection_point(mission.execution_points)
+        if first_point is None:
+            return self._result(
+                status='failed',
+                action='reject',
+                message='outdoor mission has no inspection point',
+            )
+
+        home_index, home_point = self._home_point(mission.execution_points)
+        first_distance_m = self._distance(current_x, current_y, first_point)
         base = {
-            'distance_m': distance_m,
-            'dx': dx,
-            'dy': dy,
             'current_pose': {
                 'x': current_x,
                 'y': current_y,
@@ -135,58 +117,50 @@ class OutdoorStartAligner:
                 'timestamp_ns': pose_timestamp_ns,
                 'age_s': pose_age_s,
             },
-            'planned_start': start_point.to_dict(),
-            'explicit_start': is_explicit_start,
+            'first_inspection_index': first_index,
+            'first_inspection_point': first_point.to_dict(),
+            'first_inspection_distance_m': first_distance_m,
+            'home_index': home_index,
+            'home_point': home_point.to_dict() if home_point is not None else None,
+            'home_calibration_accept_distance_m': self._home_calibration_accept_distance_m,
+            'home_calibration_reject_distance_m': self._home_calibration_reject_distance_m,
         }
 
-        if distance_m <= self._aligned_tolerance_m:
-            if is_explicit_start and self._skip_explicit_start:
-                return self._result(
-                    status='start_skipped',
-                    action='skip_start',
-                    next_current_waypoint_index=0,
-                    message='current pose is already at the planned start point',
-                    **base,
-                )
+        if first_distance_m <= self._first_inspection_direct_distance_m:
             return self._result(
-                status='passed',
-                action='none',
-                message='current pose is already aligned with the planned start point',
+                status='direct_first_inspection',
+                action='go_first_inspection',
+                next_current_waypoint_index=first_index - 1,
+                message='current pose is close enough to the first inspection point',
                 **base,
             )
 
-        if (
-            is_explicit_start and
-            self._skip_explicit_start and
-            distance_m <= self._skip_start_tolerance_m
-        ):
+        if home_point is None:
             return self._result(
-                status='start_skipped',
-                action='skip_start',
-                next_current_waypoint_index=0,
-                message='current pose is close enough; explicit start point is skipped',
+                status='failed',
+                action='reject',
+                message='current pose is far from first inspection point and mission has no home point',
                 **base,
             )
 
-        if self._allow_start_correction and distance_m <= self._max_start_correction_m:
-            action = (
-                'apply_start_correction_and_skip_start'
-                if is_explicit_start and self._skip_explicit_start else
-                'apply_start_correction'
-            )
-            next_index = 0 if action == 'apply_start_correction_and_skip_start' else -1
+        home_distance_m = self._distance(current_x, current_y, home_point)
+        base['home_distance_m'] = home_distance_m
+
+        if home_distance_m <= self._home_calibration_accept_distance_m:
             return self._result(
-                status='start_correction_applied',
-                action=action,
-                next_current_waypoint_index=next_index,
-                goal_correction={
-                    'enabled': True,
-                    'applied': True,
-                    'dx': dx,
-                    'dy': dy,
-                    'reason': 'startup map pose correction',
-                },
-                message='startup correction will be applied while dispatching map goals',
+                status='home_calibration_passed',
+                action='go_first_inspection',
+                next_current_waypoint_index=first_index - 1,
+                message='home calibration is already within the accepted distance',
+                **base,
+            )
+
+        if home_distance_m <= self._home_calibration_reject_distance_m:
+            return self._result(
+                status='home_calibration_required',
+                action='run_home_calibration',
+                home_calibration_index=home_index,
+                message='current pose is far from first inspection point; run home calibration first',
                 **base,
             )
 
@@ -194,10 +168,32 @@ class OutdoorStartAligner:
             status='failed',
             action='reject',
             message=(
-                f'current pose is {distance_m:.2f}m from planned start, '
-                f'exceeding allowed startup correction {self._max_start_correction_m:.2f}m'
+                f'current pose is {first_distance_m:.2f}m from first inspection point and '
+                f'{home_distance_m:.2f}m from home, exceeding reject distance '
+                f'{self._home_calibration_reject_distance_m:.2f}m'
             ),
             **base,
+        )
+
+    def _first_inspection_point(self, points: Sequence) -> Tuple[int, Any]:
+        for index, point in enumerate(points):
+            if str(point.kind or '').strip().lower() == 'inspection':
+                return index, point
+        for index, point in enumerate(points):
+            if str(point.kind or '').strip().lower() == 'calibration':
+                return index, point
+        return -1, None
+
+    def _home_point(self, points: Sequence) -> Tuple[int, Any]:
+        for index, point in enumerate(points):
+            if str(point.kind or '').strip().lower() == 'home':
+                return index, point
+        return -1, None
+
+    def _distance(self, current_x: float, current_y: float, point) -> float:
+        return math.hypot(
+            float(current_x) - float(point.x),
+            float(current_y) - float(point.y),
         )
 
     def _result(self, *, status: str, action: str, message: str, **extra) -> Dict[str, Any]:

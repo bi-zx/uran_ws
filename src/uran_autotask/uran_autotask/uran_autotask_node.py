@@ -259,6 +259,7 @@ class UranAutotaskNode(Node):
             config=self._straight_drive_cfg,
             move_gateway=self._move_gateway,
             pose_getter=self._pose_registry.latest_visual_pose,
+            map_pose_getter=self._local_navigation_pose,
             now_ns_getter=self._now_ns,
             logger=self.get_logger(),
         )
@@ -904,6 +905,14 @@ class UranAutotaskNode(Node):
             alignment_state=alignment_state,
             timestamp_ns=timestamp_ns,
         )
+
+    def _local_navigation_pose(self) -> Optional[Dict[str, Any]]:
+        map_pose = self._pose_registry.latest_map_pose()
+        if map_pose:
+            return map_pose
+        if hasattr(self, '_mission_manager'):
+            return self._mission_manager.local_navigation_pose()
+        return None
 
     def _refresh_pose_channel_health(self):
         now_ns = self._now_ns()

@@ -36,15 +36,13 @@ uran_autotask:
 
   outdoor_start_alignment:
     enabled: true
-    # 室外任务启动前，比较当前 map 位姿和规划起点。
-    # 已在起点附近时跳过显式 start 点；偏差较小时下发目标时临时加启动修正；偏差过大时拒绝任务。
-    aligned_tolerance_m: 1.0
-    skip_start_tolerance_m: 3.0
-    allow_start_correction: true
-    max_start_correction_m: 10.0
+    # 室外任务启动前，不再按规划 start 点整体平移路线。
+    # 先比较当前位置到第一个巡检点的距离；5m 内直接去第一个巡检点。
+    # 超过 5m 时先走 home 点做一次校准；若当前位置到 home 超过 10m，则直接拒绝任务。
+    first_inspection_direct_distance_m: 5.0
+    home_calibration_accept_distance_m: 5.0
+    home_calibration_reject_distance_m: 10.0
     max_pose_age_s: 3.0
-    skip_explicit_start: true
-    start_kinds: ["start"]
 
   outdoor_pose_aligner:
     enabled: true
@@ -71,6 +69,10 @@ uran_autotask:
     min_avoid_speed_mps: 0.06
     max_angular_speed_radps: 0.7
     heading_kp: 1.4
+    # mission_planner_route / waypoint / patrol 也统一走这套局部目标点控制。
+    # target_tolerance_m 是“到达一个路线点”的局部判定半径，不能用 GPS 校验的大容差。
+    target_tolerance_m: 0.8
+    turn_in_place_heading_deg: 85.0
     scan_timeout_s: 0.35
     blocked_timeout_s: 4.0
     distance_tolerance_m: 0.15
@@ -131,7 +133,8 @@ uran_autotask:
       source: "none"
 
   cyberdog_backend:
-    enabled: true
+    # 统一改为 uran_autotask 自己输出速度控制，不再依赖 algorithm_manager 执行路线点。
+    enabled: false
     # 参考 uran_move 的 namespace 配法。
     # 可通过 `ros2 action list | grep start_algo_task` 查看完整路径。
     namespace: "auto"

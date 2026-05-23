@@ -26,6 +26,7 @@ class StraightDriveController:
         config: Optional[Dict[str, Any]] = None,
         move_gateway,
         pose_getter,
+        map_pose_getter=None,
         now_ns_getter,
         logger,
     ):
@@ -38,16 +39,21 @@ class StraightDriveController:
         self.max_angular_speed_radps = float(cfg.get('max_angular_speed_radps', 0.7))
         self.heading_kp = float(cfg.get('heading_kp', 1.4))
         self.slowdown_heading_rad = math.radians(float(cfg.get('slowdown_heading_deg', 55.0)))
+        self.turn_in_place_heading_rad = math.radians(
+            float(cfg.get('turn_in_place_heading_deg', 85.0))
+        )
         self.scan_timeout_s = float(cfg.get('scan_timeout_s', 0.35))
         self.blocked_timeout_s = float(cfg.get('blocked_timeout_s', 4.0))
         self.recover_heading_tolerance_rad = math.radians(
             float(cfg.get('recover_heading_tolerance_deg', 10.0))
         )
         self.distance_tolerance_m = float(cfg.get('distance_tolerance_m', 0.15))
+        self.target_tolerance_m = float(cfg.get('target_tolerance_m', 0.8))
         self.command_source = str(cfg.get('command_source', 'straight_drive'))
         self._planner = GapAvoidancePlanner(cfg)
         self._move_gateway = move_gateway
         self._pose_getter = pose_getter
+        self._map_pose_getter = map_pose_getter
         self._now_ns_getter = now_ns_getter
         self._logger = logger
 
@@ -62,6 +68,11 @@ class StraightDriveController:
         self._start_pose: Optional[Dict[str, Any]] = None
         self._target_distance_m: Optional[float] = None
         self._target_duration_s: Optional[float] = None
+        self._target_x: Optional[float] = None
+        self._target_y: Optional[float] = None
+        self._target_tolerance_m: float = self.target_tolerance_m
+        self._pose_source = 'local'
+        self._active_command_source = self.command_source
         self._speed_mps = self.default_speed_mps
         self._last_vx = 0.0
         self._last_wz = 0.0
@@ -82,6 +93,10 @@ class StraightDriveController:
         distance_m: Optional[float] = None,
         duration_s: Optional[float] = None,
         speed_mps: Optional[float] = None,
+        target_x: Optional[float] = None,
+        target_y: Optional[float] = None,
+        target_tolerance_m: Optional[float] = None,
+        command_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not self.enabled:
             return {
@@ -97,20 +112,31 @@ class StraightDriveController:
             }
         distance = None if distance_m is None else float(distance_m)
         duration = None if duration_s is None else float(duration_s)
-        if (distance is None or distance <= 0.0) and (duration is None or duration <= 0.0):
+        has_target = target_x is not None and target_y is not None
+        target_x_value = None if target_x is None else float(target_x)
+        target_y_value = None if target_y is None else float(target_y)
+        if (
+            (distance is None or distance <= 0.0) and
+            (duration is None or duration <= 0.0) and
+            not has_target
+        ):
             return {
                 'accepted': False,
                 'code': 'E_STRAIGHT_DRIVE_TARGET_EMPTY',
-                'message': 'distance_m or duration_s must be positive',
+                'message': 'distance_m, duration_s, or target_x/target_y must be provided',
             }
 
         now = time.monotonic()
-        pose = self._current_pose()
-        if distance is not None and distance > 0.0 and not self._pose_has_xy(pose):
+        pose_source = 'map' if has_target else 'local'
+        pose = self._current_pose(source=pose_source)
+        if (
+            (distance is not None and distance > 0.0) or has_target
+        ) and not self._pose_has_xy(pose):
+            required = 'map pose' if has_target else 'local odometry pose'
             return {
                 'accepted': False,
                 'code': 'E_STRAIGHT_DRIVE_POSE_UNAVAILABLE',
-                'message': 'local odometry pose is required for distance-based straight drive',
+                'message': f'{required} is required for this straight drive command',
             }
         yaw = self._pose_yaw_rad(pose)
         self._active = True
@@ -122,6 +148,15 @@ class StraightDriveController:
         self._start_pose = pose
         self._target_distance_m = distance if distance is not None and distance > 0.0 else None
         self._target_duration_s = duration if duration is not None and duration > 0.0 else None
+        self._target_x = target_x_value if has_target else None
+        self._target_y = target_y_value if has_target else None
+        self._target_tolerance_m = (
+            self.target_tolerance_m
+            if target_tolerance_m is None
+            else max(0.05, float(target_tolerance_m))
+        )
+        self._pose_source = pose_source
+        self._active_command_source = str(command_source or self.command_source)
         requested_speed = self.default_speed_mps if speed_mps is None else float(speed_mps)
         self._speed_mps = _clamp(abs(requested_speed), 0.02, self.max_speed_mps)
         self._last_vx = 0.0
@@ -133,6 +168,11 @@ class StraightDriveController:
             'task_id': self._task_id,
             'target_distance_m': self._target_distance_m,
             'target_duration_s': self._target_duration_s,
+            'target_x': self._target_x,
+            'target_y': self._target_y,
+            'target_tolerance_m': self._target_tolerance_m if has_target else None,
+            'pose_source': self._pose_source,
+            'command_source': self._active_command_source,
             'speed_mps': self._speed_mps,
             'yaw_ref_deg': math.degrees(yaw) if yaw is not None else None,
         }
@@ -160,6 +200,23 @@ class StraightDriveController:
             if now - self._last_command_monotonic_s < min_interval:
                 return {'state': 'running', 'active': True, 'throttled': True}
 
+        if self._target_x is not None and not self._pose_has_xy(
+            self._current_pose(source=self._pose_source)
+        ):
+            self._publish_velocity(0.0, 0.0, reason='target_pose_unavailable')
+            self._active = False
+            result = {
+                'state': 'blocked',
+                'active': False,
+                'terminal': True,
+                'reason': 'target pose unavailable',
+                'distance_traveled_m': self.distance_traveled_m(),
+                'target_remaining_m': None,
+                'elapsed_s': self.elapsed_s(now),
+            }
+            self._last_decision = dict(result)
+            return result
+
         completion = self._completion_state(now)
         if completion is not None:
             self._publish_velocity(0.0, 0.0, reason=completion)
@@ -169,6 +226,7 @@ class StraightDriveController:
                 'state': 'completed',
                 'reason': completion,
                 'distance_traveled_m': self.distance_traveled_m(),
+                'target_remaining_m': self.target_remaining_m(),
                 'elapsed_s': self.elapsed_s(now),
             }
             return {'state': 'completed', 'active': False, 'reason': completion}
@@ -198,6 +256,7 @@ class StraightDriveController:
             'vx': vx,
             'wz': wz,
             'distance_traveled_m': self.distance_traveled_m(),
+            'target_remaining_m': self.target_remaining_m(),
             'elapsed_s': self.elapsed_s(now),
             'decision': decision.to_dict(),
         }
@@ -221,6 +280,14 @@ class StraightDriveController:
         data['distance_traveled_m'] = self.distance_traveled_m()
         data['target_distance_m'] = self._target_distance_m
         data['target_duration_s'] = self._target_duration_s
+        data['target_x'] = self._target_x
+        data['target_y'] = self._target_y
+        data['target_tolerance_m'] = (
+            self._target_tolerance_m if self._target_x is not None else None
+        )
+        data['target_remaining_m'] = self.target_remaining_m()
+        data['pose_source'] = self._pose_source
+        data['command_source'] = self._active_command_source
         data['elapsed_s'] = self.elapsed_s()
         data['control_hz'] = self.control_hz
         return data
@@ -242,12 +309,23 @@ class StraightDriveController:
     def distance_traveled_m(self) -> float:
         if self._start_pose is None:
             return 0.0
-        pose = self._current_pose()
+        pose = self._current_pose(source=self._pose_source)
         if not pose:
             return 0.0
         return math.hypot(
             float(pose.get('x', 0.0)) - float(self._start_pose.get('x', 0.0)),
             float(pose.get('y', 0.0)) - float(self._start_pose.get('y', 0.0)),
+        )
+
+    def target_remaining_m(self) -> Optional[float]:
+        if self._target_x is None or self._target_y is None:
+            return None
+        pose = self._current_pose(source=self._pose_source)
+        if not self._pose_has_xy(pose):
+            return None
+        return math.hypot(
+            float(self._target_x) - float(pose.get('x', 0.0)),
+            float(self._target_y) - float(pose.get('y', 0.0)),
         )
 
     def _completion_state(self, now: float) -> Optional[str]:
@@ -258,6 +336,9 @@ class StraightDriveController:
             self.distance_traveled_m() >= max(0.0, self._target_distance_m - self.distance_tolerance_m)
         ):
             return 'distance reached'
+        remaining = self.target_remaining_m()
+        if remaining is not None and remaining <= self._target_tolerance_m:
+            return 'target reached'
         return None
 
     def _velocity_from_decision(self, decision) -> tuple:
@@ -273,6 +354,11 @@ class StraightDriveController:
             return 0.0, 0.0
         if decision.state == 'stop':
             return 0.0, wz
+        if (
+            self._target_x is not None and
+            abs_theta >= self.turn_in_place_heading_rad
+        ):
+            return 0.0, wz
 
         heading_scale = 1.0 - _clamp(abs_theta / max(self.slowdown_heading_rad, 0.1), 0.0, 0.85)
         clearance_scale = _clamp(
@@ -287,8 +373,21 @@ class StraightDriveController:
         return _clamp(vx, 0.0, self.max_speed_mps), wz
 
     def _theta_goal(self) -> float:
+        if self._target_x is not None and self._target_y is not None:
+            pose = self._current_pose(source=self._pose_source)
+            if not self._pose_has_xy(pose):
+                return 0.0
+            current_yaw = self._pose_yaw_rad(pose)
+            if current_yaw is None:
+                return 0.0
+            target_yaw = math.atan2(
+                float(self._target_y) - float(pose.get('y', 0.0)),
+                float(self._target_x) - float(pose.get('x', 0.0)),
+            )
+            return _normalize_angle(target_yaw - current_yaw)
+
         yaw_ref = self._yaw_ref_rad
-        current_yaw = self._pose_yaw_rad(self._current_pose())
+        current_yaw = self._pose_yaw_rad(self._current_pose(source=self._pose_source))
         if yaw_ref is None or current_yaw is None:
             return 0.0
         theta = _normalize_angle(yaw_ref - current_yaw)
@@ -296,9 +395,12 @@ class StraightDriveController:
             return theta
         return theta
 
-    def _current_pose(self) -> Dict[str, Any]:
+    def _current_pose(self, *, source: str = '') -> Dict[str, Any]:
+        getter = self._pose_getter
+        if source == 'map' and self._map_pose_getter is not None:
+            getter = self._map_pose_getter
         try:
-            pose = self._pose_getter() or {}
+            pose = getter() or {}
         except Exception:
             pose = {}
         return dict(pose)
@@ -348,7 +450,7 @@ class StraightDriveController:
         self._move_gateway.velocity(
             linear_x=float(vx),
             angular_z=float(wz),
-            source=self.command_source,
+            source=self._active_command_source,
             reason=reason,
             task_id=self._task_id,
         )

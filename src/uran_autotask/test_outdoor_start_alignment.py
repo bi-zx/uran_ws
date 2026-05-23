@@ -14,21 +14,47 @@ def _mission():
             OutdoorExecutionPoint(seq=0, kind='start', x=0.0, y=0.0),
             OutdoorExecutionPoint(seq=1, kind='transit', x=5.0, y=0.0),
             OutdoorExecutionPoint(seq=2, kind='inspection', x=10.0, y=1.0),
+            OutdoorExecutionPoint(seq=3, kind='home', x=0.0, y=0.0),
         ],
     )
 
 
-def test_start_aligner_skips_explicit_start_when_already_close():
-    mission = _mission()
+def test_start_aligner_goes_directly_to_first_inspection_when_close():
     aligner = OutdoorStartAligner({
-        'aligned_tolerance_m': 1.0,
-        'skip_explicit_start': True,
+        'first_inspection_direct_distance_m': 5.0,
+        'home_calibration_accept_distance_m': 5.0,
+        'home_calibration_reject_distance_m': 10.0,
     })
 
     result = aligner.evaluate_and_apply(
-        mission=mission,
+        mission=_mission(),
         current_pose={
-            'x': 0.5,
+            'x': 7.0,
+            'y': 1.0,
+            'z': 0.0,
+            'frame_id': 'map',
+            'timestamp_ns': 1_000_000_000,
+        },
+        now_ns=1_100_000_000,
+    )
+
+    assert result['status'] == 'direct_first_inspection'
+    assert result['action'] == 'go_first_inspection'
+    assert result['first_inspection_index'] == 2
+    assert result['next_current_waypoint_index'] == 1
+
+
+def test_start_aligner_accepts_home_calibration_when_home_is_close():
+    aligner = OutdoorStartAligner({
+        'first_inspection_direct_distance_m': 5.0,
+        'home_calibration_accept_distance_m': 5.0,
+        'home_calibration_reject_distance_m': 10.0,
+    })
+
+    result = aligner.evaluate_and_apply(
+        mission=_mission(),
+        current_pose={
+            'x': 3.0,
             'y': 0.0,
             'z': 0.0,
             'frame_id': 'map',
@@ -37,27 +63,24 @@ def test_start_aligner_skips_explicit_start_when_already_close():
         now_ns=1_100_000_000,
     )
 
-    assert result['status'] == 'start_skipped'
-    assert result['action'] == 'skip_start'
-    assert result['next_current_waypoint_index'] == 0
-    assert mission.execution_points[1].x == 5.0
+    assert result['status'] == 'home_calibration_passed'
+    assert result['action'] == 'go_first_inspection'
+    assert result['home_distance_m'] == 3.0
+    assert result['next_current_waypoint_index'] == 1
 
 
-def test_start_aligner_returns_startup_correction_when_start_offset_is_allowed():
-    mission = _mission()
+def test_start_aligner_requires_home_calibration_when_home_is_within_reject_distance():
     aligner = OutdoorStartAligner({
-        'aligned_tolerance_m': 1.0,
-        'skip_start_tolerance_m': 3.0,
-        'allow_start_correction': True,
-        'max_start_correction_m': 10.0,
-        'skip_explicit_start': True,
+        'first_inspection_direct_distance_m': 5.0,
+        'home_calibration_accept_distance_m': 5.0,
+        'home_calibration_reject_distance_m': 10.0,
     })
 
     result = aligner.evaluate_and_apply(
-        mission=mission,
+        mission=_mission(),
         current_pose={
-            'x': 4.0,
-            'y': -2.0,
+            'x': 0.0,
+            'y': 8.0,
             'z': 0.0,
             'frame_id': 'map',
             'timestamp_ns': 1_000_000_000,
@@ -65,26 +88,44 @@ def test_start_aligner_returns_startup_correction_when_start_offset_is_allowed()
         now_ns=1_100_000_000,
     )
 
-    assert result['status'] == 'start_correction_applied'
-    assert result['action'] == 'apply_start_correction_and_skip_start'
-    assert result['next_current_waypoint_index'] == 0
-    assert result['goal_correction']['dx'] == 4.0
-    assert result['goal_correction']['dy'] == -2.0
-    assert mission.execution_points[0].x == 0.0
-    assert mission.execution_points[0].y == 0.0
-    assert mission.execution_points[1].x == 5.0
-    assert mission.execution_points[1].y == 0.0
+    assert result['status'] == 'home_calibration_required'
+    assert result['action'] == 'run_home_calibration'
+    assert result['home_calibration_index'] == 3
+    assert result['first_inspection_index'] == 2
 
 
-def test_start_aligner_rejects_large_start_offset():
-    mission = _mission()
+def test_start_aligner_rejects_when_home_calibration_is_too_far():
     aligner = OutdoorStartAligner({
-        'allow_start_correction': True,
-        'max_start_correction_m': 10.0,
+        'first_inspection_direct_distance_m': 5.0,
+        'home_calibration_accept_distance_m': 5.0,
+        'home_calibration_reject_distance_m': 10.0,
     })
 
     result = aligner.evaluate_and_apply(
-        mission=mission,
+        mission=_mission(),
+        current_pose={
+            'x': 0.0,
+            'y': 11.0,
+            'z': 0.0,
+            'frame_id': 'map',
+            'timestamp_ns': 1_000_000_000,
+        },
+        now_ns=1_100_000_000,
+    )
+
+    assert result['status'] == 'failed'
+    assert result['action'] == 'reject'
+
+
+def test_start_aligner_rejects_when_far_from_first_inspection_and_home():
+    aligner = OutdoorStartAligner({
+        'first_inspection_direct_distance_m': 5.0,
+        'home_calibration_accept_distance_m': 5.0,
+        'home_calibration_reject_distance_m': 10.0,
+    })
+
+    result = aligner.evaluate_and_apply(
+        mission=_mission(),
         current_pose={
             'x': 30.0,
             'y': 0.0,
@@ -97,16 +138,14 @@ def test_start_aligner_rejects_large_start_offset():
 
     assert result['status'] == 'failed'
     assert result['action'] == 'reject'
-    assert mission.execution_points[0].x == 0.0
 
 
-def test_start_aligner_waits_for_fresh_map_pose():
-    mission = _mission()
+def test_start_aligner_waits_for_fresh_pose():
     aligner = OutdoorStartAligner({'max_pose_age_s': 3.0})
 
     result = aligner.evaluate_and_apply(
-        mission=mission,
-        current_pose={'x': 0.0, 'y': 0.0, 'timestamp_ns': 1_000_000_000},
+        mission=_mission(),
+        current_pose={'x': 7.0, 'y': 1.0, 'timestamp_ns': 1_000_000_000},
         now_ns=5_000_000_000,
     )
 
