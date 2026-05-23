@@ -181,6 +181,28 @@ class UranCoreNode(Node):
             )
             return default
 
+    @staticmethod
+    def _task_type_from_params_json(task_params_json: str) -> str:
+        try:
+            payload = json.loads(task_params_json)
+        except (TypeError, ValueError):
+            return ''
+        if not isinstance(payload, dict):
+            return ''
+        task_type = payload.get('task_type') or payload.get('type')
+        if task_type is None:
+            return ''
+        return str(task_type).strip()
+
+    @staticmethod
+    def _resolve_task_type(payload: Dict[str, Any], task_params_json: str) -> str:
+        raw_task_type = payload.get('task_type', '')
+        task_type = '' if raw_task_type is None else str(raw_task_type).strip()
+        params_task_type = UranCoreNode._task_type_from_params_json(task_params_json)
+        if params_task_type and (not task_type or task_type == 'default_task'):
+            return params_task_type
+        return task_type
+
     def _payload_dict(self, payload: Dict[str, Any], key: str) -> Dict[str, Any]:
         value = payload.get(key)
         if value is None:
@@ -350,8 +372,8 @@ class UranCoreNode(Node):
         msg.msg_version = self._payload_str(payload, 'msg_version', '1.0')
         msg.task_id = self._payload_str(payload, 'task_id', '')
         msg.action = self._payload_str(payload, 'action', '')
-        msg.task_type = self._payload_str(payload, 'task_type', '')
         msg.task_params_json = self._payload_json_str(payload, 'task_params_json', '{}')
+        msg.task_type = self._resolve_task_type(payload, msg.task_params_json)
         msg.timestamp_ns = self._payload_timestamp_ns(payload)
         self._pub_task.publish(msg)
 
