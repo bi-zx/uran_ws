@@ -58,6 +58,21 @@ uran_autotask:
     enable_goal_correction: true
     max_goal_correction_m: 10.0
 
+  gps_vo_yaw_aligner:
+    enabled: true
+    # 单天线 GPS 不能静止给机身朝向。这里用“GPS 位移方向”和“本地里程计位移方向”
+    # 估计本地 yaw 到 GPS 世界坐标的角度偏移。
+    min_fix_type: 3
+    min_num_sv: 4
+    min_gps_displacement_m: 3.0
+    min_visual_displacement_m: 2.0
+    max_length_ratio_error: 0.6
+    max_sample_yaw_delta_deg: 30.0
+    smoothing_alpha: 0.1
+    gps_jump_reject_m: 10.0
+    max_sample_age_s: 20.0
+    max_history: 80
+
   straight_drive:
     enabled: true
     # 只用于“直线行驶一段距离/一段时间”的单步任务，不做全局导航。

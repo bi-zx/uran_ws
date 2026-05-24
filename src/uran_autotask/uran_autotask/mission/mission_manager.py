@@ -8,7 +8,7 @@ from .waypoint_dispatcher import WaypointDispatcher
 from ..task_models import MissionTask, TaskRuntime, TERMINAL_TASK_STAGES
 from ..task_parser import parse_task_definition
 from ..geo_utils import EARTH_RADIUS_M
-from ..localization import OutdoorPoseAligner
+from ..localization import GpsVoYawAligner, OutdoorPoseAligner
 from ..outdoor import (
     GpsVoGate,
     GoalResolution,
@@ -47,6 +47,7 @@ class MissionManager:
         mission_defaults,
         outdoor_goal_resolver_cfg: Optional[Dict[str, Any]] = None,
         outdoor_pose_aligner_cfg: Optional[Dict[str, Any]] = None,
+        gps_vo_yaw_aligner_cfg: Optional[Dict[str, Any]] = None,
         outdoor_start_alignment_cfg: Optional[Dict[str, Any]] = None,
         progress_report_interval_s: float,
         require_auto_mode: bool,
@@ -75,6 +76,7 @@ class MissionManager:
         self._outdoor_start_aligner = OutdoorStartAligner(outdoor_start_alignment_cfg)
         self._outdoor_pose_aligner_cfg = dict(outdoor_pose_aligner_cfg or {})
         self._outdoor_pose_aligner = OutdoorPoseAligner(self._outdoor_pose_aligner_cfg)
+        self._gps_vo_yaw_aligner = GpsVoYawAligner(gps_vo_yaw_aligner_cfg)
         self._progress_report_interval_s = float(progress_report_interval_s)
         self._require_auto_mode = bool(require_auto_mode)
         self._media_actions_cfg = dict(media_actions_cfg or {})
@@ -113,9 +115,9 @@ class MissionManager:
         self._outdoor_goal_records = []
         self._outdoor_gps_vo_gate = GpsVoGate()
         self._outdoor_start_alignment: Dict[str, Any] = {}
-        self._local_nav_yaw_offset_deg: Optional[float] = None
         self._motion_control_locked = False
         self._straight_drive_task: Optional[Dict[str, Any]] = None
+        self._initial_yaw_calibration_active = False
 
     @property
     def task(self) -> Optional[MissionTask]:
@@ -265,8 +267,9 @@ class MissionManager:
 
         visual_pose = self._pose_registry.latest_visual_pose() or {}
         yaw_deg = visual_pose.get('yaw_deg')
-        if yaw_deg not in (None, '') and self._local_nav_yaw_offset_deg is not None:
-            yaw_deg = float(yaw_deg) + float(self._local_nav_yaw_offset_deg)
+        yaw_offset_deg = self._gps_vo_yaw_aligner.yaw_offset_deg
+        if yaw_deg not in (None, '') and yaw_offset_deg is not None:
+            yaw_deg = float(yaw_deg) + float(yaw_offset_deg)
         if yaw_deg in (None, ''):
             yaw_deg = self._active_initial_heading_deg()
         if yaw_deg in (None, ''):
@@ -317,9 +320,29 @@ class MissionManager:
         visual_pose = self._pose_registry.latest_visual_pose() or {}
         visual_yaw = visual_pose.get('yaw_deg')
         if planned_yaw in (None, '') or visual_yaw in (None, ''):
-            self._local_nav_yaw_offset_deg = None
             return
-        self._local_nav_yaw_offset_deg = self._normalize_degrees(float(planned_yaw) - float(visual_yaw))
+        self._gps_vo_yaw_aligner.set_initial_offset(
+            self._normalize_degrees(float(planned_yaw) - float(visual_yaw)),
+            reason='initialized from planned route heading and local odometry yaw',
+        )
+
+    def _update_gps_vo_yaw_alignment(self):
+        if self._outdoor_mission is None:
+            return
+        self._gps_vo_yaw_aligner.update(
+            gps_position=self._pose_registry.gps_position(),
+            visual_pose=self._pose_registry.latest_visual_pose(),
+            timestamp_ns=self._now_ns_getter(),
+        )
+
+    def _should_run_initial_yaw_calibration(self) -> bool:
+        if self._outdoor_mission is None:
+            return False
+        if not self._gps_vo_yaw_aligner.enabled:
+            return False
+        if self._gps_vo_yaw_aligner.yaw_offset_deg is not None:
+            return False
+        return True
 
     def _normalize_degrees(self, value: float) -> float:
         while value > 180.0:
@@ -365,10 +388,12 @@ class MissionManager:
             'active_candidate': active_candidate,
             'navigation_mode': 'local_lidar_velocity',
             'active_local_goal_kind': self._active_local_goal_kind,
+            'initial_yaw_calibration_active': self._initial_yaw_calibration_active,
             'pending_first_inspection_index': self._pending_first_inspection_index,
             'active_home_calibration_index': self._active_home_calibration_index,
             'local_navigation_pose': self.local_navigation_pose(),
-            'local_nav_yaw_offset_deg': self._local_nav_yaw_offset_deg,
+            'local_nav_yaw_offset_deg': self._gps_vo_yaw_aligner.yaw_offset_deg,
+            'gps_vo_yaw_alignment': self._gps_vo_yaw_aligner.state_snapshot(),
             'active_resolution': (
                 self._active_outdoor_goal_resolution.to_dict()
                 if self._active_outdoor_goal_resolution is not None else None
@@ -785,9 +810,10 @@ class MissionManager:
         self._outdoor_calibration_records = []
         self._outdoor_goal_records = []
         self._outdoor_start_alignment = {}
-        self._local_nav_yaw_offset_deg = None
+        self._gps_vo_yaw_aligner.reset()
         self._pending_first_inspection_index = None
         self._active_home_calibration_index = None
+        self._initial_yaw_calibration_active = False
         self._outdoor_gps_vo_gate = GpsVoGate(
             stable_required_count=outdoor_mission.stable_offset_required_count
         )
@@ -857,6 +883,13 @@ class MissionManager:
                 max(1, len(outdoor_mission.execution_points))
                 if self._runtime.current_waypoint_index >= 0 else 0.0
             )
+
+        if self._should_run_initial_yaw_calibration():
+            if not self._dispatch_initial_yaw_calibration():
+                return
+            self._publish_task_progress()
+            self._write_state_fields()
+            return
         self._runtime.event = alignment_status or 'outdoor_task_received'
 
         self._set_map_pose_reporting_enabled(True)
@@ -879,6 +912,7 @@ class MissionManager:
         self._active_outdoor_goal_resolution = None
         self._active_outdoor_candidate_index = None
         self._active_home_calibration_index = None
+        self._initial_yaw_calibration_active = False
         self._hover_until = None
         self._action_runner.reset()
         self._runtime.stage = 'paused'
@@ -940,7 +974,8 @@ class MissionManager:
         self._active_local_goal_kind = ''
         self._pending_first_inspection_index = None
         self._active_home_calibration_index = None
-        self._local_nav_yaw_offset_deg = None
+        self._initial_yaw_calibration_active = False
+        self._gps_vo_yaw_aligner.reset()
         self._straight_drive_task = None
         self._hover_until = None
         self._action_runner.reset()
@@ -1116,11 +1151,17 @@ class MissionManager:
             )
             return
 
+        self._update_gps_vo_yaw_alignment()
+
         if backend_event is not None:
             self._handle_outdoor_backend_event(backend_event)
 
         if self._runtime.stage == 'paused':
             self._publish_periodic_progress(monotonic_s=monotonic_s)
+            return
+
+        if self._initial_yaw_calibration_active:
+            self._tick_initial_yaw_calibration(monotonic_s=monotonic_s)
             return
 
         if self._active_home_calibration_index is not None:
@@ -1166,6 +1207,95 @@ class MissionManager:
         if not self._dispatch_outdoor_candidate(next_index=next_index, candidate_index=0):
             self._active_outdoor_goal_resolution = None
             self._active_outdoor_candidate_index = None
+
+    def _dispatch_initial_yaw_calibration(self) -> bool:
+        mission = self._outdoor_mission
+        if mission is None:
+            return False
+        if self._straight_drive_controller is None:
+            self._pause_with_error(
+                code='E_LOCAL_NAV_UNAVAILABLE',
+                description='local LiDAR velocity navigation controller is unavailable',
+                suggested_action='check_autotask_config',
+            )
+            return False
+
+        result = self._straight_drive_controller.start(
+            task_id=mission.task_id,
+            distance_m=self._gps_vo_yaw_aligner.min_gps_displacement_m,
+            speed_mps=None,
+            command_source='initial_yaw_calibration',
+        )
+        if not result.get('accepted', False):
+            self._pause_with_error(
+                code=result.get('code', 'E_INITIAL_YAW_CALIBRATION_REJECTED'),
+                description=result.get('message', 'failed to start initial yaw calibration'),
+                suggested_action='check_gps_visual_odom_scan_and_move_gateway',
+            )
+            return False
+
+        self._initial_yaw_calibration_active = True
+        self._active_local_goal_kind = 'initial_yaw_calibration'
+        self._runtime.stage = 'executing'
+        self._runtime.status = 'normal'
+        self._runtime.event = 'initial_yaw_calibration_started'
+        self._runtime.last_goal_map_pose = {
+            'navigation_mode': 'local_lidar_velocity',
+            'calibration_role': 'initial_yaw',
+            'distance_m': self._gps_vo_yaw_aligner.min_gps_displacement_m,
+        }
+        return True
+
+    def _tick_initial_yaw_calibration(self, *, monotonic_s: float):
+        if self._straight_drive_controller is None:
+            self._pause_with_error(
+                code='E_LOCAL_NAV_UNAVAILABLE',
+                description='local LiDAR velocity navigation controller is unavailable',
+                suggested_action='check_autotask_config',
+            )
+            return
+
+        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+        state = str(result.get('state') or '')
+        alignment = self._gps_vo_yaw_aligner.state_snapshot()
+        if alignment.get('aligned', False):
+            self._straight_drive_controller.stop(reason='initial_yaw_calibration_completed')
+            self._initial_yaw_calibration_active = False
+            self._active_local_goal_kind = ''
+            self._runtime.stage = 'executing'
+            self._runtime.status = 'normal'
+            self._runtime.event = 'initial_yaw_calibration_completed'
+            self._runtime.error = None
+            self._publish_task_progress()
+            self._write_state_fields()
+            return
+
+        if state == 'completed':
+            self._initial_yaw_calibration_active = False
+            self._active_local_goal_kind = ''
+            self._pause_with_error(
+                code='E_INITIAL_YAW_CALIBRATION_FAILED',
+                description='initial yaw calibration finished but gps/visual displacement was not reliable',
+                suggested_action='retry_in_open_area_or_increase_calibration_distance',
+            )
+            return
+
+        if result.get('terminal') and state == 'blocked':
+            self._initial_yaw_calibration_active = False
+            self._active_local_goal_kind = ''
+            self._pause_with_error(
+                code='E_INITIAL_YAW_CALIBRATION_BLOCKED',
+                description=str(result.get('reason') or 'initial yaw calibration is blocked'),
+                suggested_action='clear_obstacle_or_send_stop',
+            )
+            return
+
+        if not result.get('throttled', False):
+            self._runtime.stage = 'executing'
+            self._runtime.status = 'normal'
+            self._runtime.event = f'initial_yaw_calibration_{state or "running"}'
+
+        self._publish_periodic_progress(monotonic_s=monotonic_s)
 
     def _dispatch_home_calibration(self, *, home_index: int) -> bool:
         mission = self._outdoor_mission
@@ -1837,7 +1967,8 @@ class MissionManager:
         self._active_waypoint_index = None
         self._pending_first_inspection_index = None
         self._active_home_calibration_index = None
-        self._local_nav_yaw_offset_deg = None
+        self._initial_yaw_calibration_active = False
+        self._gps_vo_yaw_aligner.reset()
         self._straight_drive_task = None
         self._runtime.stage = 'completed'
         self._runtime.status = 'normal'
@@ -1862,7 +1993,8 @@ class MissionManager:
         self._active_local_goal_kind = ''
         self._pending_first_inspection_index = None
         self._active_home_calibration_index = None
-        self._local_nav_yaw_offset_deg = None
+        self._initial_yaw_calibration_active = False
+        self._gps_vo_yaw_aligner.reset()
         self._straight_drive_task = None
         self._hover_until = None
         self._action_runner.reset()
