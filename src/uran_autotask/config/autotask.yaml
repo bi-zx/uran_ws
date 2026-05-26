@@ -79,8 +79,8 @@ uran_autotask:
     # 相对名会自动加机器狗 namespace，例如 /mi_desktop_48_b0_2d_5f_b6_d0/scan。
     scan_topic: "scan"
     control_hz: 20.0
-    default_speed_mps: 0.18
-    max_speed_mps: 0.25
+    default_speed_mps: 0.8
+    max_speed_mps: 0.8
     min_avoid_speed_mps: 0.06
     max_angular_speed_radps: 0.7
     heading_kp: 1.4

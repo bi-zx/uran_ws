@@ -119,3 +119,35 @@ systemctl --user status ubx_gps.service --no-pager -l
 rm -rf build install log
 colcon build --packages-select uran_autotask
 ```
+
+ubx_gps 是用户级服务，用这个：
+
+```bash
+cd /SDCARD/ubx_ws
+colcon build --packages-select uran_autotask
+
+systemctl --user daemon-reload
+systemctl --user restart ubx_gps.service
+systemctl --user status ubx_gps.service --no-pager -l
+```
+
+uran_autotask 如果是跟 cyberdog_bringup.service 一起启动的，用这个：
+
+```bash
+cd /SDCARD/uran_ws
+colcon build --packages-select uran_autotask
+
+sudo systemctl restart cyberdog_bringup.service
+sudo systemctl status cyberdog_bringup.service --no-pager -l
+```
+
+重启后检查：
+
+```bash
+export ROS_DOMAIN_ID=42
+source /opt/ros2/galactic/setup.bash
+source /SDCARD/uran_ws/install/setup.bash
+
+ros2 topic echo /ubx/status --field data --full-length
+ros2 service call /uran/autotask/status uran_srvs/srv/GetTaskStatus "{task_id: ''}"
+```
