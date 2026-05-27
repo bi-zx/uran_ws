@@ -49,6 +49,11 @@ class StraightDriveController:
         )
         self.distance_tolerance_m = float(cfg.get('distance_tolerance_m', 0.15))
         self.target_tolerance_m = float(cfg.get('target_tolerance_m', 0.8))
+        self.target_tolerance_relax_after_s = float(
+            cfg.get('target_tolerance_relax_after_s', 30.0)
+        )
+        self.target_tolerance_relaxed_m = float(cfg.get('target_tolerance_relaxed_m', 5.0))
+        self.target_tolerance_final_m = float(cfg.get('target_tolerance_final_m', 10.0))
         self.command_source = str(cfg.get('command_source', 'straight_drive'))
         self._planner = GapAvoidancePlanner(cfg)
         self._move_gateway = move_gateway
@@ -70,7 +75,8 @@ class StraightDriveController:
         self._target_duration_s: Optional[float] = None
         self._target_x: Optional[float] = None
         self._target_y: Optional[float] = None
-        self._target_tolerance_m: float = self.target_tolerance_m
+        self._target_tolerance_base_m: float = self.target_tolerance_m
+        self._target_tolerance_max_m: float = self.target_tolerance_m
         self._pose_source = 'local'
         self._active_command_source = self.command_source
         self._speed_mps = self.default_speed_mps
@@ -150,10 +156,15 @@ class StraightDriveController:
         self._target_duration_s = duration if duration is not None and duration > 0.0 else None
         self._target_x = target_x_value if has_target else None
         self._target_y = target_y_value if has_target else None
-        self._target_tolerance_m = (
+        self._target_tolerance_base_m = self.target_tolerance_m
+        requested_target_tolerance_m = (
             self.target_tolerance_m
             if target_tolerance_m is None
             else max(0.05, float(target_tolerance_m))
+        )
+        self._target_tolerance_max_m = max(
+            self._target_tolerance_base_m,
+            requested_target_tolerance_m,
         )
         self._pose_source = pose_source
         self._active_command_source = str(command_source or self.command_source)
@@ -170,7 +181,9 @@ class StraightDriveController:
             'target_duration_s': self._target_duration_s,
             'target_x': self._target_x,
             'target_y': self._target_y,
-            'target_tolerance_m': self._target_tolerance_m if has_target else None,
+            'target_tolerance_m': self._effective_target_tolerance_m(now) if has_target else None,
+            'target_tolerance_base_m': self._target_tolerance_base_m if has_target else None,
+            'target_tolerance_max_m': self._target_tolerance_max_m if has_target else None,
             'pose_source': self._pose_source,
             'command_source': self._active_command_source,
             'speed_mps': self._speed_mps,
@@ -283,7 +296,13 @@ class StraightDriveController:
         data['target_x'] = self._target_x
         data['target_y'] = self._target_y
         data['target_tolerance_m'] = (
-            self._target_tolerance_m if self._target_x is not None else None
+            self._effective_target_tolerance_m() if self._target_x is not None else None
+        )
+        data['target_tolerance_base_m'] = (
+            self._target_tolerance_base_m if self._target_x is not None else None
+        )
+        data['target_tolerance_max_m'] = (
+            self._target_tolerance_max_m if self._target_x is not None else None
         )
         data['target_remaining_m'] = self.target_remaining_m()
         data['pose_source'] = self._pose_source
@@ -337,9 +356,24 @@ class StraightDriveController:
         ):
             return 'distance reached'
         remaining = self.target_remaining_m()
-        if remaining is not None and remaining <= self._target_tolerance_m:
+        if remaining is not None and remaining <= self._effective_target_tolerance_m(now):
             return 'target reached'
         return None
+
+    def _effective_target_tolerance_m(self, now: Optional[float] = None) -> float:
+        if self._target_x is None or self._target_y is None:
+            return self._target_tolerance_base_m
+        if self.target_tolerance_relax_after_s <= 0.0:
+            return self._target_tolerance_max_m
+
+        now = time.monotonic() if now is None else float(now)
+        elapsed = self.elapsed_s(now)
+        tolerance = self._target_tolerance_base_m
+        if elapsed >= self.target_tolerance_relax_after_s:
+            tolerance = max(tolerance, self.target_tolerance_relaxed_m)
+        if elapsed >= 2.0 * self.target_tolerance_relax_after_s:
+            tolerance = max(tolerance, self.target_tolerance_final_m)
+        return min(tolerance, self._target_tolerance_max_m)
 
     def _velocity_from_decision(self, decision) -> tuple:
         theta = _normalize_angle(float(decision.theta_target))

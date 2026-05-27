@@ -1084,6 +1084,7 @@ class MissionManager:
             target_y=map_y,
             speed_mps=waypoint.speed_mps,
             source='waypoint',
+            target_tolerance_m=None,
         )
         if not result.get('success', False):
             self._pause_with_error(
@@ -1314,6 +1315,7 @@ class MissionManager:
             target_y=float(home.y),
             speed_mps=None,
             source='home_calibration',
+            target_tolerance_m=self._local_goal_target_tolerance(home),
         )
         if not result.get('success', False):
             self._pause_with_error(
@@ -1470,6 +1472,7 @@ class MissionManager:
             target_y=corrected_y,
             speed_mps=None,
             source='mission_planner_route',
+            target_tolerance_m=self._local_goal_target_tolerance(point),
         )
         if not result.get('success', False):
             self._pause_with_error(
@@ -1518,6 +1521,7 @@ class MissionManager:
         target_y: float,
         speed_mps: Optional[float],
         source: str,
+        target_tolerance_m: Optional[float] = None,
     ) -> Dict[str, Any]:
         if self._straight_drive_controller is None:
             return {
@@ -1539,6 +1543,7 @@ class MissionManager:
             speed_mps=speed_mps,
             target_x=float(target_x),
             target_y=float(target_y),
+            target_tolerance_m=target_tolerance_m,
             command_source=source,
         )
         if not result.get('accepted', False):
@@ -1553,6 +1558,18 @@ class MissionManager:
             'mode': 'local_lidar_velocity',
             'source': str(source),
         }
+
+    def _local_goal_target_tolerance(self, point) -> Optional[float]:
+        point_kind = str(getattr(point, 'kind', '') or '').strip().lower()
+        if point_kind == 'transit':
+            return None
+        tolerance_m = getattr(point, 'tolerance_m', None)
+        if tolerance_m in (None, ''):
+            return None
+        try:
+            return float(tolerance_m)
+        except (TypeError, ValueError):
+            return None
 
     def _tick_active_outdoor_local_goal(self, *, monotonic_s: float):
         if self._straight_drive_controller is None:

@@ -20,7 +20,7 @@ ros2 topic list | grep -E 'scan|odom_out|ubx|uran'
 ```bash
 ros2 service call /uran/core/state/set uran_srvs/srv/SetStateField "{field_name: 'control_mode', value_json: '\"auto\"', persistent: false}"
 ros2 service call /uran/core/state/set uran_srvs/srv/SetStateField "{field_name: 'current_controller', value_json: '\"auto\"', persistent: false}"
-ros2 topic pub --times 5 --rate 2 /uran/core/switch/mode uran_msgs/msg/ModeSwitchCmd "{control_mode: auto, controller: auto, timestamp_ns: 0}"
+ros2 topic pub --times 1 --rate 2 /uran/core/switch/mode uran_msgs/msg/ModeSwitchCmd "{control_mode: auto, controller: auto, timestamp_ns: 0}"
 ```
 
 确认：

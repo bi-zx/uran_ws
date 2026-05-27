@@ -86,7 +86,10 @@ uran_autotask:
     heading_kp: 1.4
     # mission_planner_route / waypoint / patrol 也统一走这套局部目标点控制。
     # target_tolerance_m 是“到达一个路线点”的局部判定半径，不能用 GPS 校验的大容差。
-    target_tolerance_m: 0.8
+    target_tolerance_m: 3.0
+    target_tolerance_relax_after_s: 30.0
+    target_tolerance_relaxed_m: 5.0
+    target_tolerance_final_m: 10.0
     turn_in_place_heading_deg: 85.0
     scan_timeout_s: 0.35
     blocked_timeout_s: 4.0
