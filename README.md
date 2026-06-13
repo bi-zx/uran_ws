@@ -111,6 +111,8 @@ rosrun uran_move uran_move_node
 - 启动脚本: `scripts/start_uran_autostart.sh`
 - `systemd` 模板: `systemd/uran-autostart.service`
 
+> 安全提示：`px4ctrl` 不在总自启动 launch 中无条件启动。它需要通过单独的 RC 安全门控入口启动，避免遥控器拨杆或油门不在安全位置时响应起飞指令。
+
 ### 1. 先手动验证
 
 ```bash
@@ -144,7 +146,61 @@ systemctl status uran-autostart.service
 journalctl -u uran-autostart.service -f
 ```
 
-### 4. 修改启动用户或工作区路径
+### 4. px4ctrl 安全启动入口
+
+`px4ctrl` 启动前要求 `/mavros/rc/in` 连续满足安全状态：
+
+| 通道 | 默认要求 | 说明 |
+|------|----------|------|
+| CH3（油门） | 1400–1600 | 油门中位 |
+| CH5 | 1900–2100 | 内侧 / 高位 |
+| CH6 | 1900–2100 | 下侧 / 高位 |
+
+手动启动：
+
+```bash
+cd ~/uran_ws
+chmod +x scripts/start_px4ctrl_safe.sh scripts/wait_for_px4ctrl_rc_safe.py
+./scripts/start_px4ctrl_safe.sh
+```
+
+脚本会先等待 ROS master 和 RC 数据；若拨杆/油门不满足条件，会持续等待，不会启动 `px4ctrl`。条件连续保持默认 `2.0s` 后，才执行：
+
+```bash
+roslaunch px4ctrl run_ctrl.launch
+```
+
+安装为单独的 systemd 服务：
+
+```bash
+sudo chmod +x ~/uran_ws/scripts/start_px4ctrl_safe.sh ~/uran_ws/scripts/wait_for_px4ctrl_rc_safe.py
+sudo cp ~/uran_ws/systemd/px4ctrl-safe.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable px4ctrl-safe.service
+sudo systemctl start px4ctrl-safe.service
+```
+
+查看日志：
+
+```bash
+systemctl status px4ctrl-safe.service
+journalctl -u px4ctrl-safe.service -f
+```
+
+可在 `systemd/px4ctrl-safe.service` 中通过环境变量调整阈值，例如：
+
+```ini
+Environment=PX4CTRL_RC_STABLE_SECONDS=2.0
+Environment=PX4CTRL_RC_CHECK_TIMEOUT=0
+Environment=PX4CTRL_RC_THROTTLE_MIN=1400
+Environment=PX4CTRL_RC_THROTTLE_MAX=1600
+Environment=PX4CTRL_RC_CH5_MIN=1900
+Environment=PX4CTRL_RC_CH5_MAX=2100
+Environment=PX4CTRL_RC_CH6_MIN=1900
+Environment=PX4CTRL_RC_CH6_MAX=2100
+```
+
+### 5. 修改启动用户或工作区路径
 
 如果不是 `jetson` 用户，或工作区不在 `~/uran_ws`，请先修改：
 
@@ -152,6 +208,7 @@ journalctl -u uran-autostart.service -f
 - `systemd/uran-autostart.service` 中的 `WorkingDirectory=`
 - `systemd/uran-autostart.service` 中的 `WORKSPACE_DIR=`
 - `systemd/uran-autostart.service` 中的 `EXTRA_SETUP_FILES=`
+- `systemd/px4ctrl-safe.service` 中对应的 `User=`、`WorkingDirectory=`、`WORKSPACE_DIR=`、`EXTRA_SETUP_FILES=`
 
 ---
 
