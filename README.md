@@ -93,10 +93,11 @@ rosrun uran_media uran_media_node
 roslaunch realsense2_camera rs_camera.launch
 roslaunch mavros px4_THS1.launch
 roslaunch livox_ros_driver2 msg_MID360.launch
-roslaunch direct_lidar_inertial_odometry dlio.launch
 roslaunch uran_core uran_core.launch
 rosrun uran_media uran_media_node
 rosrun uran_move uran_move_node
+# DLIO 使用独立延时服务启动：
+roslaunch direct_lidar_inertial_odometry dlio.launch
 ```
 
 推荐做法是：
@@ -110,8 +111,12 @@ rosrun uran_move uran_move_node
 - 总 launch: `src/uran_core/launch/uran_autostart.launch`
 - 启动脚本: `scripts/start_uran_autostart.sh`
 - `systemd` 模板: `systemd/uran-autostart.service`
+- DLIO 延时启动脚本: `scripts/start_dlio_delayed.sh`
+- DLIO Livox 点云稳定检测脚本: `scripts/wait_for_livox_lidar_stable.py`
+- DLIO `systemd` 模板: `systemd/uran-dlio-delayed.service`
 
 > 安全提示：`px4ctrl` 不在总自启动 launch 中无条件启动。它需要通过单独的 RC 安全门控入口启动，避免遥控器拨杆或油门不在安全位置时响应起飞指令。
+> DLIO 不在总自启动 launch 中直接启动，避免 Livox 点云刚启动时点数太少导致 DLIO 输出 NaN。默认由 `uran-dlio-delayed.service` 延时 10 秒后，再等待 `/livox/lidar` 连续稳定 5 秒且每帧有效点数达到阈值，满足后才启动 DLIO。
 
 ### 1. 先手动验证
 
@@ -146,7 +151,53 @@ systemctl status uran-autostart.service
 journalctl -u uran-autostart.service -f
 ```
 
-### 4. px4ctrl 安全启动入口
+### 4. DLIO 延时启动入口
+
+DLIO 默认不再由 `uran_autostart.launch` 直接启动。单独启动：
+
+```bash
+cd ~/uran_ws
+chmod +x scripts/start_dlio_delayed.sh scripts/wait_for_livox_lidar_stable.py
+./scripts/start_dlio_delayed.sh
+```
+
+安装为单独的 systemd 服务：
+
+```bash
+sudo chmod +x ~/uran_ws/scripts/start_dlio_delayed.sh ~/uran_ws/scripts/wait_for_livox_lidar_stable.py
+sudo cp ~/uran_ws/systemd/uran-dlio-delayed.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable uran-dlio-delayed.service
+sudo systemctl start uran-dlio-delayed.service
+```
+
+查看日志：
+
+```bash
+systemctl status uran-dlio-delayed.service
+journalctl -u uran-dlio-delayed.service -f
+```
+
+默认延时为 10 秒，延时后会检测 `/livox/lidar` 是否连续稳定。检测逻辑：
+
+- 每帧只统计 x/y/z 均为有限值，且距离雷达原点大于 `DLIO_LIDAR_MIN_RANGE` 的点。
+- 连续 `DLIO_LIDAR_STABLE_SECONDS` 秒内，每帧有效点数都要大于等于 `DLIO_LIDAR_MIN_VALID_POINTS`。
+- 如果 topic 无消息、点云中断、点数低于阈值，DLIO 会继续等待，不会启动。
+
+可在 `systemd/uran-dlio-delayed.service` 中调整：
+
+```ini
+Environment=DLIO_START_DELAY_SECONDS=10
+Environment=DLIO_LIDAR_TOPIC=/livox/lidar
+Environment=DLIO_LIDAR_STABLE_SECONDS=5.0
+Environment=DLIO_LIDAR_MIN_VALID_POINTS=1000
+Environment=DLIO_LIDAR_MIN_GOOD_FRAMES=5
+Environment=DLIO_LIDAR_MIN_RANGE=1.0
+Environment=DLIO_LIDAR_MAX_AGE=1.0
+Environment=DLIO_LIDAR_CHECK_TIMEOUT=0
+```
+
+### 5. px4ctrl 安全启动入口
 
 `px4ctrl` 启动前要求 `/mavros/rc/in` 连续满足安全状态：
 
@@ -174,20 +225,20 @@ roslaunch px4ctrl run_ctrl.launch
 
 ```bash
 sudo chmod +x ~/uran_ws/scripts/start_px4ctrl_safe.sh ~/uran_ws/scripts/wait_for_px4ctrl_rc_safe.py
-sudo cp ~/uran_ws/systemd/px4ctrl-safe.service /etc/systemd/system/
+sudo cp ~/uran_ws/systemd/uran-px4ctrl-safe.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable px4ctrl-safe.service
-sudo systemctl start px4ctrl-safe.service
+sudo systemctl enable uran-px4ctrl-safe.service
+sudo systemctl start uran-px4ctrl-safe.service
 ```
 
 查看日志：
 
 ```bash
-systemctl status px4ctrl-safe.service
-journalctl -u px4ctrl-safe.service -f
+systemctl status uran-px4ctrl-safe.service
+journalctl -u uran-px4ctrl-safe.service -f
 ```
 
-可在 `systemd/px4ctrl-safe.service` 中通过环境变量调整阈值，例如：
+可在 `systemd/uran-px4ctrl-safe.service` 中通过环境变量调整阈值，例如：
 
 ```ini
 Environment=PX4CTRL_RC_STABLE_SECONDS=2.0
@@ -200,7 +251,7 @@ Environment=PX4CTRL_RC_CH6_MIN=1900
 Environment=PX4CTRL_RC_CH6_MAX=2100
 ```
 
-### 5. 修改启动用户或工作区路径
+### 6. 修改启动用户或工作区路径
 
 如果不是 `jetson` 用户，或工作区不在 `~/uran_ws`，请先修改：
 
@@ -208,7 +259,8 @@ Environment=PX4CTRL_RC_CH6_MAX=2100
 - `systemd/uran-autostart.service` 中的 `WorkingDirectory=`
 - `systemd/uran-autostart.service` 中的 `WORKSPACE_DIR=`
 - `systemd/uran-autostart.service` 中的 `EXTRA_SETUP_FILES=`
-- `systemd/px4ctrl-safe.service` 中对应的 `User=`、`WorkingDirectory=`、`WORKSPACE_DIR=`、`EXTRA_SETUP_FILES=`
+- `systemd/uran-dlio-delayed.service` 中对应的 `User=`、`WorkingDirectory=`、`WORKSPACE_DIR=`、`EXTRA_SETUP_FILES=`
+- `systemd/uran-px4ctrl-safe.service` 中对应的 `User=`、`WorkingDirectory=`、`WORKSPACE_DIR=`、`EXTRA_SETUP_FILES=`
 
 ---
 

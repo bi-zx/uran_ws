@@ -2,7 +2,7 @@
   <arg name="start_realsense" default="true" />
   <arg name="start_mavros" default="true" />
   <arg name="start_livox" default="true" />
-  <arg name="start_dlio" default="true" />
+  <arg name="start_dlio" default="false" />
   <arg name="start_uran_core" default="true" />
   <arg name="start_uran_media" default="true" />
   <arg name="start_uran_move" default="true" />

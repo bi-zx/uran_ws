@@ -1,5 +1,5 @@
 [Unit]
-Description=PX4Ctrl safe startup gate
+Description=URAN DLIO delayed startup
 After=network-online.target uran-autostart.service
 Wants=network-online.target uran-autostart.service
 
@@ -13,10 +13,16 @@ Environment=ROS_DISTRO=noetic
 Environment=EXTRA_SETUP_FILES=/home/jetson/catkin_pkg/devel/setup.bash
 Environment=ROS_HOME=/tmp/ros_home
 Environment=ROS_LOG_DIR=/tmp/ros_home/log
-Environment=PX4CTRL_RC_STABLE_SECONDS=2.0
-Environment=PX4CTRL_RC_CHECK_TIMEOUT=0
-ExecStart=/home/jetson/uran_ws/scripts/start_px4ctrl_safe.sh
-Restart=on-failure
+Environment=DLIO_START_DELAY_SECONDS=10
+Environment=DLIO_LIDAR_TOPIC=/livox/lidar
+Environment=DLIO_LIDAR_STABLE_SECONDS=5.0
+Environment=DLIO_LIDAR_MIN_VALID_POINTS=1000
+Environment=DLIO_LIDAR_MIN_GOOD_FRAMES=5
+Environment=DLIO_LIDAR_MIN_RANGE=1.0
+Environment=DLIO_LIDAR_MAX_AGE=1.0
+Environment=DLIO_LIDAR_CHECK_TIMEOUT=0
+ExecStart=/home/jetson/uran_ws/scripts/start_dlio_delayed.sh
+Restart=always
 RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=30
