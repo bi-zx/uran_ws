@@ -1,0 +1,49 @@
+uran_base_core:
+  node_name: "uran_base_core_node"
+  db_path: "/tmp/uran_base_state.db"
+  default_protocol: "mqtt"
+  state_broadcast_interval_ms: 1000
+  state_report_interval_ms: 10000
+  state_report_protocol: "mqtt"
+  state_report_on_change: true
+  state_report_change_fields:
+    - "online_status"
+    - "error_code"
+    - "control_mode"
+    - "current_controller"
+    - "motion_control_lock"
+    - "battery_level"
+    - "task_id"
+    - "task_stage"
+  package_registry:
+    - package_id: "uran_core"
+      category: "core"
+      version: "1.0.0"
+      provides:
+        - "state"
+        - "network"
+        - "routing"
+    - package_id: "uran_move"
+      category: "motion"
+      version: "1.0.0"
+      provides:
+        - "move_execution"
+    - package_id: "uran_media"
+      category: "media"
+      version: "1.0.0"
+      provides:
+        - "streaming"
+    - package_id: "uran_autotask"
+      category: "task"
+      version: "1.0.0"
+      provides:
+        - "mission_execution"
+  protocols:
+    mqtt:
+      enabled: true
+      priority: 10
+      config:
+        broker_host: "localhost"
+        broker_port: 1883
+        keepalive: 60
+        topic_prefix: "/oivs/{tenant_id}/{device_id}"

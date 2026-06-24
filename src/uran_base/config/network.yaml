@@ -1,0 +1,31 @@
+network:
+  device_id: "device_001"
+  template_id: "template_001"
+  tenant_id: "default"
+  auth:
+    username: "changeme"
+    token: "changeme"
+    cert_path: ""
+  mqtt:
+    enabled: true
+    broker_host: "localhost"
+    broker_port: 1883
+    keepalive: 60
+    topic_prefix: "/oivs/{tenant_id}/{device_id}"
+  websocket:
+    enabled: false
+    url: ""
+  tcp:
+    enabled: false
+    host: ""
+    port: 0
+  udp:
+    enabled: false
+    host: ""
+    port: 0
+  lora:
+    enabled: false
+    serial_port: "/dev/ttyUSB0"
+    baud_rate: 9600
+  heartbeat_interval_ms: 5000
+  ipv6_enabled: false
