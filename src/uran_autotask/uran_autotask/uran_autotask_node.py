@@ -141,6 +141,8 @@ class UranAutotaskNode(Node):
         self._control_mode = 'manual'
         self._controller = 'cloud'
         self._battery_level: Optional[float] = None
+        self._cyberdog2_switch_status = None
+        self._failsafe_active = False
         self._device_namespace = ''
         self._protocol_available = False
 
@@ -263,6 +265,8 @@ class UranAutotaskNode(Node):
             map_pose_getter=self._local_navigation_pose,
             now_ns_getter=self._now_ns,
             logger=self.get_logger(),
+            control_state_getter=self._motion_control_state,
+            monotonic_getter=time.monotonic,
         )
 
         self._configure_pose_related_subscriptions()
@@ -728,6 +732,8 @@ class UranAutotaskNode(Node):
     def _cb_mode_switch(self, msg: ModeSwitchCmd):
         self._control_mode = msg.control_mode
         self._controller = msg.controller
+        if hasattr(self, '_mission_manager'):
+            self._mission_manager.handle_control_state_change()
 
     def _cb_state_snapshot(self, msg: StateSnapshot):
         try:
@@ -741,6 +747,33 @@ class UranAutotaskNode(Node):
                 self._battery_level = float(fields['battery_level'])
         except Exception:
             pass
+
+        if 'cyberdog2_switch_status' in fields:
+            value = fields.get('cyberdog2_switch_status')
+            try:
+                self._cyberdog2_switch_status = int(value)
+            except (TypeError, ValueError):
+                self._cyberdog2_switch_status = value
+        if 'failsafe_active' in fields:
+            value = fields.get('failsafe_active')
+            self._failsafe_active = (
+                str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+                if isinstance(value, str) else bool(value)
+            )
+
+        mode_changed = False
+        if 'control_mode' in fields:
+            control_mode = str(fields.get('control_mode') or '')
+            if control_mode and control_mode != self._control_mode:
+                self._control_mode = control_mode
+                mode_changed = True
+        if 'current_controller' in fields:
+            controller = str(fields.get('current_controller') or '')
+            if controller and controller != self._controller:
+                self._controller = controller
+                mode_changed = True
+        if mode_changed and hasattr(self, '_mission_manager'):
+            self._mission_manager.handle_control_state_change()
 
         position = fields.get('position')
         if isinstance(position, dict):
@@ -774,7 +807,10 @@ class UranAutotaskNode(Node):
 
     def _cb_straight_drive_scan(self, msg: LaserScan):
         if self._straight_drive_controller is not None:
-            self._straight_drive_controller.update_scan(msg)
+            self._straight_drive_controller.update_scan(
+                msg,
+                monotonic_s=time.monotonic(),
+            )
 
     def _cb_pose_stamped(self, role: str, msg: PoseStamped):
         payload = pose_stamped_to_dict(msg)
@@ -856,11 +892,7 @@ class UranAutotaskNode(Node):
         self._mission_manager.tick(monotonic_s=time.monotonic())
 
     def _cb_straight_drive_tick(self):
-        if (
-            self._straight_drive_controller is not None and
-            self._straight_drive_controller.is_active()
-        ):
-            self._mission_manager.tick(monotonic_s=time.monotonic())
+        self._mission_manager.tick_control(monotonic_s=time.monotonic())
 
     def _cb_pose_report_tick(self):
         now_ns = self._now_ns()
@@ -1075,10 +1107,21 @@ class UranAutotaskNode(Node):
             'gps_status': self._gps_status_tracker.snapshot(now_ns=self._now_ns()),
             'gps_status_topic': self._gps_status_topic,
             'pose_history': self._pose_registry.history_summary(),
+            'motion_control': self._motion_control_state(),
             'local_odometry_note': (
                 'The visual channel stores the selected local odometry source. '
                 'It can be visual odometry, leg odometry, fused odometry, or TF fallback.'
             ),
+        }
+
+    def _motion_control_state(self) -> Dict[str, Any]:
+        return {
+            'control_mode': self._control_mode,
+            'controller': self._controller,
+            'bottom_status': self._cyberdog2_switch_status,
+            'cyberdog2_switch_status': self._cyberdog2_switch_status,
+            'failsafe_active': self._failsafe_active,
+            'battery_level': self._battery_level,
         }
 
     def _set_map_pose_reporting_enabled(self, enabled: bool):

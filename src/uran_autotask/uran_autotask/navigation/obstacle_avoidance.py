@@ -1,5 +1,6 @@
 import math
 import statistics
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -26,6 +27,8 @@ class GapChoice:
     front_clearance_m: float
     nearest_obstacle_m: float
     blocked_ratio: float
+    physical_width_m: float = 0.0
+    direction: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -38,6 +41,8 @@ class GapChoice:
             'front_clearance_m': self.front_clearance_m,
             'nearest_obstacle_m': self.nearest_obstacle_m,
             'blocked_ratio': self.blocked_ratio,
+            'physical_width_m': self.physical_width_m,
+            'direction': self.direction,
         }
 
 
@@ -50,6 +55,10 @@ class AvoidanceDecision:
     blocked_ratio: float
     choice: Optional[GapChoice] = None
     reason: str = ''
+    scan_quality: str = 'good'
+    valid_ratio: float = 1.0
+    front_valid_ratio: float = 1.0
+    direction: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -61,6 +70,10 @@ class AvoidanceDecision:
             'blocked_ratio': self.blocked_ratio,
             'reason': self.reason,
             'choice': self.choice.to_dict() if self.choice is not None else None,
+            'scan_quality': self.scan_quality,
+            'valid_ratio': self.valid_ratio,
+            'front_valid_ratio': self.front_valid_ratio,
+            'direction': self.direction,
         }
 
 
@@ -89,11 +102,82 @@ class GapAvoidancePlanner:
         self.clearance_weight = float(cfg.get('clearance_weight', 1.0))
         self.width_weight = float(cfg.get('width_weight', 0.25))
         self.center_bias_weight = float(cfg.get('center_bias_weight', 0.4))
+        self.direction_consistency_weight = float(
+            cfg.get('direction_consistency_weight', 1.0)
+        )
+        self.robot_width_m = max(0.1, float(cfg.get('robot_width_m', 2.0 * self.robot_radius_m)))
+        self.min_gap_physical_width_m = max(
+            self.robot_width_m + 2.0 * self.safety_margin_m,
+            float(cfg.get('min_gap_physical_width_m', self.robot_width_m + 2.0 * self.safety_margin_m)),
+        )
+        self.min_valid_ratio = _clamp(float(cfg.get('min_scan_valid_ratio', 0.50)), 0.0, 1.0)
+        self.min_front_valid_ratio = _clamp(
+            float(cfg.get('min_front_valid_ratio', 0.50)),
+            0.0,
+            1.0,
+        )
+        self.degraded_valid_ratio = _clamp(
+            float(cfg.get('degraded_scan_valid_ratio', 0.75)),
+            self.min_valid_ratio,
+            1.0,
+        )
+        self.degraded_front_valid_ratio = _clamp(
+            float(cfg.get('degraded_front_valid_ratio', 0.75)),
+            self.min_front_valid_ratio,
+            1.0,
+        )
+        self.direction_lock_s = max(0.0, float(cfg.get('avoid_direction_lock_s', 1.5)))
+        self.clear_confirm_s = max(0.0, float(cfg.get('clear_confirm_s', 0.8)))
+        self.recover_confirm_s = max(0.0, float(cfg.get('recover_confirm_s', 0.8)))
+        self._last_beam_valid: List[bool] = []
+        self._last_valid_ratio = 0.0
+        self._last_front_valid_ratio = 0.0
+        self._last_scan_quality = 'invalid'
+        self._avoid_direction = ''
+        self._avoid_direction_since: Optional[float] = None
+        self._clear_since: Optional[float] = None
+        self._last_state = 'idle'
 
-    def plan(self, scan, *, theta_goal: float = 0.0) -> AvoidanceDecision:
+    def reset(self):
+        self._last_beam_valid = []
+        self._last_valid_ratio = 0.0
+        self._last_front_valid_ratio = 0.0
+        self._last_scan_quality = 'invalid'
+        self._avoid_direction = ''
+        self._avoid_direction_since = None
+        self._clear_since = None
+        self._last_state = 'idle'
+
+    def quality_snapshot(self) -> Dict[str, Any]:
+        return {
+            'scan_quality': self._last_scan_quality,
+            'valid_ratio': self._last_valid_ratio,
+            'front_valid_ratio': self._last_front_valid_ratio,
+            'avoid_direction': self._avoid_direction,
+            'avoid_direction_age_s': (
+                max(0.0, time.monotonic() - self._avoid_direction_since)
+                if self._avoid_direction_since is not None else None
+            ),
+            'clear_age_s': (
+                max(0.0, time.monotonic() - self._clear_since)
+                if self._clear_since is not None else None
+            ),
+        }
+
+    def plan(
+        self,
+        scan,
+        *,
+        theta_goal: float = 0.0,
+        stop_distance_m: Optional[float] = None,
+        now_s: Optional[float] = None,
+    ) -> AvoidanceDecision:
+        now = time.monotonic() if now_s is None else float(now_s)
         beams = self._preprocess(scan)
         if not beams:
-            return AvoidanceDecision(
+            self._last_scan_quality = 'invalid'
+            self._last_state = 'blocked'
+            return self._decision(
                 state='blocked',
                 theta_target=0.0,
                 front_clearance_m=0.0,
@@ -105,13 +189,58 @@ class GapAvoidancePlanner:
         front_ranges = [r for theta, r in beams if abs(theta) <= self.front_sector_rad]
         front_clearance = min(front_ranges) if front_ranges else min(r for _, r in beams)
         nearest_obstacle = min(r for _, r in beams)
+        valid_ratio = self._last_valid_ratio
+        front_valid_ratio = self._last_front_valid_ratio
+        if (
+            valid_ratio < self.min_valid_ratio or
+            front_valid_ratio < self.min_front_valid_ratio
+        ):
+            self._last_scan_quality = 'invalid'
+            self._last_state = 'blocked'
+            return self._decision(
+                state='blocked',
+                theta_target=0.0,
+                front_clearance_m=front_clearance,
+                nearest_obstacle_m=nearest_obstacle,
+                blocked_ratio=1.0,
+                reason='laser scan quality is insufficient',
+            )
+        if (
+            valid_ratio < self.degraded_valid_ratio or
+            front_valid_ratio < self.degraded_front_valid_ratio
+        ):
+            self._last_scan_quality = 'degraded'
+        else:
+            self._last_scan_quality = 'good'
 
         blocked = self._build_blocked_mask(beams)
         blocked_ratio = float(sum(1 for item in blocked if item)) / float(len(blocked))
+        stop_distance = self.min_stop_distance_m if stop_distance_m is None else max(
+            self.min_stop_distance_m,
+            float(stop_distance_m),
+        )
 
-        if front_clearance <= self.min_stop_distance_m:
-            choice = self._choose_gap(beams, blocked, theta_goal=theta_goal)
-            return AvoidanceDecision(
+        if front_clearance <= stop_distance:
+            choice = self._choose_gap(
+                beams,
+                blocked,
+                theta_goal=theta_goal,
+                now_s=now,
+            )
+            self._remember_direction(choice, now)
+            self._clear_since = None
+            if choice is None:
+                self._last_state = 'blocked'
+                return self._decision(
+                    state='blocked',
+                    theta_target=0.0,
+                    front_clearance_m=front_clearance,
+                    nearest_obstacle_m=nearest_obstacle,
+                    blocked_ratio=blocked_ratio,
+                    reason='front obstacle is too close and no safe gap was found',
+                )
+            self._last_state = 'stop'
+            return self._decision(
                 state='stop',
                 theta_target=choice.theta_target if choice is not None else 0.0,
                 front_clearance_m=front_clearance,
@@ -122,7 +251,27 @@ class GapAvoidancePlanner:
             )
 
         if self._has_clear_goal_corridor(beams, blocked, theta_goal):
-            return AvoidanceDecision(
+            if self._avoid_direction:
+                if self._clear_since is None:
+                    self._clear_since = now
+                clear_for = now - self._clear_since
+                if clear_for < self.recover_confirm_s:
+                    self._last_state = 'recover'
+                    return self._decision(
+                        state='recover',
+                        theta_target=_normalize_angle(theta_goal),
+                        front_clearance_m=front_clearance,
+                        nearest_obstacle_m=nearest_obstacle,
+                        blocked_ratio=blocked_ratio,
+                        reason='goal corridor is clear, recovering route direction',
+                    )
+                self._avoid_direction = ''
+                self._avoid_direction_since = None
+            self._clear_since = self._clear_since or now
+            if now - self._clear_since >= self.clear_confirm_s:
+                self._clear_since = None
+            self._last_state = 'clear'
+            return self._decision(
                 state='clear',
                 theta_target=_normalize_angle(theta_goal),
                 front_clearance_m=front_clearance,
@@ -131,9 +280,16 @@ class GapAvoidancePlanner:
                 reason='goal corridor is clear',
             )
 
-        choice = self._choose_gap(beams, blocked, theta_goal=theta_goal)
+        self._clear_since = None
+        choice = self._choose_gap(
+            beams,
+            blocked,
+            theta_goal=theta_goal,
+            now_s=now,
+        )
         if choice is None:
-            return AvoidanceDecision(
+            self._last_state = 'blocked'
+            return self._decision(
                 state='blocked',
                 theta_target=0.0,
                 front_clearance_m=front_clearance,
@@ -142,7 +298,9 @@ class GapAvoidancePlanner:
                 reason='no safe gap found',
             )
 
-        return AvoidanceDecision(
+        self._remember_direction(choice, now)
+        self._last_state = 'avoid'
+        return self._decision(
             state='avoid',
             theta_target=choice.theta_target,
             front_clearance_m=front_clearance,
@@ -152,7 +310,33 @@ class GapAvoidancePlanner:
             reason='selected safest local gap',
         )
 
+    def _decision(self, **kwargs) -> AvoidanceDecision:
+        return AvoidanceDecision(
+            scan_quality=self._last_scan_quality,
+            valid_ratio=self._last_valid_ratio,
+            front_valid_ratio=self._last_front_valid_ratio,
+            direction=self._avoid_direction,
+            **kwargs,
+        )
+
+    def _remember_direction(self, choice: Optional[GapChoice], now: float):
+        if choice is None or not choice.direction:
+            return
+        if self._avoid_direction == choice.direction:
+            return
+        if (
+            self._avoid_direction and
+            self._avoid_direction_since is not None and
+            now - self._avoid_direction_since < self.direction_lock_s
+        ):
+            return
+        self._avoid_direction = choice.direction
+        self._avoid_direction_since = now
+
     def _preprocess(self, scan) -> List[Tuple[float, float]]:
+        self._last_beam_valid = []
+        self._last_valid_ratio = 0.0
+        self._last_front_valid_ratio = 0.0
         ranges = list(getattr(scan, 'ranges', []) or [])
         if not ranges:
             return []
@@ -169,24 +353,45 @@ class GapAvoidancePlanner:
 
         half_fov = max(0.0, self.usable_fov_rad / 2.0)
         normalized_ranges: List[float] = []
+        valid_flags: List[bool] = []
         for raw in ranges:
             try:
                 value = float(raw)
             except Exception:
                 value = range_max
-            if not math.isfinite(value) or value <= 0.0:
+            valid = True
+            if math.isnan(value) or value <= 0.0:
+                valid = False
+                value = range_max
+            elif math.isinf(value):
                 value = range_max
             value = _clamp(value, range_min, range_max)
             normalized_ranges.append(value)
+            valid_flags.append(valid)
 
         filtered_ranges = self._median_filter(normalized_ranges)
-        beams: List[Tuple[float, float]] = []
+        beams_with_validity = []
         for index, value in enumerate(filtered_ranges):
             theta = angle_min + float(index) * angle_increment + self.angle_offset_rad
             theta = _normalize_angle(theta)
             if -half_fov <= theta <= half_fov:
-                beams.append((theta, value))
-        beams.sort(key=lambda item: item[0])
+                beams_with_validity.append((theta, value, valid_flags[index]))
+        beams_with_validity.sort(key=lambda item: item[0])
+        beams = [(theta, value) for theta, value, _ in beams_with_validity]
+        self._last_beam_valid = [valid for _, _, valid in beams_with_validity]
+        self._last_valid_ratio = (
+            float(sum(1 for valid in self._last_beam_valid if valid)) /
+            float(len(self._last_beam_valid))
+            if self._last_beam_valid else 0.0
+        )
+        front_flags = [
+            valid for (theta, _), valid in zip(beams, self._last_beam_valid)
+            if abs(theta) <= self.front_sector_rad
+        ]
+        self._last_front_valid_ratio = (
+            float(sum(1 for valid in front_flags if valid)) / float(len(front_flags))
+            if front_flags else 0.0
+        )
         return beams
 
     def _median_filter(self, values: Sequence[float]) -> List[float]:
@@ -253,6 +458,7 @@ class GapAvoidancePlanner:
         blocked: Sequence[bool],
         *,
         theta_goal: float,
+        now_s: Optional[float] = None,
     ) -> Optional[GapChoice]:
         gaps = self._find_gaps(beams, blocked)
         if not gaps:
@@ -265,6 +471,7 @@ class GapAvoidancePlanner:
         nearest_obstacle = min(r for _, r in beams)
         blocked_ratio = float(sum(1 for item in blocked if item)) / float(len(blocked))
 
+        choices = []
         for start, end in gaps:
             start_theta = beams[start][0]
             end_theta = beams[end][0]
@@ -274,11 +481,19 @@ class GapAvoidancePlanner:
             target = _clamp(theta_goal, start_theta, end_theta)
             center = (start_theta + end_theta) / 2.0
             gap_clearance = min(beams[index][1] for index in range(start, end + 1))
+            physical_width = 2.0 * gap_clearance * math.sin(max(0.0, width) / 2.0)
+            if physical_width < self.min_gap_physical_width_m:
+                continue
+            direction = 'left' if center > 1e-6 else 'right' if center < -1e-6 else ''
             score = (
                 -self.goal_weight * abs(_normalize_angle(target - theta_goal)) +
                 self.clearance_weight * min(gap_clearance, self.obstacle_consider_range_m) +
                 self.width_weight * width -
-                self.center_bias_weight * abs(center)
+                self.center_bias_weight * abs(center) +
+                (
+                    self.direction_consistency_weight
+                    if direction and direction == self._avoid_direction else 0.0
+                )
             )
             choice = GapChoice(
                 theta_target=target,
@@ -289,7 +504,25 @@ class GapAvoidancePlanner:
                 front_clearance_m=front_clearance,
                 nearest_obstacle_m=nearest_obstacle,
                 blocked_ratio=blocked_ratio,
+                physical_width_m=physical_width,
+                direction=direction,
             )
+            choices.append(choice)
+
+        locked_direction = self._avoid_direction
+        if (
+            locked_direction and
+            self._avoid_direction_since is not None and
+            now_s is not None and
+            float(now_s) - self._avoid_direction_since < self.direction_lock_s
+        ):
+            locked_choices = [
+                choice for choice in choices if choice.direction == locked_direction
+            ]
+            if locked_choices:
+                choices = locked_choices
+
+        for choice in choices:
             if best is None or choice.score > best.score:
                 best = choice
         return best

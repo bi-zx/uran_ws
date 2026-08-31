@@ -61,13 +61,19 @@ ros2 topic hz /mi_desktop_48_b0_2d_5f_b6_d0/odom_out
 ## 5. 手动下发直线避障任务
 
 ```bash
-ros2 topic pub --times 1 /uran/core/downlink/task_ctrl uran_msgs/msg/TaskCtrlCmd "{msg_version: '1.0', task_id: 'straight_test_001', action: 'start', task_type: 'straight_drive', task_params_json: '{\"task_type\":\"straight_drive\",\"distance_m\":2.0,\"speed_mps\":0.12}', timestamp_ns: 0}"
+ros2 topic pub --times 1 /uran/core/downlink/task_ctrl uran_msgs/msg/TaskCtrlCmd "{msg_version: '1.0', task_id: 'straight_test_001', action: 'start', task_type: 'straight_drive', task_params_json: '{\"task_type\":\"straight_drive\",\"distance_m\":2.0,\"speed_mps\":0.8}', timestamp_ns: 0}"
 ```
 
 监控速度指令：
 
 ```bash
 ros2 topic echo /uran/core/downlink/move_cmd
+```
+
+监控 `uran_move` 实际执行、限速和拒绝结果：
+
+```bash
+ros2 topic echo /uran/core/uplink/data | grep -E 'move_result|move_reject_event|move_clamp_event|command_seq|actual_velocity|reason'
 ```
 
 ## 6. 手动打断任务
@@ -99,10 +105,10 @@ ros2 topic hz /uran/core/uplink/data
 
 ```bash
 cd /SDCARD/uran_ws
-colcon build --packages-select uran_autotask
+colcon build --packages-select uran_autotask uran_move
 ```
 
-编译后需要重启运行 `uran_autotask` 的服务或进程。
+编译后需要重启运行 `uran_autotask` 和 `uran_move` 的服务或进程。
 
 外接 GPS 服务：
 
@@ -116,15 +122,15 @@ systemctl --user status ubx_gps.service --no-pager -l
 如果工作区是复制过来的，先清缓存：
 
 ```bash
-rm -rf build install log
-colcon build --packages-select uran_autotask
+rm -rf build/uran_autotask build/uran_move install/uran_autotask install/uran_move
+colcon build --packages-select uran_autotask uran_move
 ```
 
 ubx_gps 是用户级服务，用这个：
 
 ```bash
 cd /SDCARD/ubx_ws
-colcon build --packages-select uran_autotask
+colcon build --packages-select ubx_gps
 
 systemctl --user daemon-reload
 systemctl --user restart ubx_gps.service
@@ -135,7 +141,7 @@ uran_autotask 如果是跟 cyberdog_bringup.service 一起启动的，用这个�
 
 ```bash
 cd /SDCARD/uran_ws
-colcon build --packages-select uran_autotask
+colcon build --packages-select uran_autotask uran_move
 
 sudo systemctl restart cyberdog_bringup.service
 sudo systemctl status cyberdog_bringup.service --no-pager -l

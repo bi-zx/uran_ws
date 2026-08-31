@@ -49,6 +49,14 @@ class GpsVoYawAligner:
             0.1,
             _as_float(cfg.get('min_visual_displacement_m'), 2.0),
         )
+        minimum_drive_distance = max(
+            self.min_gps_displacement_m,
+            self.min_visual_displacement_m,
+        ) + 0.5
+        self.calibration_drive_distance_m = max(
+            minimum_drive_distance,
+            _as_float(cfg.get('calibration_drive_distance_m'), 4.0),
+        )
         self.max_length_ratio_error = max(0.0, _as_float(cfg.get('max_length_ratio_error'), 0.6))
         self.max_sample_yaw_delta_deg = max(
             0.0,
@@ -184,6 +192,7 @@ class GpsVoYawAligner:
             'min_num_sv': self.min_num_sv,
             'min_gps_displacement_m': self.min_gps_displacement_m,
             'min_visual_displacement_m': self.min_visual_displacement_m,
+            'calibration_drive_distance_m': self.calibration_drive_distance_m,
             'max_length_ratio_error': self.max_length_ratio_error,
             'max_sample_yaw_delta_deg': self.max_sample_yaw_delta_deg,
             'smoothing_alpha': self.smoothing_alpha,

@@ -24,14 +24,13 @@ uran_autotask:
     heading_mode: "true_north_deg"
 
   outdoor_goal_resolver:
-    enabled: true
-    # 第一版没有直接读取室外代价地图，所以不假装判断“墙在哪里”。
-    # 它会按路线切线生成候选目标点；Nav2 失败后再逐个候选点重试。
+    # 局部激光控制器已经负责临时绕障，不再移动后台给出的真实任务点。
+    enabled: false
     strategy: "route_tangent_offsets"
     max_attempts_per_point: 7
     search_radii_m: [0.0, 2.0, 5.0, 10.0]
     dedupe_epsilon_m: 0.1
-    skip_unreachable_transit: true
+    skip_unreachable_transit: false
     skip_unreachable_nav_points: false
 
   outdoor_start_alignment:
@@ -66,6 +65,8 @@ uran_autotask:
     min_num_sv: 4
     min_gps_displacement_m: 3.0
     min_visual_displacement_m: 2.0
+    # 实际校准行走距离要大于采样门槛，给停车余量和 GPS 采样周期留出空间。
+    calibration_drive_distance_m: 4.0
     max_length_ratio_error: 0.6
     max_sample_yaw_delta_deg: 30.0
     smoothing_alpha: 0.1
@@ -84,25 +85,55 @@ uran_autotask:
     min_avoid_speed_mps: 0.06
     max_angular_speed_radps: 0.7
     heading_kp: 1.4
+    slowdown_heading_deg: 55.0
+    max_linear_accel_mps2: 0.4
+    max_linear_decel_mps2: 0.8
+    max_angular_accel_radps2: 1.2
+    max_angular_decel_radps2: 1.8
+    lookahead_min_m: 0.8
+    lookahead_max_m: 2.0
+    lookahead_time_s: 0.8
     # mission_planner_route / waypoint / patrol 也统一走这套局部目标点控制。
     # target_tolerance_m 是“到达一个路线点”的局部判定半径，不能用 GPS 校验的大容差。
     target_tolerance_m: 3.0
     target_tolerance_relax_after_s: 30.0
     target_tolerance_relaxed_m: 5.0
     target_tolerance_final_m: 10.0
+    goal_confirm_frames: 5
+    goal_settle_speed_mps: 0.15
+    goal_settle_angular_radps: 0.15
+    goal_latch_s: 0.5
+    goal_pass_margin_m: 0.35
+    route_corridor_half_width_m: 1.5
     turn_in_place_heading_deg: 85.0
+    control_pose_timeout_s: 0.30
     scan_timeout_s: 0.35
     blocked_timeout_s: 4.0
+    fault_pause_timeout_s: 4.0
     distance_tolerance_m: 0.15
+    command_latency_s: 0.15
+    brake_decel_mps2: 0.5
+    stop_margin_m: 0.25
+    max_pose_step_m: 2.0
     usable_fov_deg: 180.0
     obstacle_consider_range_m: 3.0
     robot_radius_m: 0.35
+    robot_width_m: 0.70
     safety_margin_m: 0.20
+    min_gap_physical_width_m: 1.10
     min_stop_distance_m: 0.65
     clear_path_distance_m: 1.4
     min_gap_width_deg: 28.0
     max_bubble_angle_deg: 35.0
     front_sector_deg: 18.0
+    min_scan_valid_ratio: 0.50
+    min_front_valid_ratio: 0.50
+    degraded_scan_valid_ratio: 0.75
+    degraded_front_valid_ratio: 0.75
+    degraded_sensor_speed_cap_mps: 0.15
+    avoid_direction_lock_s: 1.5
+    clear_confirm_s: 0.8
+    recover_confirm_s: 0.8
     # 如果 /scan 的 theta=0 不是机器狗正前方，可在这里补偿角度。
     angle_offset_deg: 0.0
     median_window: 5

@@ -54,6 +54,13 @@ class CyberDog2Plugin(MovePluginBase):
         self._zero_velocity_epsilon = float(params.get('zero_velocity_epsilon', 0.02))
         self._last_execute_ts = 0.0
         self._switch_status = _SWITCH_STATUS_NORMAL
+        self._switch_status_published = False
+        self._last_published_velocity = {
+            'linear_x': 0.0,
+            'linear_y': 0.0,
+            'angular_z': 0.0,
+        }
+        self._last_servo_publish_monotonic_s = None
         self._charger_connected = None
         self._charger_disconnected_since = None
         self._idle_zero_since = None
@@ -154,7 +161,18 @@ class CyberDog2Plugin(MovePluginBase):
         return '1.0.0'
 
     def internal_state_json(self) -> str:
-        return json.dumps({'switch_status': self._switch_status})
+        age_s = None
+        if self._last_servo_publish_monotonic_s is not None:
+            age_s = max(
+                0.0,
+                time.monotonic() - self._last_servo_publish_monotonic_s,
+            )
+        return json.dumps({
+            'switch_status': self._switch_status,
+            'switch_status_name': self._switch_status_name(),
+            'last_published_velocity': dict(self._last_published_velocity),
+            'last_servo_publish_age_s': age_s,
+        })
 
     # ------------------------------------------------------------------ #
     #  执行                                                                #
@@ -175,6 +193,7 @@ class CyberDog2Plugin(MovePluginBase):
             self._idle_zero_since = None
             self._auto_stand_sent = False
             self._auto_stand_retry_after = 0.0
+            self._publish_servo(0.0, 0.0, 0.0)
             return self._call_result_cmd(_MOTION_ESTOP)
         elif action == 'stop':
             self._last_execute_ts = 0.0
@@ -253,6 +272,7 @@ class CyberDog2Plugin(MovePluginBase):
         self._auto_stand_sent = False
         self._auto_stand_retry_after = 0.0
         self._auto_stand_in_progress = False
+        self._publish_servo(0.0, 0.0, 0.0)
         self._node.get_logger().info(
             f'CyberDog2: control suspended by {owner or "unknown"}, reason={reason or ""}'
         )
@@ -294,6 +314,12 @@ class CyberDog2Plugin(MovePluginBase):
         msg.step_height = step_height
         # 其余数组字段保持默认零值
         self._servo_pub.publish(msg)
+        self._last_published_velocity = {
+            'linear_x': float(vx),
+            'linear_y': float(vy),
+            'angular_z': float(wz),
+        }
+        self._last_servo_publish_monotonic_s = time.monotonic()
 
     def _call_result_cmd(self, motion_id: int) -> tuple:
         if not self._result_client.service_is_ready():
@@ -440,6 +466,13 @@ class CyberDog2Plugin(MovePluginBase):
         prev = self._switch_status
         self._switch_status = int(new_status)
         if self._switch_status == prev:
+            if not self._switch_status_published:
+                self._node._write_state(
+                    'cyberdog2_switch_status',
+                    self._switch_status,
+                    urgent=self._switch_status != _SWITCH_STATUS_NORMAL,
+                )
+                self._switch_status_published = True
             return False
 
         self._node._write_state(
@@ -447,6 +480,7 @@ class CyberDog2Plugin(MovePluginBase):
             self._switch_status,
             urgent=self._switch_status != _SWITCH_STATUS_NORMAL,
         )
+        self._switch_status_published = True
 
         prev_name = _SWITCH_STATUS_NAMES.get(prev, str(prev))
         name = _SWITCH_STATUS_NAMES.get(self._switch_status, str(self._switch_status))

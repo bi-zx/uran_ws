@@ -107,6 +107,7 @@ class MissionManager:
         self._active_outdoor_candidate_index: Optional[int] = None
         self._active_local_goal_kind = ''
         self._pending_first_inspection_index: Optional[int] = None
+        self._pending_home_calibration_index: Optional[int] = None
         self._active_home_calibration_index: Optional[int] = None
         self._hover_until: Optional[float] = None
         self._last_periodic_report_ts = 0.0
@@ -118,6 +119,7 @@ class MissionManager:
         self._motion_control_locked = False
         self._straight_drive_task: Optional[Dict[str, Any]] = None
         self._initial_yaw_calibration_active = False
+        self._paused_local_context: Dict[str, Any] = {}
 
     @property
     def task(self) -> Optional[MissionTask]:
@@ -202,6 +204,65 @@ class MissionManager:
         if self.has_active_task():
             self._tick_task(monotonic_s=monotonic_s, backend_event=backend_event)
             return
+
+    def tick_control(self, *, monotonic_s: Optional[float] = None) -> Dict[str, Any]:
+        """Run only the high-frequency local velocity loop.
+
+        Task parsing, waypoint dispatch, media actions, and progress reporting
+        stay in ``tick``.  This prevents the 20 Hz control timer from running
+        the complete mission state machine a second time.
+        """
+        monotonic_s = time.monotonic() if monotonic_s is None else float(monotonic_s)
+        controller = self._straight_drive_controller
+        if controller is None or not controller.is_active():
+            return {'state': 'idle', 'active': False}
+        if self._runtime.stage == 'paused' or self._runtime.stage in TERMINAL_TASK_STAGES:
+            controller.hard_stop(reason='task_not_executable', monotonic_s=monotonic_s)
+            return {'state': 'idle', 'active': False}
+
+        result = controller.tick(monotonic_s=monotonic_s)
+        if self._straight_drive_task is not None:
+            self._handle_straight_drive_control_result(
+                result=result,
+                monotonic_s=monotonic_s,
+            )
+        elif self._initial_yaw_calibration_active:
+            self._handle_initial_yaw_control_result(
+                result=result,
+                monotonic_s=monotonic_s,
+            )
+        elif self._active_home_calibration_index is not None:
+            self._handle_home_calibration_control_result(
+                result=result,
+                monotonic_s=monotonic_s,
+            )
+        elif self._active_outdoor_point_index is not None:
+            self._handle_outdoor_control_result(
+                result=result,
+                monotonic_s=monotonic_s,
+            )
+        elif self._active_waypoint_index is not None:
+            self._handle_waypoint_control_result(
+                result=result,
+                monotonic_s=monotonic_s,
+            )
+        else:
+            controller.hard_stop(reason='local_goal_context_missing', monotonic_s=monotonic_s)
+        return result
+
+    def handle_control_state_change(self) -> None:
+        """Stop and pause an active task immediately after leaving auto mode."""
+        if not self.has_active_task() or self._runtime.stage == 'paused':
+            return
+        if not self._require_auto_mode or self._control_mode_getter() == 'auto':
+            return
+        if self._straight_drive_controller is not None:
+            self._straight_drive_controller.hard_stop(reason='control_mode_changed')
+        self._pause_with_error(
+            code='E_TASK_CONFLICT',
+            description='current control_mode is not auto',
+            suggested_action='switch_to_auto_mode',
+        )
 
     def build_status_payload(self) -> Dict[str, Any]:
         payload = self._runtime.to_status_dict(
@@ -315,17 +376,6 @@ class MissionManager:
                 return math.degrees(math.atan2(dy, dx))
         return None
 
-    def _capture_local_navigation_yaw_anchor(self):
-        planned_yaw = self._active_initial_heading_deg()
-        visual_pose = self._pose_registry.latest_visual_pose() or {}
-        visual_yaw = visual_pose.get('yaw_deg')
-        if planned_yaw in (None, '') or visual_yaw in (None, ''):
-            return
-        self._gps_vo_yaw_aligner.set_initial_offset(
-            self._normalize_degrees(float(planned_yaw) - float(visual_yaw)),
-            reason='initialized from planned route heading and local odometry yaw',
-        )
-
     def _update_gps_vo_yaw_alignment(self):
         if self._outdoor_mission is None:
             return
@@ -343,13 +393,6 @@ class MissionManager:
         if self._gps_vo_yaw_aligner.yaw_offset_deg is not None:
             return False
         return True
-
-    def _normalize_degrees(self, value: float) -> float:
-        while value > 180.0:
-            value -= 360.0
-        while value < -180.0:
-            value += 360.0
-        return value
 
     def _outdoor_status_snapshot(self) -> Dict[str, Any]:
         if self._outdoor_mission is None:
@@ -390,6 +433,7 @@ class MissionManager:
             'active_local_goal_kind': self._active_local_goal_kind,
             'initial_yaw_calibration_active': self._initial_yaw_calibration_active,
             'pending_first_inspection_index': self._pending_first_inspection_index,
+            'pending_home_calibration_index': self._pending_home_calibration_index,
             'active_home_calibration_index': self._active_home_calibration_index,
             'local_navigation_pose': self.local_navigation_pose(),
             'local_nav_yaw_offset_deg': self._gps_vo_yaw_aligner.yaw_offset_deg,
@@ -438,7 +482,14 @@ class MissionManager:
 
     def _tick_task(self, *, monotonic_s: float, backend_event):
         if self._straight_drive_task is not None:
-            self._tick_straight_drive_task(monotonic_s=monotonic_s)
+            if self._require_auto_mode and self._control_mode_getter() != 'auto':
+                self._pause_with_error(
+                    code='E_TASK_CONFLICT',
+                    description='current control_mode is not auto',
+                    suggested_action='switch_to_auto_mode',
+                )
+                return
+            self._publish_periodic_progress(monotonic_s=monotonic_s)
             return
 
         if self._outdoor_mission is not None:
@@ -499,7 +550,7 @@ class MissionManager:
             return
 
         if self._active_waypoint_index is not None:
-            self._tick_active_waypoint_local_goal(monotonic_s=monotonic_s)
+            self._publish_periodic_progress(monotonic_s=monotonic_s)
             return
 
         if self._hover_until is not None:
@@ -569,6 +620,7 @@ class MissionManager:
 
         self._task = task
         self._outdoor_mission = None
+        self._paused_local_context = {}
         self._runtime = TaskRuntime(
             task_id=task.task_id,
             stage='preparing',
@@ -683,6 +735,9 @@ class MissionManager:
             distance_m = self._optional_float(payload.get('distance_m', payload.get('distance')))
             duration_s = self._optional_float(payload.get('duration_s', payload.get('duration')))
             speed_mps = self._optional_float(payload.get('speed_mps', payload.get('speed')))
+            target_x = self._optional_float(payload.get('target_x'))
+            target_y = self._optional_float(payload.get('target_y'))
+            target_tolerance_m = self._optional_float(payload.get('target_tolerance_m'))
         except ValueError as exc:
             self._runtime = TaskRuntime(
                 task_id=task_id,
@@ -702,12 +757,16 @@ class MissionManager:
             return
         self._task = None
         self._outdoor_mission = None
+        self._paused_local_context = {}
         self._straight_drive_task = {
             'task_id': str(task_id or ''),
             'task_type': str(task_type or payload.get('task_type') or 'straight_drive'),
             'distance_m': distance_m,
             'duration_s': duration_s,
             'speed_mps': speed_mps,
+            'target_x': target_x,
+            'target_y': target_y,
+            'target_tolerance_m': target_tolerance_m,
             'params': payload,
         }
         self._runtime = TaskRuntime(
@@ -727,6 +786,7 @@ class MissionManager:
         self._active_outdoor_candidate_index = None
         self._active_local_goal_kind = ''
         self._pending_first_inspection_index = None
+        self._pending_home_calibration_index = None
         self._active_home_calibration_index = None
         self._hover_until = None
         self._action_runner.reset()
@@ -746,6 +806,11 @@ class MissionManager:
             distance_m=self._straight_drive_task.get('distance_m'),
             duration_s=self._straight_drive_task.get('duration_s'),
             speed_mps=self._straight_drive_task.get('speed_mps'),
+            target_x=self._straight_drive_task.get('target_x'),
+            target_y=self._straight_drive_task.get('target_y'),
+            target_tolerance_m=self._straight_drive_task.get('target_tolerance_m'),
+            goal_kind='inspection',
+            requires_stop=True,
         )
         if not result.get('accepted', False):
             self._pause_with_error(
@@ -788,6 +853,7 @@ class MissionManager:
 
         self._task = None
         self._outdoor_mission = outdoor_mission
+        self._paused_local_context = {}
         self._runtime = TaskRuntime(
             task_id=outdoor_mission.task_id,
             stage='preparing',
@@ -812,6 +878,7 @@ class MissionManager:
         self._outdoor_start_alignment = {}
         self._gps_vo_yaw_aligner.reset()
         self._pending_first_inspection_index = None
+        self._pending_home_calibration_index = None
         self._active_home_calibration_index = None
         self._initial_yaw_calibration_active = False
         self._outdoor_gps_vo_gate = GpsVoGate(
@@ -831,7 +898,6 @@ class MissionManager:
             )
             return
 
-        self._capture_local_navigation_yaw_anchor()
         self._outdoor_start_alignment = self._outdoor_start_aligner.evaluate_and_apply(
             mission=outdoor_mission,
             current_pose=self.local_navigation_pose(),
@@ -864,6 +930,13 @@ class MissionManager:
                 self._outdoor_start_alignment.get('first_inspection_index', -1)
             )
             home_index = int(self._outdoor_start_alignment.get('home_calibration_index', -1))
+            self._pending_home_calibration_index = home_index
+            if self._should_run_initial_yaw_calibration():
+                if not self._dispatch_initial_yaw_calibration():
+                    return
+                self._publish_task_progress()
+                self._write_state_fields()
+                return
             if not self._dispatch_home_calibration(home_index=home_index):
                 return
             self._publish_task_progress()
@@ -904,6 +977,7 @@ class MissionManager:
         ) or self._runtime.stage in TERMINAL_TASK_STAGES:
             return
 
+        self._capture_paused_local_context()
         self._stop_straight_drive_if_needed(reason=reason)
         self._stop_backend_navigation_if_needed()
         self._publish_move_stop(reason=reason)
@@ -934,13 +1008,32 @@ class MissionManager:
                 suggested_action='switch_to_auto_mode',
             )
             return
+        paused_context = dict(self._paused_local_context)
         self._acquire_motion_control_lock(task_id=self._runtime.task_id, reason='task_resumed')
         if self._straight_drive_task is not None and self._straight_drive_controller is not None:
+            distance_m = self._straight_drive_task.get('distance_m')
+            duration_s = self._straight_drive_task.get('duration_s')
+            if str(paused_context.get('kind') or '') == 'straight_drive':
+                if paused_context.get('remaining_distance_m') is not None:
+                    distance_m = float(paused_context['remaining_distance_m'])
+                if paused_context.get('remaining_duration_s') is not None:
+                    duration_s = float(paused_context['remaining_duration_s'])
+            if (
+                (distance_m is not None and float(distance_m) <= 0.0) or
+                (duration_s is not None and float(duration_s) <= 0.0)
+            ):
+                self._complete_task()
+                return
             result = self._straight_drive_controller.start(
                 task_id=self._runtime.task_id,
-                distance_m=self._straight_drive_task.get('distance_m'),
-                duration_s=self._straight_drive_task.get('duration_s'),
+                distance_m=distance_m,
+                duration_s=duration_s,
                 speed_mps=self._straight_drive_task.get('speed_mps'),
+                target_x=self._straight_drive_task.get('target_x'),
+                target_y=self._straight_drive_task.get('target_y'),
+                target_tolerance_m=self._straight_drive_task.get('target_tolerance_m'),
+                goal_kind='inspection',
+                requires_stop=True,
             )
             if not result.get('accepted', False):
                 self._pause_with_error(
@@ -958,8 +1051,16 @@ class MissionManager:
         self._active_outdoor_goal_resolution = None
         self._active_outdoor_candidate_index = None
         self._active_local_goal_kind = ''
-        self._pending_first_inspection_index = None
         self._active_home_calibration_index = None
+        context_kind = str(paused_context.get('kind') or '')
+        if context_kind == 'home_calibration':
+            home_index = int(paused_context.get('index', -1))
+            if not self._dispatch_home_calibration(home_index=home_index):
+                return
+        elif context_kind == 'initial_yaw_calibration':
+            if not self._dispatch_initial_yaw_calibration():
+                return
+        self._paused_local_context = {}
         self._publish_task_progress()
         self._write_state_fields()
 
@@ -973,10 +1074,12 @@ class MissionManager:
         self._active_outdoor_candidate_index = None
         self._active_local_goal_kind = ''
         self._pending_first_inspection_index = None
+        self._pending_home_calibration_index = None
         self._active_home_calibration_index = None
         self._initial_yaw_calibration_active = False
         self._gps_vo_yaw_aligner.reset()
         self._straight_drive_task = None
+        self._paused_local_context = {}
         self._hover_until = None
         self._action_runner.reset()
         self._runtime.stage = 'aborted'
@@ -994,31 +1097,12 @@ class MissionManager:
         self._publish_task_progress()
         self._write_state_fields()
 
-    def _tick_straight_drive_task(self, *, monotonic_s: float):
-        if self._straight_drive_task is None:
-            return
-
-        if self._require_auto_mode and self._control_mode_getter() != 'auto':
-            self._pause_with_error(
-                code='E_TASK_CONFLICT',
-                description='current control_mode is not auto',
-                suggested_action='switch_to_auto_mode',
-            )
-            return
-
-        if self._runtime.stage == 'paused':
-            self._publish_periodic_progress(monotonic_s=monotonic_s)
-            return
-
-        if self._straight_drive_controller is None:
-            self._pause_with_error(
-                code='E_STRAIGHT_DRIVE_UNAVAILABLE',
-                description='straight drive controller is unavailable',
-                suggested_action='check_autotask_config',
-            )
-            return
-
-        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+    def _handle_straight_drive_control_result(
+        self,
+        *,
+        result: Dict[str, Any],
+        monotonic_s: float,
+    ):
         state = str(result.get('state') or '')
         if state == 'completed':
             self._runtime.current_waypoint_index = 0
@@ -1027,12 +1111,11 @@ class MissionManager:
             self._complete_task()
             return
 
-        if result.get('terminal') and state == 'blocked':
-            self._pause_with_error(
-                code='E_STRAIGHT_DRIVE_BLOCKED',
-                description=str(result.get('reason') or 'straight drive is blocked'),
-                suggested_action='clear_obstacle_or_send_stop',
-            )
+        if self._handle_terminal_local_control_result(
+            result,
+            default_code='E_STRAIGHT_DRIVE_BLOCKED',
+            default_description='straight drive is blocked',
+        ):
             return
 
         if not result.get('throttled', False):
@@ -1049,6 +1132,39 @@ class MissionManager:
                 self._runtime.progress_percent = max(0.0, min(99.0, 100.0 * elapsed / target))
 
         self._publish_periodic_progress(monotonic_s=monotonic_s)
+
+    def _handle_terminal_local_control_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        default_code: str,
+        default_description: str,
+    ) -> bool:
+        if not bool(result.get('terminal', False)):
+            return False
+        code = str(result.get('code') or default_code)
+        suggested_actions = {
+            'E_CONTROL_MODE': 'switch_to_auto_mode',
+            'E_CONTROLLER_MODE': 'switch_to_auto_controller',
+            'E_FAILSAFE_ACTIVE': 'restore_link_and_clear_failsafe',
+            'E_POSE_UNAVAILABLE': 'wait_for_localization',
+            'E_POSE_STALE': 'check_localization_input',
+            'E_SCAN_UNAVAILABLE': 'check_lidar_topic',
+            'E_SCAN_STALE': 'check_lidar_topic',
+            'E_SCAN_QUALITY': 'check_lidar_data',
+            'E_SCAN_FRONT_QUALITY': 'check_lidar_data',
+            'E_BOTTOM_STATUS': 'check_cyberdog_motion_status',
+            'E_LOW_BATTERY': 'charge_robot',
+        }
+        self._pause_with_error(
+            code=code,
+            description=str(result.get('reason') or default_description),
+            suggested_action=suggested_actions.get(
+                code,
+                'clear_obstacle_or_send_stop',
+            ),
+        )
+        return True
 
     def _dispatch_next_waypoint_if_needed(self):
         if self._task is None:
@@ -1078,6 +1194,12 @@ class MissionManager:
             )
             return
 
+        route_start = self._waypoint_map_xy(next_index - 1)
+        if route_start is None:
+            current_pose = self.local_navigation_pose()
+            if 'x' in current_pose and 'y' in current_pose:
+                route_start = (float(current_pose['x']), float(current_pose['y']))
+        route_next = self._waypoint_map_xy(next_index + 1)
         result = self._start_local_map_goal(
             task_id=self._runtime.task_id,
             target_x=map_x,
@@ -1085,6 +1207,12 @@ class MissionManager:
             speed_mps=waypoint.speed_mps,
             source='waypoint',
             target_tolerance_m=None,
+            route_start_x=route_start[0] if route_start is not None else None,
+            route_start_y=route_start[1] if route_start is not None else None,
+            route_next_x=route_next[0] if route_next is not None else None,
+            route_next_y=route_next[1] if route_next is not None else None,
+            goal_kind='inspection',
+            requires_stop=True,
         )
         if not result.get('success', False):
             self._pause_with_error(
@@ -1110,27 +1238,31 @@ class MissionManager:
         self._publish_task_progress()
         self._write_state_fields()
 
-    def _tick_active_waypoint_local_goal(self, *, monotonic_s: float):
-        if self._straight_drive_controller is None:
-            self._pause_with_error(
-                code='E_LOCAL_NAV_UNAVAILABLE',
-                description='local LiDAR velocity navigation controller is unavailable',
-                suggested_action='check_autotask_config',
-            )
-            return
+    def _waypoint_map_xy(self, index: int):
+        if self._task is None or index < 0 or index >= len(self._task.waypoints):
+            return None
+        waypoint = self._task.waypoints[index]
+        try:
+            return self._projector.latlon_to_map_xy(waypoint.lat, waypoint.lon)
+        except Exception:
+            return None
 
-        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+    def _handle_waypoint_control_result(
+        self,
+        *,
+        result: Dict[str, Any],
+        monotonic_s: float,
+    ):
         state = str(result.get('state') or '')
         if state == 'completed':
             self._handle_waypoint_success()
             return
 
-        if result.get('terminal') and state == 'blocked':
-            self._pause_with_error(
-                code='E_LOCAL_NAV_BLOCKED',
-                description=str(result.get('reason') or 'local LiDAR navigation is blocked'),
-                suggested_action='clear_obstacle_or_send_stop',
-            )
+        if self._handle_terminal_local_control_result(
+            result,
+            default_code='E_LOCAL_NAV_BLOCKED',
+            default_description='local LiDAR navigation is blocked',
+        ):
             return
 
         if not result.get('throttled', False):
@@ -1162,15 +1294,15 @@ class MissionManager:
             return
 
         if self._initial_yaw_calibration_active:
-            self._tick_initial_yaw_calibration(monotonic_s=monotonic_s)
+            self._publish_periodic_progress(monotonic_s=monotonic_s)
             return
 
         if self._active_home_calibration_index is not None:
-            self._tick_active_home_calibration(monotonic_s=monotonic_s)
+            self._publish_periodic_progress(monotonic_s=monotonic_s)
             return
 
         if self._active_outdoor_point_index is not None:
-            self._tick_active_outdoor_local_goal(monotonic_s=monotonic_s)
+            self._publish_periodic_progress(monotonic_s=monotonic_s)
             return
 
         if self._active_outdoor_point_index is None:
@@ -1221,11 +1353,16 @@ class MissionManager:
             )
             return False
 
+        # A resumed calibration must not combine displacement collected before
+        # and after a pause into one heading estimate.
+        self._gps_vo_yaw_aligner.reset()
         result = self._straight_drive_controller.start(
             task_id=mission.task_id,
-            distance_m=self._gps_vo_yaw_aligner.min_gps_displacement_m,
+            distance_m=self._gps_vo_yaw_aligner.calibration_drive_distance_m,
             speed_mps=None,
             command_source='initial_yaw_calibration',
+            goal_kind='calibration',
+            requires_stop=True,
         )
         if not result.get('accepted', False):
             self._pause_with_error(
@@ -1243,26 +1380,31 @@ class MissionManager:
         self._runtime.last_goal_map_pose = {
             'navigation_mode': 'local_lidar_velocity',
             'calibration_role': 'initial_yaw',
-            'distance_m': self._gps_vo_yaw_aligner.min_gps_displacement_m,
+            'distance_m': self._gps_vo_yaw_aligner.calibration_drive_distance_m,
+            'required_gps_displacement_m': self._gps_vo_yaw_aligner.min_gps_displacement_m,
+            'required_visual_displacement_m': self._gps_vo_yaw_aligner.min_visual_displacement_m,
         }
         return True
 
-    def _tick_initial_yaw_calibration(self, *, monotonic_s: float):
-        if self._straight_drive_controller is None:
-            self._pause_with_error(
-                code='E_LOCAL_NAV_UNAVAILABLE',
-                description='local LiDAR velocity navigation controller is unavailable',
-                suggested_action='check_autotask_config',
-            )
-            return
-
-        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+    def _handle_initial_yaw_control_result(
+        self,
+        *,
+        result: Dict[str, Any],
+        monotonic_s: float,
+    ):
         state = str(result.get('state') or '')
         alignment = self._gps_vo_yaw_aligner.state_snapshot()
         if alignment.get('aligned', False):
             self._straight_drive_controller.stop(reason='initial_yaw_calibration_completed')
             self._initial_yaw_calibration_active = False
             self._active_local_goal_kind = ''
+            pending_home_index = self._pending_home_calibration_index
+            if pending_home_index is not None:
+                if not self._dispatch_home_calibration(home_index=pending_home_index):
+                    return
+                self._publish_task_progress()
+                self._write_state_fields()
+                return
             self._runtime.stage = 'executing'
             self._runtime.status = 'normal'
             self._runtime.event = 'initial_yaw_calibration_completed'
@@ -1272,8 +1414,6 @@ class MissionManager:
             return
 
         if state == 'completed':
-            self._initial_yaw_calibration_active = False
-            self._active_local_goal_kind = ''
             self._pause_with_error(
                 code='E_INITIAL_YAW_CALIBRATION_FAILED',
                 description='initial yaw calibration finished but gps/visual displacement was not reliable',
@@ -1281,13 +1421,11 @@ class MissionManager:
             )
             return
 
-        if result.get('terminal') and state == 'blocked':
-            self._initial_yaw_calibration_active = False
-            self._active_local_goal_kind = ''
-            self._pause_with_error(
-                code='E_INITIAL_YAW_CALIBRATION_BLOCKED',
-                description=str(result.get('reason') or 'initial yaw calibration is blocked'),
-                suggested_action='clear_obstacle_or_send_stop',
+        if result.get('terminal'):
+            self._handle_terminal_local_control_result(
+                result,
+                default_code='E_INITIAL_YAW_CALIBRATION_BLOCKED',
+                default_description='initial yaw calibration is blocked',
             )
             return
 
@@ -1309,6 +1447,11 @@ class MissionManager:
             return False
 
         home = mission.execution_points[home_index]
+        current_pose = self.local_navigation_pose()
+        next_point = self._outdoor_point_at(
+            self._pending_first_inspection_index
+            if self._pending_first_inspection_index is not None else -1
+        )
         result = self._start_local_map_goal(
             task_id=mission.task_id,
             target_x=float(home.x),
@@ -1316,6 +1459,12 @@ class MissionManager:
             speed_mps=None,
             source='home_calibration',
             target_tolerance_m=self._local_goal_target_tolerance(home),
+            route_start_x=current_pose.get('x'),
+            route_start_y=current_pose.get('y'),
+            route_next_x=next_point.x if next_point is not None else None,
+            route_next_y=next_point.y if next_point is not None else None,
+            goal_kind='home',
+            requires_stop=True,
         )
         if not result.get('success', False):
             self._pause_with_error(
@@ -1325,6 +1474,7 @@ class MissionManager:
             )
             return False
 
+        self._pending_home_calibration_index = None
         self._active_home_calibration_index = home_index
         self._active_local_goal_kind = 'home_calibration'
         self._runtime.stage = 'executing'
@@ -1341,27 +1491,22 @@ class MissionManager:
         }
         return True
 
-    def _tick_active_home_calibration(self, *, monotonic_s: float):
-        if self._straight_drive_controller is None:
-            self._pause_with_error(
-                code='E_LOCAL_NAV_UNAVAILABLE',
-                description='local LiDAR velocity navigation controller is unavailable',
-                suggested_action='check_autotask_config',
-            )
-            return
-
-        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+    def _handle_home_calibration_control_result(
+        self,
+        *,
+        result: Dict[str, Any],
+        monotonic_s: float,
+    ):
         state = str(result.get('state') or '')
         if state == 'completed':
             self._handle_home_calibration_reached()
             return
 
-        if result.get('terminal') and state == 'blocked':
-            self._pause_with_error(
-                code='E_HOME_CALIBRATION_BLOCKED',
-                description=str(result.get('reason') or 'home calibration is blocked'),
-                suggested_action='clear_obstacle_or_send_stop',
-            )
+        if self._handle_terminal_local_control_result(
+            result,
+            default_code='E_HOME_CALIBRATION_BLOCKED',
+            default_description='home calibration is blocked',
+        ):
             return
 
         if not result.get('throttled', False):
@@ -1464,8 +1609,27 @@ class MissionManager:
 
         point = mission.execution_points[next_index]
         goal_correction = self._current_outdoor_goal_correction()
-        corrected_x = float(candidate.x) + float(goal_correction.get('dx', 0.0))
-        corrected_y = float(candidate.y) + float(goal_correction.get('dy', 0.0))
+        correction_x = float(goal_correction.get('dx', 0.0))
+        correction_y = float(goal_correction.get('dy', 0.0))
+        corrected_x = float(candidate.x) + correction_x
+        corrected_y = float(candidate.y) + correction_y
+        previous_point = self._outdoor_point_at(next_index - 1)
+        next_point = self._outdoor_point_at(next_index + 1)
+        route_start = None
+        if previous_point is not None:
+            route_start = (
+                float(previous_point.x) + correction_x,
+                float(previous_point.y) + correction_y,
+            )
+        if route_start is None:
+            current_pose = self.local_navigation_pose()
+            if 'x' in current_pose and 'y' in current_pose:
+                route_start = (float(current_pose['x']), float(current_pose['y']))
+        route_next = (
+            (float(next_point.x) + correction_x, float(next_point.y) + correction_y)
+            if next_point is not None else None
+        )
+        point_kind = str(point.kind or '').strip().lower() or 'inspection'
         result = self._start_local_map_goal(
             task_id=mission.task_id,
             target_x=corrected_x,
@@ -1473,6 +1637,12 @@ class MissionManager:
             speed_mps=None,
             source='mission_planner_route',
             target_tolerance_m=self._local_goal_target_tolerance(point),
+            route_start_x=route_start[0] if route_start is not None else None,
+            route_start_y=route_start[1] if route_start is not None else None,
+            route_next_x=route_next[0] if route_next is not None else None,
+            route_next_y=route_next[1] if route_next is not None else None,
+            goal_kind=point_kind,
+            requires_stop=point_kind != 'transit',
         )
         if not result.get('success', False):
             self._pause_with_error(
@@ -1522,6 +1692,12 @@ class MissionManager:
         speed_mps: Optional[float],
         source: str,
         target_tolerance_m: Optional[float] = None,
+        route_start_x: Optional[float] = None,
+        route_start_y: Optional[float] = None,
+        route_next_x: Optional[float] = None,
+        route_next_y: Optional[float] = None,
+        goal_kind: str = 'inspection',
+        requires_stop: Optional[bool] = None,
     ) -> Dict[str, Any]:
         if self._straight_drive_controller is None:
             return {
@@ -1545,6 +1721,12 @@ class MissionManager:
             target_y=float(target_y),
             target_tolerance_m=target_tolerance_m,
             command_source=source,
+            route_start_x=route_start_x,
+            route_start_y=route_start_y,
+            route_next_x=route_next_x,
+            route_next_y=route_next_y,
+            goal_kind=goal_kind,
+            requires_stop=requires_stop,
         )
         if not result.get('accepted', False):
             return {
@@ -1571,16 +1753,12 @@ class MissionManager:
         except (TypeError, ValueError):
             return None
 
-    def _tick_active_outdoor_local_goal(self, *, monotonic_s: float):
-        if self._straight_drive_controller is None:
-            self._pause_with_error(
-                code='E_LOCAL_NAV_UNAVAILABLE',
-                description='local LiDAR velocity navigation controller is unavailable',
-                suggested_action='check_autotask_config',
-            )
-            return
-
-        result = self._straight_drive_controller.tick(monotonic_s=monotonic_s)
+    def _handle_outdoor_control_result(
+        self,
+        *,
+        result: Dict[str, Any],
+        monotonic_s: float,
+    ):
         state = str(result.get('state') or '')
         if state == 'completed':
             self._handle_outdoor_point_success()
@@ -1591,17 +1769,11 @@ class MissionManager:
                 status='local_navigation_blocked',
                 backend_event={'state': state, 'reason': result.get('reason', '')},
             )
-            if self._retry_next_outdoor_candidate({'state': state, 'reason': result.get('reason', '')}):
-                return
-            if self._skip_current_outdoor_point_if_allowed(
-                {'state': state, 'reason': result.get('reason', '')}
-            ):
-                return
-            self._pause_with_error(
-                code='E_LOCAL_NAV_BLOCKED',
-                description=str(result.get('reason') or 'local LiDAR navigation is blocked'),
-                suggested_action='clear_obstacle_or_send_stop',
-            )
+        if self._handle_terminal_local_control_result(
+            result,
+            default_code='E_LOCAL_NAV_BLOCKED',
+            default_description='local LiDAR navigation is blocked',
+        ):
             return
 
         if not result.get('throttled', False):
@@ -1752,6 +1924,14 @@ class MissionManager:
                 if calibration.get('status') == 'passed' else
                 'outdoor_calibration_observing'
             )
+
+        if str(point.kind or '').strip().lower() == 'transit':
+            # The controller intentionally does not send zero speed for a
+            # transit point.  Dispatch the next segment in the same control
+            # callback so the bottom layer receives a continuous command
+            # stream instead of waiting for the slower mission timer.
+            self._dispatch_next_outdoor_point_if_needed()
+            return
 
         self._publish_task_progress()
         self._write_state_fields()
@@ -1983,10 +2163,12 @@ class MissionManager:
         self._active_local_goal_kind = ''
         self._active_waypoint_index = None
         self._pending_first_inspection_index = None
+        self._pending_home_calibration_index = None
         self._active_home_calibration_index = None
         self._initial_yaw_calibration_active = False
         self._gps_vo_yaw_aligner.reset()
         self._straight_drive_task = None
+        self._paused_local_context = {}
         self._runtime.stage = 'completed'
         self._runtime.status = 'normal'
         self._runtime.progress_percent = 100.0
@@ -2009,10 +2191,12 @@ class MissionManager:
         self._active_outdoor_candidate_index = None
         self._active_local_goal_kind = ''
         self._pending_first_inspection_index = None
+        self._pending_home_calibration_index = None
         self._active_home_calibration_index = None
         self._initial_yaw_calibration_active = False
         self._gps_vo_yaw_aligner.reset()
         self._straight_drive_task = None
+        self._paused_local_context = {}
         self._hover_until = None
         self._action_runner.reset()
         self._runtime.stage = 'aborted'
@@ -2030,6 +2214,7 @@ class MissionManager:
         self._write_state_fields()
 
     def _pause_with_error(self, *, code: str, description: str, suggested_action: str):
+        self._capture_paused_local_context()
         self._stop_straight_drive_if_needed(reason=code)
         self._stop_backend_navigation_if_needed()
         self._publish_move_stop(reason=code)
@@ -2039,6 +2224,7 @@ class MissionManager:
         self._active_outdoor_candidate_index = None
         self._active_local_goal_kind = ''
         self._active_home_calibration_index = None
+        self._initial_yaw_calibration_active = False
         self._hover_until = None
         self._action_runner.reset()
         self._runtime.stage = 'paused'
@@ -2052,6 +2238,45 @@ class MissionManager:
         self._release_motion_control_lock(reason=code)
         self._publish_task_progress()
         self._write_state_fields()
+
+    def _capture_paused_local_context(self):
+        if self._initial_yaw_calibration_active:
+            self._paused_local_context = {'kind': 'initial_yaw_calibration'}
+        elif self._active_home_calibration_index is not None:
+            self._paused_local_context = {
+                'kind': 'home_calibration',
+                'index': int(self._active_home_calibration_index),
+            }
+        elif self._active_outdoor_point_index is not None:
+            self._paused_local_context = {
+                'kind': 'outdoor',
+                'index': int(self._active_outdoor_point_index),
+            }
+        elif self._active_waypoint_index is not None:
+            self._paused_local_context = {
+                'kind': 'waypoint',
+                'index': int(self._active_waypoint_index),
+            }
+        elif self._straight_drive_task is not None:
+            context = {'kind': 'straight_drive'}
+            if self._straight_drive_controller is not None:
+                try:
+                    control = self._straight_drive_controller.snapshot()
+                except Exception:
+                    control = {}
+                target_distance = control.get('target_distance_m')
+                if target_distance is not None:
+                    context['remaining_distance_m'] = max(
+                        0.0,
+                        float(target_distance) - float(control.get('distance_traveled_m', 0.0)),
+                    )
+                target_duration = control.get('target_duration_s')
+                if target_duration is not None:
+                    context['remaining_duration_s'] = max(
+                        0.0,
+                        float(target_duration) - float(control.get('elapsed_s', 0.0)),
+                    )
+            self._paused_local_context = context
 
     def _stop_backend_navigation_if_needed(self):
         if self._task is None and self._outdoor_mission is None:

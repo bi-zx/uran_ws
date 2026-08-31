@@ -157,7 +157,7 @@ namespace，所以实机上会订阅类似 `/mi_desktop_48_b0_2d_5f_b6_d0/scan` 
   "action": "start",
   "task_id": "straight_001",
   "task_type": "straight_drive",
-  "task_params_json": "{\"task_type\":\"straight_drive\",\"distance_m\":3.0,\"speed_mps\":0.18}"
+  "task_params_json": "{\"task_type\":\"straight_drive\",\"distance_m\":3.0,\"speed_mps\":0.8}"
 }
 ```
 
@@ -167,7 +167,7 @@ namespace，所以实机上会订阅类似 `/mi_desktop_48_b0_2d_5f_b6_d0/scan` 
 {
   "task_type": "straight_drive",
   "duration_s": 8.0,
-  "speed_mps": 0.18
+  "speed_mps": 0.8
 }
 ```
 
@@ -178,6 +178,13 @@ namespace，所以实机上会订阅类似 `/mi_desktop_48_b0_2d_5f_b6_d0/scan` 
 - `distance_traveled_m`：按本地里程计估算的已走距离。
 - `decision.front_clearance_m`：正前方最近障碍距离。
 - `decision.theta_target_deg`：当前避障选择的目标方向。
+- `route`：当前路线段投影、横向误差、前视点和通行点越过状态。
+- `safety`：自动模式、位姿、雷达、底层状态和失控保护的检查结果。
+- `goal_relaxation_age_s`：进入目标最终容差范围后的计时；为空表示尚未开始放宽容差。
+
+默认巡航速度和最高速度均为 `0.8 m/s`。转向、接近停车点、障碍物靠近、
+传感器质量下降或安全条件不满足时，控制器会降速或停车，所以底层实际速度不一定恒为
+`0.8 m/s`。
 
 `fusion_state` 含义：
 

@@ -2,6 +2,17 @@ from uran_autotask.geo_utils import EARTH_RADIUS_M
 from uran_autotask.localization.gps_vo_yaw_aligner import GpsVoYawAligner
 
 
+def test_calibration_drive_distance_keeps_margin_above_sample_thresholds():
+    aligner = GpsVoYawAligner({
+        'min_gps_displacement_m': 3.0,
+        'min_visual_displacement_m': 3.8,
+        'calibration_drive_distance_m': 3.0,
+    })
+
+    assert aligner.calibration_drive_distance_m == 4.3
+    assert aligner.config_snapshot()['calibration_drive_distance_m'] == 4.3
+
+
 def _gps_from_local(lat0, lon0, x, y):
     lat = lat0 + (y / EARTH_RADIUS_M) * 180.0 / 3.141592653589793
     lon = lon0 + (x / (EARTH_RADIUS_M * 0.7771459614569709)) * 180.0 / 3.141592653589793

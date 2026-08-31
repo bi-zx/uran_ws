@@ -52,6 +52,9 @@ class UranMoveNode(Node):
             'expires_at_ns': 0,
         }
         self._control_suspended_by_lock = False
+        self._last_received_command_seq = 0
+        self._last_executed_command_seq = 0
+        self._last_rejected_command_seq = 0
 
         # 插件相关
         self._plugin = None
@@ -94,6 +97,15 @@ class UranMoveNode(Node):
         # ---------- 发布 ----------
         self._uplink_pub = self.create_publisher(UplinkPayload, '/uran/core/uplink/data', 10)
         self._state_pub = self.create_publisher(StateField, '/uran/core/state/write', 10)
+
+        self._write_state('failsafe_active', False, urgent=True)
+        plugin_state = self._plugin_internal_state()
+        if 'switch_status' in plugin_state:
+            self._write_state(
+                'cyberdog2_switch_status',
+                plugin_state['switch_status'],
+                urgent=plugin_state['switch_status'] not in (0, '0', 'NORMAL'),
+            )
 
         # ---------- 服务 ----------
         self.create_service(SwitchMovePlugin, '/uran/move/switch_plugin', self._srv_switch_plugin)
@@ -298,35 +310,38 @@ class UranMoveNode(Node):
         )
 
     def _cb_move_cmd(self, cmd: UnifiedMoveCmd):
+        command_seq = self._command_seq(cmd)
+        self._last_received_command_seq = command_seq
+        safety_action = str(cmd.action or '').strip().lower() in {
+            'stop',
+            'emergency_stop',
+        }
+        requested_velocity = self._velocity_payload(cmd)
+
         if self._plugin is None:
             self.get_logger().warn('No active plugin, dropping move_cmd')
+            self._publish_rejection(cmd, reason='no active move plugin')
             return
 
-        # 失控保护拦截（保护期间拒绝一切指令，urgent 也无效）
-        if self._failsafe_active:
+        # 停车类指令必须能穿过所有普通控制拦截，否则异常状态下反而
+        # 无法把已经下发到底层的运动速度清零。
+        if self._failsafe_active and not safety_action:
             self.get_logger().warn(
                 f'[FAILSAFE] Active, dropping move_cmd from controller={cmd.controller}'
             )
-            self._publish_uplink(
-                data_type='move_reject_event',
-                payload={
-                    'reason': 'failsafe active',
-                    'controller': cmd.controller,
-                    'control_mode': self._control_mode,
-                },
-                urgent=False,
-            )
+            self._publish_rejection(cmd, reason='failsafe active')
             return
 
-        if not self._check_motion_control_lock(cmd):
+        if not safety_action and not self._check_motion_control_lock(cmd):
             return
 
         # 模式过滤
-        if not self._check_mode(cmd):
+        if not safety_action and not self._check_mode(cmd):
             return
 
         # 预检限速
-        cmd = self._precheck_cmd(cmd)
+        if not safety_action:
+            cmd = self._precheck_cmd(cmd)
 
         # 执行
         try:
@@ -335,7 +350,16 @@ class UranMoveNode(Node):
             success, result_json = False, str(e)
             self.get_logger().error(f'Plugin execute error: {e}')
 
-        self._report_result(cmd, success, result_json)
+        if success:
+            self._last_executed_command_seq = command_seq
+        else:
+            self._last_rejected_command_seq = command_seq
+        self._report_result(
+            cmd,
+            success,
+            result_json,
+            requested_velocity=requested_velocity,
+        )
 
     # ------------------------------------------------------------------ #
     #  预检限速（T2.2）                                                    #
@@ -343,8 +367,9 @@ class UranMoveNode(Node):
 
     def _precheck_cmd(self, cmd: UnifiedMoveCmd) -> UnifiedMoveCmd:
         """用缓存的速度限制截断指令速度（限速参数由 StateSnapshot 广播更新）。"""
-        linear_limit = self._linear_vel_limit
-        angular_limit = self._angular_vel_limit
+        linear_limit = max(0.0, self._linear_vel_limit)
+        angular_limit = max(0.0, self._angular_vel_limit)
+        requested_velocity = self._velocity_payload(cmd)
 
         clamped = False
         vx, vy, vz = cmd.linear_vel_x, cmd.linear_vel_y, cmd.linear_vel_z
@@ -365,9 +390,12 @@ class UranMoveNode(Node):
             self._publish_uplink(
                 data_type='move_clamp_event',
                 payload={
+                    'command_seq': self._command_seq(cmd),
                     'original_v_norm': v_norm,
                     'linear_limit': linear_limit,
                     'angular_limit': angular_limit,
+                    'requested_velocity': requested_velocity,
+                    'clamped_velocity': self._velocity_payload(cmd),
                 },
                 urgent=False,
             )
@@ -381,25 +409,15 @@ class UranMoveNode(Node):
     def _check_mode(self, cmd: UnifiedMoveCmd) -> bool:
         """检查当前控制模式是否允许该指令来源。"""
         if self._control_mode == 'manual' and cmd.controller == 'auto':
-            self._publish_uplink(
-                data_type='move_reject_event',
-                payload={
-                    'reason': 'manual mode rejects auto controller',
-                    'controller': cmd.controller,
-                    'control_mode': self._control_mode,
-                },
-                urgent=False,
+            self._publish_rejection(
+                cmd,
+                reason='manual mode rejects auto controller',
             )
             return False
         if self._control_mode == 'auto' and cmd.controller in ('cloud', 'field'):
-            self._publish_uplink(
-                data_type='move_reject_event',
-                payload={
-                    'reason': 'auto mode rejects manual controller',
-                    'controller': cmd.controller,
-                    'control_mode': self._control_mode,
-                },
-                urgent=False,
+            self._publish_rejection(
+                cmd,
+                reason='auto mode rejects manual controller',
             )
             return False
         return True
@@ -489,44 +507,120 @@ class UranMoveNode(Node):
         if owner and controller == 'auto' and source_pkg == owner:
             return True
 
-        self._publish_uplink(
-            data_type='move_reject_event',
-            payload={
-                'reason': 'motion control locked',
-                'controller': controller,
+        self._publish_rejection(
+            cmd,
+            reason='motion control locked',
+            extra={
                 'source_pkg': source_pkg,
                 'lock_owner': owner,
                 'lock_task_id': str(lock.get('task_id') or ''),
-                'control_mode': self._control_mode,
             },
-            urgent=False,
         )
         return False
 
     def _cmd_source_pkg(self, cmd: UnifiedMoveCmd) -> str:
+        extra = self._cmd_extra(cmd)
+        return str(extra.get('source_pkg') or '')
+
+    def _cmd_extra(self, cmd: UnifiedMoveCmd) -> dict:
         try:
             extra = json.loads(cmd.extra_json or '{}')
         except Exception:
             extra = {}
-        if isinstance(extra, dict):
-            return str(extra.get('source_pkg') or '')
-        return ''
+        return extra if isinstance(extra, dict) else {}
+
+    def _command_seq(self, cmd: UnifiedMoveCmd) -> int:
+        try:
+            return int(self._cmd_extra(cmd).get('command_seq') or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _velocity_payload(self, cmd: UnifiedMoveCmd) -> dict:
+        return {
+            'linear_x': float(cmd.linear_vel_x),
+            'linear_y': float(cmd.linear_vel_y),
+            'linear_z': float(cmd.linear_vel_z),
+            'angular_z': float(cmd.angular_vel_z),
+        }
+
+    def _plugin_internal_state(self) -> dict:
+        if self._plugin is None:
+            return {}
+        try:
+            state = json.loads(self._plugin.internal_state_json() or '{}')
+        except Exception as exc:
+            return {'parse_error': str(exc)}
+        return state if isinstance(state, dict) else {'raw_state': state}
+
+    def _publish_rejection(
+        self,
+        cmd: UnifiedMoveCmd,
+        *,
+        reason: str,
+        extra: dict = None,
+    ):
+        command_seq = self._command_seq(cmd)
+        self._last_rejected_command_seq = command_seq
+        plugin_state = self._plugin_internal_state()
+        payload = {
+            'reason': str(reason),
+            'command_seq': command_seq,
+            'received_command_seq': self._last_received_command_seq,
+            'executed_command_seq': self._last_executed_command_seq,
+            'rejected_command_seq': self._last_rejected_command_seq,
+            'controller': str(cmd.controller or ''),
+            'control_mode': self._control_mode,
+            'action': str(cmd.action or ''),
+            'requested_velocity': self._velocity_payload(cmd),
+            'failsafe_active': self._failsafe_active,
+            'switch_status': plugin_state.get('switch_status'),
+            'switch_status_name': plugin_state.get('switch_status_name'),
+        }
+        payload.update(dict(extra or {}))
+        self._publish_uplink(
+            data_type='move_reject_event',
+            payload=payload,
+            urgent=False,
+        )
 
     # ------------------------------------------------------------------ #
     #  上报                                                                #
     # ------------------------------------------------------------------ #
 
-    def _report_result(self, cmd: UnifiedMoveCmd, success: bool, result_json: str):
+    def _report_result(
+        self,
+        cmd: UnifiedMoveCmd,
+        success: bool,
+        result_json: str,
+        *,
+        requested_velocity: dict = None,
+    ):
+        plugin_state = self._plugin_internal_state()
+        try:
+            result_detail = json.loads(result_json) if result_json else {}
+        except Exception:
+            result_detail = {'message': str(result_json or '')}
         payload = {
             'cmd_timestamp_ns': cmd.timestamp_ns,
+            'command_seq': self._command_seq(cmd),
+            'received_command_seq': self._last_received_command_seq,
+            'executed_command_seq': self._last_executed_command_seq,
+            'rejected_command_seq': self._last_rejected_command_seq,
             'success': success,
             'error_code': 0 if success else 1,
             'error_msg': '' if success else result_json,
+            'result_detail': result_detail,
             'current_control_mode': self._control_mode,
+            'controller': str(cmd.controller or ''),
+            'action': str(cmd.action or ''),
+            'requested_velocity': dict(requested_velocity or self._velocity_payload(cmd)),
+            'clamped_velocity': self._velocity_payload(cmd),
+            'actual_velocity': dict(plugin_state.get('last_published_velocity') or {}),
+            'failsafe_active': self._failsafe_active,
+            'switch_status': plugin_state.get('switch_status'),
+            'switch_status_name': plugin_state.get('switch_status_name'),
             'plugin_id': self._active_plugin_id,
-            'plugin_internal_state': json.loads(
-                self._plugin.internal_state_json() if self._plugin else '{}'
-            ),
+            'plugin_internal_state': plugin_state,
         }
         self._publish_uplink(data_type='move_result', payload=payload, urgent=False)
 

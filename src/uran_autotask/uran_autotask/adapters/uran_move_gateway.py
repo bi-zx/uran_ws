@@ -10,6 +10,7 @@ class UranMoveGateway:
     def __init__(self, node, *, topic_name: str = '/uran/core/downlink/move_cmd'):
         self._node = node
         self._publisher = node.create_publisher(UnifiedMoveCmd, topic_name, 10)
+        self._command_seq = 0
 
     def stop(self, *, reason: str = ''):
         self._publish_action('stop', reason=reason)
@@ -40,6 +41,7 @@ class UranMoveGateway:
         payload = {
             'source_pkg': 'uran_autotask',
             'source': str(source or 'velocity'),
+            'command_seq': self._next_command_seq(),
         }
         if reason:
             payload['reason'] = str(reason)
@@ -56,7 +58,12 @@ class UranMoveGateway:
         msg.action = str(action)
         payload = dict(extra or {})
         payload['source_pkg'] = 'uran_autotask'
+        payload['command_seq'] = self._next_command_seq()
         if reason:
             payload['reason'] = str(reason)
         msg.extra_json = json.dumps(payload, ensure_ascii=False)
         self._publisher.publish(msg)
+
+    def _next_command_seq(self) -> int:
+        self._command_seq += 1
+        return self._command_seq

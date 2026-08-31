@@ -49,13 +49,17 @@ uran_autotask/
 │   │   ├── cyberdog_camera_capture.py
 │   │   └── uran_move_gateway.py
 │   ├── navigation/
-│   │   ├── local_outdoor_backend.py
 │   │   ├── obstacle_avoidance.py
 │   │   ├── route_follower.py
-│   │   └── velocity_policy.py
+│   │   ├── safety_gate.py
+│   │   ├── straight_drive_controller.py
+│   │   └── velocity_shaper.py
 │   ├── localization/
 │   │   ├── closed_loop_manager.py
+│   │   ├── geo_pose_fuser.py
+│   │   ├── gps_status.py
 │   │   ├── gps_supervisor.py
+│   │   ├── gps_vo_yaw_aligner.py
 │   │   ├── outdoor_pose_aligner.py
 │   │   ├── pose_msg_utils.py
 │   │   ├── pose_registry.py
@@ -166,7 +170,7 @@ This is not a full Kalman filter. The current fusion rule is:
 After enough logs are collected, the internal estimator can be upgraded from a
 sliding window to a Kalman filter without changing the cloud protocol.
 
-## Planned Outdoor Motion Layer
+## Outdoor Motion Layer
 
 The outdoor motion layer stays inside `uran_autotask`. It is not a separate ROS
 package. The split is by responsibility:
@@ -178,15 +182,19 @@ package. The split is by responsibility:
 - `adapters/` owns ROS-facing bridges to `uran_core`, `uran_move`, and the
   legacy CyberDog algorithm manager.
 
-The intended control flow for the new outdoor path is:
+The implemented outdoor control flow is:
 
 1. `mission_manager` parses the outdoor route and keeps the task state machine;
-2. the local outdoor backend takes the next route point;
-3. the route follower uses the fused pose as the motion reference;
-4. the obstacle avoidance layer filters laser or point-cloud inputs and scores
-   safe velocities;
-5. the velocity policy picks a low-level command;
-6. the command goes through `/uran/core/downlink/move_cmd` and then
+2. the low-frequency mission timer selects the next route point and handles
+   pause, resume, task actions, and progress reporting;
+3. the 20 Hz control timer projects the current pose onto the active route
+   segment and selects a forward look-ahead point;
+4. `obstacle_avoidance` filters `LaserScan`, inflates obstacles by robot size
+   and safety margin, and selects a physically wide enough local gap;
+5. `safety_gate` checks auto mode, pose/scan freshness, scan quality, bottom
+   motion state, failsafe state, and battery state;
+6. `velocity_shaper` applies velocity, acceleration, and deceleration limits;
+7. the command goes through `/uran/core/downlink/move_cmd` and then
    `uran_move`.
 
 This keeps the control logic close to the bottom layer, but still outside the
@@ -197,10 +205,29 @@ The first implementation should keep the motion source package as
 `uran_autotask`, so the existing `motion_control_lock` path in `uran_move` does
 not need a new ownership model.
 
-For the smaller `straight_drive` command, the navigation layer only keeps the
-starting heading and reacts to the current `LaserScan`. It does not build a map,
-does not run SLAM, and does not guarantee a route around complex obstacles.
-When no safe local gap exists, it must stop and report `blocked`.
+Transit points do not stop. Near a transit point the look-ahead reference moves
+onto the next segment, so normal turns remain continuous. Inspection,
+calibration, and home points stop and require several consecutive in-tolerance
+control frames. Their tolerance starts at 3 m. Only after the robot first enters
+the final 10 m neighborhood does the fallback timer start: 5 m after 30 seconds
+and 10 m after 60 seconds.
+
+At the start of an outdoor task, a single-antenna GNSS receiver cannot provide
+body heading while stationary. The robot therefore drives a short straight
+calibration segment using local odometry yaw. The yaw aligner compares GNSS
+displacement direction with local-odometry displacement direction and estimates
+the yaw offset between those frames. The default estimator requires 3 m of GPS
+displacement and drives 4 m to leave room for command stopping tolerance and
+GPS sampling delay. A resumed calibration discards samples collected before
+the pause.
+
+The normal cruise speed and hard speed limit are both 0.8 m/s. This is not a
+constant output speed: heading error, stopping distance, obstacle clearance,
+sensor degradation, acceleration limits, and safety stops can lower it.
+
+This layer does not build a map, does not run SLAM, and does not guarantee a
+route through a maze or around a large concave obstacle. When no safe local gap
+exists, it stops and reports a blocked or safety error instead of guessing.
 
 ## Configuration
 
@@ -212,6 +239,10 @@ Important groups in [autotask.yaml](/home/techno/uran_ws/src/uran_autotask/confi
   thresholds. The selected source can be visual odometry, leg odometry, fused
   odometry, or TF.
 - `outdoor_pose_aligner`: sliding-window alignment parameters.
+- `gps_vo_yaw_aligner`: GNSS/local-odometry yaw estimation and initial
+  calibration distance.
+- `straight_drive`: control frequency, route look-ahead, stopping tolerance,
+  obstacle inflation, sensor quality, and velocity limits.
 - `cyberdog_backend`: CyberDog algorithm manager action/service names for
   transitional or legacy paths.
 
