@@ -58,6 +58,12 @@ class AvoidanceDecision:
     scan_quality: str = 'good'
     valid_ratio: float = 1.0
     front_valid_ratio: float = 1.0
+    positive_return_count: int = 0
+    positive_return_ratio: float = 1.0
+    zero_range_ratio: float = 0.0
+    front_positive_return_ratio: float = 1.0
+    front_zero_range_ratio: float = 0.0
+    zero_ranges_treated_as_clear: bool = False
     direction: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
@@ -73,6 +79,12 @@ class AvoidanceDecision:
             'scan_quality': self.scan_quality,
             'valid_ratio': self.valid_ratio,
             'front_valid_ratio': self.front_valid_ratio,
+            'positive_return_count': self.positive_return_count,
+            'positive_return_ratio': self.positive_return_ratio,
+            'zero_range_ratio': self.zero_range_ratio,
+            'front_positive_return_ratio': self.front_positive_return_ratio,
+            'front_zero_range_ratio': self.front_zero_range_ratio,
+            'zero_ranges_treated_as_clear': self.zero_ranges_treated_as_clear,
             'direction': self.direction,
         }
 
@@ -126,12 +138,33 @@ class GapAvoidancePlanner:
             self.min_front_valid_ratio,
             1.0,
         )
+        zero_range_mode = str(cfg.get('zero_range_mode', 'invalid')).strip().lower()
+        self.zero_range_mode = (
+            zero_range_mode
+            if zero_range_mode in {'invalid', 'clear_if_scan_healthy'}
+            else 'invalid'
+        )
+        self.min_positive_return_count = max(
+            1,
+            int(cfg.get('min_positive_return_count', 20)),
+        )
+        self.min_positive_return_ratio = _clamp(
+            float(cfg.get('min_positive_return_ratio', 0.05)),
+            0.0,
+            1.0,
+        )
         self.direction_lock_s = max(0.0, float(cfg.get('avoid_direction_lock_s', 1.5)))
         self.clear_confirm_s = max(0.0, float(cfg.get('clear_confirm_s', 0.8)))
         self.recover_confirm_s = max(0.0, float(cfg.get('recover_confirm_s', 0.8)))
         self._last_beam_valid: List[bool] = []
         self._last_valid_ratio = 0.0
         self._last_front_valid_ratio = 0.0
+        self._last_positive_return_count = 0
+        self._last_positive_return_ratio = 0.0
+        self._last_zero_range_ratio = 0.0
+        self._last_front_positive_return_ratio = 0.0
+        self._last_front_zero_range_ratio = 0.0
+        self._last_zero_ranges_treated_as_clear = False
         self._last_scan_quality = 'invalid'
         self._avoid_direction = ''
         self._avoid_direction_since: Optional[float] = None
@@ -142,6 +175,12 @@ class GapAvoidancePlanner:
         self._last_beam_valid = []
         self._last_valid_ratio = 0.0
         self._last_front_valid_ratio = 0.0
+        self._last_positive_return_count = 0
+        self._last_positive_return_ratio = 0.0
+        self._last_zero_range_ratio = 0.0
+        self._last_front_positive_return_ratio = 0.0
+        self._last_front_zero_range_ratio = 0.0
+        self._last_zero_ranges_treated_as_clear = False
         self._last_scan_quality = 'invalid'
         self._avoid_direction = ''
         self._avoid_direction_since = None
@@ -153,6 +192,12 @@ class GapAvoidancePlanner:
             'scan_quality': self._last_scan_quality,
             'valid_ratio': self._last_valid_ratio,
             'front_valid_ratio': self._last_front_valid_ratio,
+            'positive_return_count': self._last_positive_return_count,
+            'positive_return_ratio': self._last_positive_return_ratio,
+            'zero_range_ratio': self._last_zero_range_ratio,
+            'front_positive_return_ratio': self._last_front_positive_return_ratio,
+            'front_zero_range_ratio': self._last_front_zero_range_ratio,
+            'zero_ranges_treated_as_clear': self._last_zero_ranges_treated_as_clear,
             'avoid_direction': self._avoid_direction,
             'avoid_direction_age_s': (
                 max(0.0, time.monotonic() - self._avoid_direction_since)
@@ -315,6 +360,12 @@ class GapAvoidancePlanner:
             scan_quality=self._last_scan_quality,
             valid_ratio=self._last_valid_ratio,
             front_valid_ratio=self._last_front_valid_ratio,
+            positive_return_count=self._last_positive_return_count,
+            positive_return_ratio=self._last_positive_return_ratio,
+            zero_range_ratio=self._last_zero_range_ratio,
+            front_positive_return_ratio=self._last_front_positive_return_ratio,
+            front_zero_range_ratio=self._last_front_zero_range_ratio,
+            zero_ranges_treated_as_clear=self._last_zero_ranges_treated_as_clear,
             direction=self._avoid_direction,
             **kwargs,
         )
@@ -337,6 +388,12 @@ class GapAvoidancePlanner:
         self._last_beam_valid = []
         self._last_valid_ratio = 0.0
         self._last_front_valid_ratio = 0.0
+        self._last_positive_return_count = 0
+        self._last_positive_return_ratio = 0.0
+        self._last_zero_range_ratio = 0.0
+        self._last_front_positive_return_ratio = 0.0
+        self._last_front_zero_range_ratio = 0.0
+        self._last_zero_ranges_treated_as_clear = False
         ranges = list(getattr(scan, 'ranges', []) or [])
         if not ranges:
             return []
@@ -354,12 +411,20 @@ class GapAvoidancePlanner:
         half_fov = max(0.0, self.usable_fov_rad / 2.0)
         normalized_ranges: List[float] = []
         valid_flags: List[bool] = []
+        zero_flags: List[bool] = []
+        positive_return_flags: List[bool] = []
         for raw in ranges:
+            converted = True
             try:
                 value = float(raw)
             except Exception:
+                converted = False
                 value = range_max
             valid = True
+            zero_range = value == 0.0
+            positive_return = converted and math.isfinite(value) and value > 0.0
+            if not converted:
+                valid = False
             if math.isnan(value) or value <= 0.0:
                 valid = False
                 value = range_max
@@ -368,6 +433,8 @@ class GapAvoidancePlanner:
             value = _clamp(value, range_min, range_max)
             normalized_ranges.append(value)
             valid_flags.append(valid)
+            zero_flags.append(zero_range)
+            positive_return_flags.append(positive_return)
 
         filtered_ranges = self._median_filter(normalized_ranges)
         beams_with_validity = []
@@ -375,10 +442,46 @@ class GapAvoidancePlanner:
             theta = angle_min + float(index) * angle_increment + self.angle_offset_rad
             theta = _normalize_angle(theta)
             if -half_fov <= theta <= half_fov:
-                beams_with_validity.append((theta, value, valid_flags[index]))
+                beams_with_validity.append((
+                    theta,
+                    value,
+                    valid_flags[index],
+                    zero_flags[index],
+                    positive_return_flags[index],
+                ))
         beams_with_validity.sort(key=lambda item: item[0])
-        beams = [(theta, value) for theta, value, _ in beams_with_validity]
-        self._last_beam_valid = [valid for _, _, valid in beams_with_validity]
+        beam_count = len(beams_with_validity)
+        positive_return_count = sum(
+            1 for _, _, _, _, positive in beams_with_validity if positive
+        )
+        positive_return_ratio = (
+            float(positive_return_count) / float(beam_count)
+            if beam_count else 0.0
+        )
+        scan_has_healthy_returns = (
+            positive_return_count >= self.min_positive_return_count and
+            positive_return_ratio >= self.min_positive_return_ratio
+        )
+        treat_zero_as_clear = (
+            self.zero_range_mode == 'clear_if_scan_healthy' and
+            scan_has_healthy_returns
+        )
+
+        beams = [(theta, value) for theta, value, _, _, _ in beams_with_validity]
+        self._last_beam_valid = [
+            valid or (zero_range and treat_zero_as_clear)
+            for _, _, valid, zero_range, _ in beams_with_validity
+        ]
+        self._last_positive_return_count = positive_return_count
+        self._last_positive_return_ratio = positive_return_ratio
+        self._last_zero_range_ratio = (
+            float(sum(1 for _, _, _, zero_range, _ in beams_with_validity if zero_range)) /
+            float(beam_count)
+            if beam_count else 0.0
+        )
+        self._last_zero_ranges_treated_as_clear = bool(
+            treat_zero_as_clear and self._last_zero_range_ratio > 0.0
+        )
         self._last_valid_ratio = (
             float(sum(1 for valid in self._last_beam_valid if valid)) /
             float(len(self._last_beam_valid))
@@ -388,9 +491,24 @@ class GapAvoidancePlanner:
             valid for (theta, _), valid in zip(beams, self._last_beam_valid)
             if abs(theta) <= self.front_sector_rad
         ]
+        front_raw_flags = [
+            (zero_range, positive)
+            for theta, _, _, zero_range, positive in beams_with_validity
+            if abs(theta) <= self.front_sector_rad
+        ]
         self._last_front_valid_ratio = (
             float(sum(1 for valid in front_flags if valid)) / float(len(front_flags))
             if front_flags else 0.0
+        )
+        self._last_front_positive_return_ratio = (
+            float(sum(1 for _, positive in front_raw_flags if positive)) /
+            float(len(front_raw_flags))
+            if front_raw_flags else 0.0
+        )
+        self._last_front_zero_range_ratio = (
+            float(sum(1 for zero_range, _ in front_raw_flags if zero_range)) /
+            float(len(front_raw_flags))
+            if front_raw_flags else 0.0
         )
         return beams
 

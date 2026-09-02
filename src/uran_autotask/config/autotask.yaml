@@ -107,7 +107,8 @@ uran_autotask:
     route_corridor_half_width_m: 1.5
     turn_in_place_heading_deg: 85.0
     control_pose_timeout_s: 0.30
-    scan_timeout_s: 0.35
+    # 原厂雷达约 10Hz，留出调度抖动余量，连续 0.5s 无数据再判过期。
+    scan_timeout_s: 0.50
     blocked_timeout_s: 4.0
     fault_pause_timeout_s: 4.0
     distance_tolerance_m: 0.15
@@ -130,6 +131,11 @@ uran_autotask:
     min_front_valid_ratio: 0.50
     degraded_scan_valid_ratio: 0.75
     degraded_front_valid_ratio: 0.75
+    # CyberDog 原厂 YDLidar 会用 0 表示超量程或无返回。只有整帧仍有足够
+    # 正距离回波证明雷达在工作时，才把其余 0 按空旷处理；接近全零仍停车。
+    zero_range_mode: "clear_if_scan_healthy"
+    min_positive_return_count: 20
+    min_positive_return_ratio: 0.05
     degraded_sensor_speed_cap_mps: 0.15
     avoid_direction_lock_s: 1.5
     clear_confirm_s: 0.8

@@ -168,6 +168,64 @@ def test_obstacle_planner_rejects_invalid_front_scan():
     assert decision.scan_quality == 'invalid'
 
 
+def test_cyberdog_zero_ranges_are_clear_when_scan_has_healthy_returns():
+    planner = GapAvoidancePlanner({
+        'zero_range_mode': 'clear_if_scan_healthy',
+        'min_positive_return_count': 20,
+        'min_positive_return_ratio': 0.05,
+        'min_scan_valid_ratio': 0.5,
+        'min_front_valid_ratio': 0.5,
+    })
+    ranges = [0.0] * 181
+    ranges[:30] = [10.0] * 30
+
+    decision = planner.plan(_Scan(ranges), now_s=0.0)
+
+    assert decision.state == 'clear'
+    assert decision.scan_quality == 'good'
+    assert decision.front_valid_ratio == 1.0
+    assert decision.front_positive_return_ratio == 0.0
+    assert decision.zero_ranges_treated_as_clear is True
+
+
+def test_cyberdog_nearly_all_zero_scan_remains_invalid():
+    planner = GapAvoidancePlanner({
+        'zero_range_mode': 'clear_if_scan_healthy',
+        'min_positive_return_count': 20,
+        'min_positive_return_ratio': 0.05,
+        'min_scan_valid_ratio': 0.5,
+        'min_front_valid_ratio': 0.5,
+    })
+    ranges = [0.0] * 181
+    ranges[:10] = [10.0] * 10
+
+    decision = planner.plan(_Scan(ranges), now_s=0.0)
+
+    assert decision.state == 'blocked'
+    assert decision.scan_quality == 'invalid'
+    assert decision.zero_ranges_treated_as_clear is False
+
+
+def test_cyberdog_zero_compatibility_keeps_real_front_obstacle():
+    planner = GapAvoidancePlanner({
+        'zero_range_mode': 'clear_if_scan_healthy',
+        'min_positive_return_count': 20,
+        'min_positive_return_ratio': 0.05,
+        'min_scan_valid_ratio': 0.5,
+        'min_front_valid_ratio': 0.5,
+        'min_stop_distance_m': 0.65,
+    })
+    ranges = [0.0] * 181
+    ranges[:30] = [10.0] * 30
+    ranges[88:93] = [0.4] * 5
+
+    decision = planner.plan(_Scan(ranges), now_s=0.0)
+
+    assert decision.state in {'stop', 'blocked'}
+    assert decision.front_clearance_m == 0.4
+    assert decision.zero_ranges_treated_as_clear is True
+
+
 def test_obstacle_planner_reports_blocked_when_no_gap_exists():
     planner = GapAvoidancePlanner({
         'min_scan_valid_ratio': 0.5,

@@ -489,15 +489,37 @@ class StraightDriveController:
         )
         self._last_safety = dict(safety)
         if not safety.get('allowed', False):
+            scan_diagnostics = {
+                'valid_ratio': decision.valid_ratio,
+                'front_valid_ratio': decision.front_valid_ratio,
+                'positive_return_count': decision.positive_return_count,
+                'positive_return_ratio': decision.positive_return_ratio,
+                'zero_range_ratio': decision.zero_range_ratio,
+                'front_positive_return_ratio': decision.front_positive_return_ratio,
+                'front_zero_range_ratio': decision.front_zero_range_ratio,
+                'zero_ranges_treated_as_clear': decision.zero_ranges_treated_as_clear,
+            }
+            safety_code = str(safety.get('code') or 'E_CONTROL_SAFETY')
+            safety_reason = str(
+                safety.get('reason') or 'motion safety gate blocked control'
+            )
+            if safety_code in {'E_SCAN_QUALITY', 'E_SCAN_FRONT_QUALITY'}:
+                safety_reason = (
+                    f'{decision.reason}; valid_ratio={decision.valid_ratio:.3f}, '
+                    f'front_valid_ratio={decision.front_valid_ratio:.3f}, '
+                    f'positive_return_ratio={decision.positive_return_ratio:.3f}, '
+                    f'zero_range_ratio={decision.zero_range_ratio:.3f}'
+                )
             return self._handle_safety_block(
                 now,
-                code=str(safety.get('code') or 'E_CONTROL_SAFETY'),
-                reason=str(safety.get('reason') or 'motion safety gate blocked control'),
+                code=safety_code,
+                reason=safety_reason,
                 pose_available=pose_available,
                 pose_age_s=pose_age_s,
                 scan_age_s=scan_age,
                 scan_quality=decision.scan_quality,
                 safety=safety,
+                scan_diagnostics=scan_diagnostics,
             )
 
         self._fault_since_s = None
@@ -1015,6 +1037,7 @@ class StraightDriveController:
         scan_age_s: Optional[float],
         scan_quality: str,
         safety: Optional[Dict[str, Any]] = None,
+        scan_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         new_fault = self._fault_since_s is None or self._last_safety_code != code
         if new_fault:
@@ -1050,6 +1073,7 @@ class StraightDriveController:
             'scan_quality': scan_quality,
             'safety': dict(safety or self._last_safety),
         }
+        result.update(dict(scan_diagnostics or {}))
         timeout = self.fault_pause_timeout_s
         if timeout > 0.0 and blocked_for >= timeout:
             self._active = False
