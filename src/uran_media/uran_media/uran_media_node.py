@@ -396,6 +396,10 @@ class UranMediaNode(Node):
                 self, lc_node,
                 launch_pkg=rs_cfg.get('launch_pkg', ''),
                 launch_file=rs_cfg.get('launch_file', ''),
+                keep_active_after_release=rs_cfg.get(
+                    'keep_active_after_channel_stop',
+                    False,
+                ),
             )
         self._realsense_adapters[lc_node].activate()
 

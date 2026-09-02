@@ -76,9 +76,29 @@ uran_autotask:
 
   straight_drive:
     enabled: true
-    # 只用于“直线行驶一段距离/一段时间”的单步任务，不做全局导航。
-    # 相对名会自动加机器狗 namespace，例如 /mi_desktop_48_b0_2d_5f_b6_d0/scan。
+    # TG30 已出现错误距离，当前改用 D430I 点云作为独立避障数据源。
+    # 更换雷达后可改回 laser_scan，不要同时混合两种传感器的数据。
+    obstacle_source: "depth_pointcloud"
     scan_topic: "scan"
+    depth_pointcloud_topic: "/camera/depth/color/points"
+    depth_target_frame: "base_link"
+    depth_virtual_scan_topic: "/uran/autotask/depth_scan"
+    # 以下参数都在 base_link（机身坐标系）中生效。
+    depth_min_height_m: 0.05
+    depth_max_height_m: 0.80
+    depth_min_range_m: 0.15
+    depth_max_range_m: 3.0
+    depth_sensor_max_range_m: 10.0
+    depth_horizontal_fov_deg: 80.0
+    depth_angle_increment_deg: 1.0
+    depth_processing_hz: 15.0
+    # 对 640x480 点云每隔 8 行、4 列采样一次，避免阻塞 20Hz 控制循环。
+    depth_sample_row_stride: 8
+    depth_sample_column_stride: 4
+    # 每个角度至少两个点才确认障碍，距离取该角度内较近的 10% 分位值。
+    depth_min_obstacle_points_per_bin: 2
+    depth_min_clear_points_per_bin: 2
+    depth_distance_percentile: 0.10
     control_hz: 20.0
     default_speed_mps: 0.8
     max_speed_mps: 0.8
@@ -107,7 +127,7 @@ uran_autotask:
     route_corridor_half_width_m: 1.5
     turn_in_place_heading_deg: 85.0
     control_pose_timeout_s: 0.30
-    # 原厂雷达约 10Hz，留出调度抖动余量，连续 0.5s 无数据再判过期。
+    # 连续 0.5s 没有新的有效虚拟扫描就停车。
     scan_timeout_s: 0.50
     blocked_timeout_s: 4.0
     fault_pause_timeout_s: 4.0

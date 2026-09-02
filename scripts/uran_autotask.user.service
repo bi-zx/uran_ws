@@ -1,7 +1,7 @@
 [Unit]
 Description=Uran ROS2 Autotask Node (User Service)
-After=uran_core.service
-Wants=uran_core.service
+After=uran_core.service uran_realsense_navigation.service
+Wants=uran_core.service uran_realsense_navigation.service
 
 [Service]
 Type=simple

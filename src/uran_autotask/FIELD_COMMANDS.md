@@ -50,13 +50,33 @@ lon
 last_error
 ```
 
-## 4. 雷达和里程计检查
+## 4. D430I 避障和里程计检查
 
 ```bash
-ros2 topic list -t | grep -E 'scan|LaserScan|odom_out|Odometry'
-ros2 topic hz /mi_desktop_48_b0_2d_5f_b6_d0/scan
+systemctl --user status uran_realsense_navigation.service --no-pager -l
+ros2 lifecycle get /camera/camera
+ros2 topic hz /camera/depth/color/points
+ros2 topic hz /uran/autotask/depth_scan
 ros2 topic hz /mi_desktop_48_b0_2d_5f_b6_d0/odom_out
 ```
+
+检查点云到机身坐标系的变换：
+
+```bash
+FRAME=$(timeout 3s ros2 topic echo /camera/depth/color/points --field header.frame_id | head -1 | tr -d " '\r")
+echo "pointcloud frame: $FRAME"
+ros2 run tf2_ros tf2_echo base_link "$FRAME"
+```
+
+只看 URAN 当前使用的障碍传感器状态：
+
+```bash
+ros2 service call /uran/autotask/status uran_srvs/srv/GetTaskStatus "{task_id: ''}" | python3 -c "import sys,re,ast,json; s=sys.stdin.read(); m=re.search(r\"status_json='(.*)'\\)\\s*$\", s, re.S); d=json.loads(ast.literal_eval(\"'\"+m.group(1)+\"'\")); print(json.dumps(d.get('obstacle_sensor') or {}, ensure_ascii=False, indent=2))"
+```
+
+正常时应看到 `source=depth_pointcloud`、`status=healthy`、
+`converted_frames` 持续增加且 `last_error` 为空。`tf_unavailable` 表示相机到
+`base_link` 的坐标变换缺失，URAN 会停车。
 
 ## 5. 手动下发直线避障任务
 
@@ -105,10 +125,18 @@ ros2 topic hz /uran/core/uplink/data
 
 ```bash
 cd /SDCARD/uran_ws
-colcon build --packages-select uran_autotask uran_move
+colcon build --packages-select uran_autotask uran_media uran_move
+
+cd /SDCARD/uran_ws/scripts
+./install_user_services.sh
+
+systemctl --user restart uran_realsense_navigation.service
+systemctl --user restart uran_media.service
+systemctl --user restart uran_autotask.service
 ```
 
-编译后需要重启运行 `uran_autotask` 和 `uran_move` 的服务或进程。
+编译后需要重启 `uran_realsense_navigation`、`uran_media`、`uran_autotask` 和
+`uran_move` 的服务或进程。
 
 外接 GPS 服务：
 
@@ -123,7 +151,7 @@ systemctl --user status ubx_gps.service --no-pager -l
 
 ```bash
 rm -rf build/uran_autotask build/uran_move install/uran_autotask install/uran_move
-colcon build --packages-select uran_autotask uran_move
+colcon build --packages-select uran_autotask uran_media uran_move
 ```
 
 ubx_gps 是用户级服务，用这个：
@@ -143,6 +171,7 @@ uran_autotask 如果是跟 cyberdog_bringup.service 一起启动的，用这个�
 cd /SDCARD/uran_ws
 colcon build --packages-select uran_autotask uran_move
 
+systemctl --user restart uran_realsense_navigation.service
 sudo systemctl restart cyberdog_bringup.service
 sudo systemctl status cyberdog_bringup.service --no-pager -l
 ```

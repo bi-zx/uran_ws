@@ -62,6 +62,8 @@ uran_media:
   realsense:
     launch_pkg: "realsense2_camera"
     launch_file: "on_dog.py"
+    # D430I 同时给 uran_autotask 提供避障点云，停止视频时不能停用相机。
+    keep_active_after_channel_stop: true
 
   # CyberDog2 命名空间前缀（ros2 node list 输出中 /mi_desktop_xxx/ 部分）
   # 留空则使用裸 topic 名（非 CyberDog2 环境）

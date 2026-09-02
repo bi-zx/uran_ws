@@ -10,7 +10,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, PointCloud2
 from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -34,6 +34,7 @@ from .localization import (
 )
 from .mission import MissionManager
 from .navigation import StraightDriveController
+from .navigation.depth_scan_adapter import DepthPointCloudScanAdapter, RigidTransform
 from .task_models import TERMINAL_TASK_STAGES
 
 
@@ -137,6 +138,28 @@ class UranAutotaskNode(Node):
         )
         self._media_actions_cfg = dict(node_cfg.get('media_actions', {}))
         self._straight_drive_cfg = dict(node_cfg.get('straight_drive', {}))
+        self._obstacle_source = str(
+            self._straight_drive_cfg.get('obstacle_source', 'laser_scan') or 'laser_scan'
+        ).strip().lower()
+        if self._obstacle_source not in {'laser_scan', 'depth_pointcloud'}:
+            self.get_logger().warning(
+                f'unknown obstacle_source {self._obstacle_source!r}; using laser_scan'
+            )
+            self._obstacle_source = 'laser_scan'
+        self._obstacle_topic = ''
+        self._depth_scan_adapter = None
+        self._depth_scan_pub = None
+        self._last_depth_process_monotonic_s = None
+        depth_processing_hz = max(
+            1.0,
+            float(self._straight_drive_cfg.get('depth_processing_hz', 15.0)),
+        )
+        self._depth_process_interval_s = 1.0 / depth_processing_hz
+        if self._obstacle_source == 'depth_pointcloud':
+            self._depth_scan_adapter = DepthPointCloudScanAdapter(
+                self._straight_drive_cfg,
+                monotonic_getter=time.monotonic,
+            )
 
         self._control_mode = 'manual'
         self._controller = 'cloud'
@@ -162,7 +185,8 @@ class UranAutotaskNode(Node):
         )
         if (
             self._map_tf_fallback_enabled or
-            (self._visual_pose_monitor_enabled and self._visual_tf_fallback_enabled)
+            (self._visual_pose_monitor_enabled and self._visual_tf_fallback_enabled) or
+            self._obstacle_source == 'depth_pointcloud'
         ):
             self._tf_buffer = Buffer()
             self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -481,15 +505,50 @@ class UranAutotaskNode(Node):
     def _configure_straight_drive_subscriptions(self):
         if not bool(self._straight_drive_cfg.get('enabled', True)):
             return
-        scan_topic = self._resolve_name(str(self._straight_drive_cfg.get('scan_topic', '/scan')))
-        if not scan_topic:
-            return
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        if self._obstacle_source == 'depth_pointcloud':
+            pointcloud_topic = self._resolve_name(str(
+                self._straight_drive_cfg.get(
+                    'depth_pointcloud_topic',
+                    '/camera/depth/color/points',
+                )
+            ))
+            if not pointcloud_topic:
+                return
+            self._obstacle_topic = pointcloud_topic
+            self.create_subscription(
+                PointCloud2,
+                pointcloud_topic,
+                self._cb_straight_drive_pointcloud,
+                qos,
+            )
+            virtual_scan_topic = str(
+                self._straight_drive_cfg.get(
+                    'depth_virtual_scan_topic',
+                    '/uran/autotask/depth_scan',
+                ) or ''
+            ).strip()
+            if virtual_scan_topic:
+                self._depth_scan_pub = self.create_publisher(
+                    LaserScan,
+                    virtual_scan_topic,
+                    qos,
+                )
+            self.get_logger().info(
+                'straight drive obstacle avoidance listening depth point cloud: '
+                f'{pointcloud_topic}'
+            )
+            return
+
+        scan_topic = self._resolve_name(str(self._straight_drive_cfg.get('scan_topic', '/scan')))
+        if not scan_topic:
+            return
+        self._obstacle_topic = scan_topic
         self.create_subscription(LaserScan, scan_topic, self._cb_straight_drive_scan, qos)
         self.get_logger().info(f'straight drive obstacle avoidance listening scan: {scan_topic}')
 
@@ -812,6 +871,90 @@ class UranAutotaskNode(Node):
                 monotonic_s=time.monotonic(),
             )
 
+    def _cb_straight_drive_pointcloud(self, msg: PointCloud2):
+        adapter = self._depth_scan_adapter
+        if adapter is None or self._straight_drive_controller is None:
+            return
+
+        now = time.monotonic()
+        if (
+            self._last_depth_process_monotonic_s is not None and
+            now - self._last_depth_process_monotonic_s < self._depth_process_interval_s
+        ):
+            adapter.record_skipped()
+            return
+        self._last_depth_process_monotonic_s = now
+
+        source_frame = str(msg.header.frame_id or '').strip('/')
+        target_frame = str(adapter.target_frame or '').strip('/')
+        if not source_frame:
+            adapter.record_received('')
+            adapter.record_error(
+                'point cloud frame_id is empty',
+                status='frame_id_missing',
+            )
+            return
+
+        if source_frame == target_frame:
+            transform = RigidTransform.identity()
+        else:
+            if self._tf_buffer is None:
+                adapter.record_received(source_frame)
+                adapter.record_error(
+                    f'TF buffer is unavailable for {source_frame} -> {target_frame}',
+                    status='tf_unavailable',
+                )
+                return
+            try:
+                transform_msg = self._tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    rclpy.time.Time(),
+                )
+                transform = RigidTransform.from_ros(transform_msg)
+            except Exception as exc:
+                adapter.record_received(source_frame)
+                adapter.record_error(
+                    f'TF {source_frame} -> {target_frame} unavailable: {exc}',
+                    status='tf_unavailable',
+                )
+                return
+
+        try:
+            scan = adapter.convert(
+                msg,
+                transform,
+                monotonic_s=now,
+            )
+        except Exception as exc:
+            self.get_logger().warning(f'failed to convert depth point cloud: {exc}')
+            return
+
+        self._straight_drive_controller.update_scan(
+            scan,
+            monotonic_s=now,
+        )
+        self._publish_depth_virtual_scan(scan, msg)
+
+    def _publish_depth_virtual_scan(self, scan, source_msg: PointCloud2):
+        if self._depth_scan_pub is None:
+            return
+        msg = LaserScan()
+        msg.header.stamp = source_msg.header.stamp
+        msg.header.frame_id = str(
+            self._depth_scan_adapter.target_frame if self._depth_scan_adapter else 'base_link'
+        )
+        msg.angle_min = float(scan.angle_min)
+        msg.angle_max = float(scan.angle_max)
+        msg.angle_increment = float(scan.angle_increment)
+        msg.time_increment = 0.0
+        msg.scan_time = 0.0
+        msg.range_min = float(scan.range_min)
+        msg.range_max = float(scan.range_max)
+        msg.ranges = list(scan.ranges)
+        msg.intensities = []
+        self._depth_scan_pub.publish(msg)
+
     def _cb_pose_stamped(self, role: str, msg: PoseStamped):
         payload = pose_stamped_to_dict(msg)
         self._update_pose_by_role(role, payload)
@@ -1098,7 +1241,7 @@ class UranAutotaskNode(Node):
         state['last_sample_frame_id'] = str(payload.get('frame_id', ''))
 
     def _build_extra_status_payload(self) -> Dict[str, Any]:
-        return {
+        payload = {
             'pose_channels': {
                 'map': dict(self._pose_channel_state['map']),
                 'visual': dict(self._pose_channel_state['visual']),
@@ -1113,6 +1256,14 @@ class UranAutotaskNode(Node):
                 'It can be visual odometry, leg odometry, fused odometry, or TF fallback.'
             ),
         }
+        obstacle_sensor = {
+            'source': self._obstacle_source,
+            'topic': self._obstacle_topic,
+        }
+        if self._depth_scan_adapter is not None:
+            obstacle_sensor.update(self._depth_scan_adapter.snapshot())
+        payload['obstacle_sensor'] = obstacle_sensor
+        return payload
 
     def _motion_control_state(self) -> Dict[str, Any]:
         return {

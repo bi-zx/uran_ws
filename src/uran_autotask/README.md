@@ -8,7 +8,7 @@
 - 解析 `mission_planner` 生成的室外路径任务包；
 - 将经纬度航点转换为 CyberDog/Nav2 可执行的 `map` 坐标目标；
 - 在包内执行室外路线跟随和近场绕障控制；
-- 支持 `straight_drive` 单步直线行驶任务，使用 2D 激光雷达做轻量避障；
+- 支持 `straight_drive` 单步直线行驶任务，使用 D430I 深度点云或 2D 激光雷达做近场避障；
 - 兼容保留 CyberDog 现有 `algorithm_manager` 的过渡接口；
 - 在户外任务中做 GPS 与本地里程计的对齐监督；
 - 按固定频率通过 `/uran/core/uplink/data` 上报机器狗当前位置；
@@ -140,12 +140,12 @@ robot_pose
 ## straight_drive 单步任务
 
 `straight_drive` 只表示“向前直线走一段距离或一段时间”。它不是未知环境自主导航，
-不使用地图，不做 SLAM。遇到近场障碍时会根据机器狗 namespace 下的 `scan`
-临时绕行；绕不开或雷达超时会停车并把任务置为暂停异常。
+不使用地图，不做 SLAM。当前默认把 `/camera/depth/color/points` 转换到
+`base_link`，过滤地面、机身和过高点，再生成 `/uran/autotask/depth_scan`
+供现有绕障控制器使用；绕不开、点云过期或坐标变换缺失时会停车并把任务置为暂停异常。
 
-默认配置 `straight_drive.scan_topic: "scan"` 是相对名。节点会先自动探测机器狗
-namespace，所以实机上会订阅类似 `/mi_desktop_48_b0_2d_5f_b6_d0/scan` 的话题。
-如果你写成 `/scan` 这种绝对名，就不会自动加 namespace。
+`straight_drive.obstacle_source` 可选 `depth_pointcloud` 或 `laser_scan`。当前损坏的
+TG30 不参与避障；更换雷达后才能把配置切回 `laser_scan`。
 
 第一版默认 `scan` 的角度 0 就是机器狗正前方。如果实机雷达坐标和 `base_link`
 不一致，需要在 `straight_drive.angle_offset_deg` 里补偿。

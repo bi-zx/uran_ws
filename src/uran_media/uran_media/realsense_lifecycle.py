@@ -19,11 +19,13 @@ class RealSenseLifecycleAdapter:
     TRANSITION_DEACTIVATE = 4
 
     def __init__(self, node, lifecycle_node_name: str,
-                 launch_pkg: str = '', launch_file: str = ''):
+                 launch_pkg: str = '', launch_file: str = '',
+                 keep_active_after_release: bool = False):
         self._node = node
         self._name = lifecycle_node_name
         self._launch_pkg = launch_pkg
         self._launch_file = launch_file
+        self._keep_active_after_release = bool(keep_active_after_release)
         self._ref_count = 0
         self._client = None
         self._ChangeState = None
@@ -110,6 +112,11 @@ class RealSenseLifecycleAdapter:
         if self._ref_count > 0:
             return
         if not self._available or self._client is None:
+            return
+        if self._keep_active_after_release:
+            self._node.get_logger().info(
+                '[RealSense] kept active for non-media consumers'
+            )
             return
         self._transition(self.TRANSITION_DEACTIVATE)
         self._node.get_logger().info(f'[RealSense] {self._name} deactivated')
