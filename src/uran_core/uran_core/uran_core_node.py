@@ -29,7 +29,7 @@ from .mqtt_client import MqttClient
 def _load_yaml(path: str) -> dict:
     if not os.path.exists(path):
         return {}
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f) or {}
 
 
@@ -66,6 +66,18 @@ class UranCoreNode(Node):
         self._mqtt_enabled = self._net_cfg.get('mqtt', {}).get('enabled', True)
         self._mqtt_thread_lock = threading.Lock()
         self._mqtt_connecting = False
+        mqtt_cfg = self._net_cfg.get('mqtt', {})
+        topic_prefix = mqtt_cfg.get('topic_prefix', '')
+        self.get_logger().info(
+            'MQTT config: broker=%s:%s, topic_prefix=%s, device_id=%s, tenant_id=%s'
+            % (
+                mqtt_cfg.get('broker_host', 'localhost'),
+                mqtt_cfg.get('broker_port', 1883),
+                topic_prefix,
+                self._net_cfg.get('device_id', 'device_001'),
+                self._net_cfg.get('tenant_id', 'default'),
+            )
+        )
 
         # ── ROS 发布者 ────────────────────────────────────────────────────
         latch = QoSProfile(

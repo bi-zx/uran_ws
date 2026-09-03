@@ -40,7 +40,12 @@ class MqttClient:
         self._device_id = device_id
         self._template_id = net_cfg.get('template_id', 'template_001')
         auth_cfg = net_cfg.get('auth', {})
-        self._mqtt_username = auth_cfg.get('username', '') or self._device_id
+        configured_username = auth_cfg.get('username', '')
+        # Keep compatibility with deployments that used device_id as the
+        # MQTT username before auth.username was introduced.
+        if configured_username in ('', 'changeme', None):
+            configured_username = self._device_id
+        self._mqtt_username = configured_username
         self._token = auth_cfg.get('token', '')
         self._broker_host = mqtt_cfg.get('broker_host', 'localhost')
         self._broker_port = int(mqtt_cfg.get('broker_port', 1883))
@@ -138,7 +143,10 @@ class MqttClient:
             self._registered = False
         self._reg_event.clear()
         self._reg_result = 'timeout'
-        self.publish_raw(payload)
+        if not self.publish_raw(payload):
+            logger.error(
+                f'MQTT register publish failed, topic={self._uplink_topic}'
+            )
         self._reg_event.wait(timeout=timeout_s)
         with self._lock:
             connected = self._connected
