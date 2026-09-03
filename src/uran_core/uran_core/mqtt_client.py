@@ -23,6 +23,7 @@ class MqttClient:
         self._downlink_cb = downlink_cb
         self._client: Optional['mqtt.Client'] = None
         self._lock = threading.Lock()
+        self._connect_lock = threading.Lock()
         self._connected = False
         self._registered = False
         self._reg_event = threading.Event()
@@ -59,30 +60,68 @@ class MqttClient:
     def connect(self) -> bool:
         if not _PAHO_OK:
             return False
-        self._client = mqtt.Client(client_id=self._device_id)
-        if self._token:
-            self._client.username_pw_set(self._mqtt_username, self._token)
-        self._client.on_connect = self._on_connect
-        self._client.on_disconnect = self._on_disconnect
-        self._client.on_message = self._on_message
-        try:
-            self._client.connect(self._broker_host, self._broker_port, self._keepalive)
-            self._client.loop_start()
-            # 等待连接最多 5s
-            for _ in range(50):
-                if self._connected:
+        with self._connect_lock:
+            with self._lock:
+                if self._connected and self._client is not None:
                     return True
-                time.sleep(0.1)
-            logger.error('MQTT connect timeout')
-            return False
-        except Exception as exc:
-            logger.error(f'MQTT connect error: {exc}')
+                old_client = self._client
+                self._client = None
+                self._connected = False
+                self._registered = False
+
+            if old_client is not None:
+                try:
+                    old_client.loop_stop()
+                    old_client.disconnect()
+                except Exception:
+                    pass
+
+            client = mqtt.Client(client_id=self._device_id)
+            if self._token:
+                client.username_pw_set(self._mqtt_username, self._token)
+            client.on_connect = self._on_connect
+            client.on_disconnect = self._on_disconnect
+            client.on_message = self._on_message
+            with self._lock:
+                self._client = client
+
+            try:
+                client.connect(self._broker_host, self._broker_port, self._keepalive)
+                client.loop_start()
+                # 等待连接最多 5 秒，失败交给上层定时器重试。
+                for _ in range(50):
+                    if self.is_connected():
+                        return True
+                    time.sleep(0.1)
+                logger.error(
+                    f'MQTT connect timeout: {self._broker_host}:{self._broker_port}'
+                )
+            except Exception as exc:
+                logger.error(
+                    f'MQTT connect error ({self._broker_host}:{self._broker_port}): {exc}'
+                )
+
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:
+                pass
+            with self._lock:
+                if self._client is client:
+                    self._client = None
+                self._connected = False
+                self._registered = False
             return False
 
     def disconnect(self):
-        if self._client:
-            self._client.loop_stop()
-            self._client.disconnect()
+        with self._lock:
+            client = self._client
+            self._client = None
+            self._connected = False
+            self._registered = False
+        if client:
+            client.loop_stop()
+            client.disconnect()
 
     # ------------------------------------------------------------------ registration
     def register(self, timeout_s: float = 10.0) -> str:
@@ -121,10 +160,14 @@ class MqttClient:
         with self._lock:
             if not self._connected or self._client is None:
                 return False
+            client = self._client
         try:
             data = json.dumps(payload)
-            result = self._client.publish(self._uplink_topic, data, qos=qos)
-            return result.rc == 0
+            result = client.publish(self._uplink_topic, data, qos=qos)
+            if result.rc != 0:
+                logger.error(f'MQTT publish rejected rc={result.rc}, topic={self._uplink_topic}')
+                return False
+            return True
         except Exception as exc:
             logger.error(f'MQTT publish error: {exc}')
             return False
@@ -149,16 +192,36 @@ class MqttClient:
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             with self._lock:
+                if self._client is not client:
+                    return
                 self._connected = True
                 self._registered = False
             self._last_check_ts = int(time.time())
-            client.subscribe(self._downlink_topic, qos=1)
+            try:
+                result = client.subscribe(self._downlink_topic, qos=1)
+                subscribe_rc = result[0]
+            except Exception as exc:
+                subscribe_rc = None
+                logger.error(
+                    f'MQTT subscribe error, topic={self._downlink_topic}: {exc}'
+                )
+            if subscribe_rc != mqtt.MQTT_ERR_SUCCESS:
+                with self._lock:
+                    if self._client is client:
+                        self._connected = False
+                        self._registered = False
+                logger.error(
+                    f'MQTT subscribe rejected rc={subscribe_rc}, topic={self._downlink_topic}'
+                )
+                return
             logger.info(f'MQTT connected → subscribed {self._downlink_topic}')
         else:
             logger.error(f'MQTT connect refused rc={rc}')
 
     def _on_disconnect(self, client, userdata, rc):
         with self._lock:
+            if self._client is not client:
+                return
             self._connected = False
             self._registered = False
         self._last_check_ts = int(time.time())

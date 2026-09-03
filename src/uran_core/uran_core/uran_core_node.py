@@ -64,6 +64,8 @@ class UranCoreNode(Node):
         # ── MQTT 客户端 ───────────────────────────────────────────────────
         self._mqtt: MqttClient = MqttClient(self._net_cfg, self._on_mqtt_downlink)
         self._mqtt_enabled = self._net_cfg.get('mqtt', {}).get('enabled', True)
+        self._mqtt_thread_lock = threading.Lock()
+        self._mqtt_connecting = False
 
         # ── ROS 发布者 ────────────────────────────────────────────────────
         latch = QoSProfile(
@@ -101,10 +103,11 @@ class UranCoreNode(Node):
         self.create_timer(1.0, self._timer_report_check)  # T1.6: 每秒检查是否到上报周期
         self.create_timer(self._hb_ms / 1000.0, self._timer_heartbeat)
         self.create_timer(1.0, self._timer_uptime)
+        self.create_timer(5.0, self._timer_mqtt_reconnect)
 
         # ── 启动 MQTT ─────────────────────────────────────────────────────
         if self._mqtt_enabled:
-            threading.Thread(target=self._mqtt_connect_thread, daemon=True).start()
+            self._start_mqtt_connect_thread()
 
         self.get_logger().info('uran_core_node started')
 
@@ -236,29 +239,48 @@ class UranCoreNode(Node):
             return raw
 
     # ================================================================== MQTT 连接线程
+    def _start_mqtt_connect_thread(self):
+        with self._mqtt_thread_lock:
+            if self._mqtt_connecting:
+                return
+            self._mqtt_connecting = True
+        threading.Thread(target=self._mqtt_connect_thread, daemon=True).start()
+
     def _mqtt_connect_thread(self):
-        ok = self._mqtt.connect()
-        if not ok:
-            self.get_logger().error('MQTT connect failed')
-            return
-        self.get_logger().info('MQTT connected, sending registration...')
-        result = self._mqtt.register(timeout_s=10.0)
-        self.get_logger().info(f'Registration result: {result}')
-        registered = result in ('registered', 'auto_registered', 'legacy_connected')
-        self._state.set('online_status', registered)
-        self._update_protocol_table()
-        if not registered:
-            if result == 'rejected':
-                self.get_logger().error('Registration rejected — node will continue without cloud link')
-            else:
+        try:
+            ok = self._mqtt.connect()
+            if not ok:
+                self.get_logger().error('MQTT connect failed; will retry in 5 seconds')
+                return
+            self.get_logger().info('MQTT connected, sending registration...')
+            result = self._mqtt.register(timeout_s=10.0)
+            self.get_logger().info(f'Registration result: {result}')
+            registered = result in ('registered', 'auto_registered', 'legacy_connected')
+            self._state.set('online_status', registered)
+            self._update_protocol_table()
+            if not registered:
+                if result == 'rejected':
+                    self.get_logger().error(
+                        'Registration rejected; will retry in 5 seconds'
+                    )
+                else:
+                    self.get_logger().warning(
+                        f'Registration did not complete ({result}); will retry in 5 seconds'
+                    )
+            elif result == 'legacy_connected':
                 self.get_logger().warning(
-                    f'Registration did not complete ({result}) — waiting for a valid register_response'
+                    'Registration response timed out; using legacy MQTT-connected online mode'
                 )
-        elif result == 'legacy_connected':
-            self.get_logger().warning(
-                'Registration response timed out; using legacy MQTT-connected online mode'
-            )
+        finally:
+            with self._mqtt_thread_lock:
+                self._mqtt_connecting = False
+
+    def _timer_mqtt_reconnect(self):
+        if not self._mqtt_enabled:
             return
+        if self._mqtt.is_connected() and self._mqtt.is_registered():
+            return
+        self._start_mqtt_connect_thread()
 
     def _update_protocol_table(self):
         table = {
@@ -533,13 +555,15 @@ class UranCoreNode(Node):
             'position': self._state.get('position') or {},
             'error_code': self._state.get('error_code') or 0,
         }
-        self._mqtt.publish_uplink(hb)
+        heartbeat_ok = self._mqtt.publish_uplink(hb)
+        if connected and not heartbeat_ok:
+            self.get_logger().warning('MQTT heartbeat publish failed')
 
         ros_hb = HeartbeatStatus()
         ros_hb.timestamp_ns = self._now_ns()
         ros_hb.protocol = 'mqtt'
         ros_hb.last_sent_ts = self._now_ns()
-        ros_hb.success = connected
+        ros_hb.success = heartbeat_ok
         self._pub_hb.publish(ros_hb)
 
     def _timer_uptime(self):
@@ -580,7 +604,7 @@ class UranCoreNode(Node):
         if req.protocol == 'mqtt':
             if req.action == 'connect':
                 if not self._mqtt.is_connected():
-                    threading.Thread(target=self._mqtt_connect_thread, daemon=True).start()
+                    self._start_mqtt_connect_thread()
                 res.success = True
                 res.message = 'connecting'
             elif req.action == 'disconnect':
